@@ -4,7 +4,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
-import { activateManagedDatabase, createManagedDatabase, databaseIdFromName, dbPath, listManagedDatabases } from "./db.js";
+import { activateManagedDatabase, createManagedDatabase, databaseIdFromName, dbPath, deleteManagedDatabase, listManagedDatabases } from "./db.js";
 import { dataSnapshot } from "./data-snapshot.js";
 import {
   dashboard,
@@ -123,6 +123,15 @@ app.post("/api/databases/:id/activate", (req, res) => {
     res.json(catalogue);
   } catch (error) {
     res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+app.delete("/api/databases/:id", (req, res) => {
+  try {
+    res.json(deleteManagedDatabase(req.params.id));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const status = message.startsWith("Database not found:") ? 404 : message.startsWith("The active database") ? 409 : 400;
+    res.status(status).json({ error: message });
   }
 });
 

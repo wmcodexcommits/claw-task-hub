@@ -723,6 +723,36 @@ await page.getByRole("button", { name: "Manage databases", exact: true }).click(
 assert(await page.getByRole("menu", { name: "Databases" }).isVisible(), "Database manager did not open");
 assert(await page.getByRole("menuitemradio", { name: new RegExp(`${createdCatalogue.active.fileName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}.*active`, "i") }).isVisible(), "Database manager does not identify the active database by exact filename");
 
+const activeDeleteResponse = await fetch(`${env.VITE_CLAW_TASK_HUB_API_BASE}/databases/${encodeURIComponent(createdCatalogue.active.id)}`, { method: "DELETE" });
+assert(activeDeleteResponse.status === 409, `Active database deletion returned ${activeDeleteResponse.status} instead of 409`);
+assert(existsSync(selectedDatabasePath), "Active database deletion protection removed the database file");
+
+const activateOriginalRequest = page.waitForResponse((response) => {
+  const url = new URL(response.url());
+  return url.pathname.endsWith("/databases/ui-smoke.sqlite/activate") && response.request().method() === "POST" && response.ok();
+});
+await page.getByRole("menuitemradio", { name: "ui-smoke.sqlite", exact: true }).click();
+await activateOriginalRequest;
+await page.waitForFunction(() => document.querySelector(".window-tab span")?.textContent?.trim() === "ui-smoke");
+
+await page.getByRole("button", { name: "Manage databases", exact: true }).click();
+await page.getByRole("menuitem", { name: `Delete ${createdCatalogue.active.fileName}`, exact: true }).click();
+const deleteDatabaseDialog = page.getByRole("dialog", { name: "Delete database?" });
+assert(await deleteDatabaseDialog.getByText(createdCatalogue.active.fileName, { exact: true }).isVisible(), "Delete confirmation does not identify the database filename");
+assert(await deleteDatabaseDialog.getByText(selectedDatabasePath, { exact: true }).isVisible(), "Delete confirmation does not show the exact database path");
+const deleteDatabaseRequest = page.waitForResponse((response) => {
+  const url = new URL(response.url());
+  return decodeURIComponent(url.pathname).endsWith(`/databases/${createdCatalogue.active.id}`) && response.request().method() === "DELETE" && response.ok();
+});
+await deleteDatabaseDialog.getByRole("button", { name: "Delete database", exact: true }).click();
+const deleteDatabaseResponse = await deleteDatabaseRequest;
+const deletedCatalogue = await deleteDatabaseResponse.json();
+assert(!deletedCatalogue.databases.some((database) => database.id === createdCatalogue.active.id), "Deleted database remains in the API catalogue");
+assert(!existsSync(selectedDatabasePath), "Confirmed database deletion did not remove the SQLite file");
+await page.getByRole("button", { name: "Manage databases", exact: true }).click();
+assert(await page.getByRole("menuitem", { name: `Delete ${createdCatalogue.active.fileName}`, exact: true }).count() === 0, "Deleted database still has a delete action in the database menu");
+assert(await page.getByRole("menuitemradio", { name: createdCatalogue.active.fileName, exact: true }).count() === 0, "Deleted database remains selectable in the database menu");
+
 await browser.close();
 console.log("UI smoke passed");
 } finally {

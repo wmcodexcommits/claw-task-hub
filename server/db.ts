@@ -117,6 +117,20 @@ export function activateManagedDatabase(id: string) {
   return listManagedDatabases();
 }
 
+export function deleteManagedDatabase(id: string) {
+  const catalogue = listManagedDatabases();
+  const target = catalogue.databases.find((database) => database.id === id);
+  if (!target) throw new Error(`Database not found: ${id}`);
+  if (target.active) throw new Error("The active database cannot be deleted. Activate another database first.");
+
+  rmSync(target.path);
+  rmSync(`${target.path}-wal`, { force: true });
+  rmSync(`${target.path}-shm`, { force: true });
+  rmSync(`${target.path}-journal`, { force: true });
+  unregisterDatabasePath(target.path);
+  return listManagedDatabases();
+}
+
 function resolveInitialDbPath() {
   mkdirSync(databaseDir, { recursive: true });
   if (!existsSync(activeDatabasePointer)) return configuredDbPath;
@@ -176,6 +190,15 @@ function readDatabaseRegistry(): string[] {
 
 function registerDatabasePath(path: string) {
   const paths = [...new Set([...readDatabaseRegistry(), resolve(path)])].sort();
+  writeDatabaseRegistry(paths);
+}
+
+function unregisterDatabasePath(path: string) {
+  const target = resolve(path);
+  writeDatabaseRegistry(readDatabaseRegistry().filter((registeredPath) => registeredPath !== target));
+}
+
+function writeDatabaseRegistry(paths: string[]) {
   const temporaryRegistry = `${databaseRegistryPath}.${process.pid}.tmp`;
   writeFileSync(temporaryRegistry, `${JSON.stringify(paths, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
   renameSync(temporaryRegistry, databaseRegistryPath);

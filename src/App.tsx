@@ -21,6 +21,7 @@ import {
   Plus,
   Search,
   SlidersHorizontal,
+  Trash2,
   UserRound,
   X,
 } from "lucide-react";
@@ -299,6 +300,9 @@ function App() {
   const [databaseEditorOpen, setDatabaseEditorOpen] = useState(false);
   const [databaseSaving, setDatabaseSaving] = useState(false);
   const [databaseError, setDatabaseError] = useState<string | null>(null);
+  const [databaseDeleteTarget, setDatabaseDeleteTarget] = useState<ManagedDatabase | null>(null);
+  const [databaseDeleting, setDatabaseDeleting] = useState(false);
+  const [databaseDeleteError, setDatabaseDeleteError] = useState<string | null>(null);
   const [databaseCatalogue, setDatabaseCatalogue] = useState<DatabaseCatalogue | null>(null);
   const [healthState, setHealthState] = useState<HealthState>("unknown");
   const [darkMode, setDarkMode] = useState(() => window.localStorage.getItem("claw-task-hub-theme") !== "light");
@@ -705,6 +709,24 @@ function App() {
     }
   }
 
+  async function deleteDatabase() {
+    const target = databaseDeleteTarget;
+    if (!target || target.active) return;
+    setDatabaseDeleteError(null);
+    setDatabaseDeleting(true);
+    try {
+      const catalogue = await api<DatabaseCatalogue>(`/databases/${encodeURIComponent(target.id)}`, {
+        method: "DELETE",
+      });
+      setDatabaseCatalogue(catalogue);
+      setDatabaseDeleteTarget(null);
+    } catch (error) {
+      setDatabaseDeleteError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setDatabaseDeleting(false);
+    }
+  }
+
   function resetForDatabaseChange() {
     setProjects([]);
     setWorkspaceIssues([]);
@@ -896,6 +918,10 @@ function App() {
           setDatabaseEditorOpen(true);
         }}
         onActivateDatabase={activateDatabase}
+        onDeleteDatabase={(database) => {
+          setDatabaseDeleteError(null);
+          setDatabaseDeleteTarget(database);
+        }}
         onToggleDarkMode={() => setDarkMode((enabled) => !enabled)}
         onRefresh={() => refresh(true, true)}
       />
@@ -1032,6 +1058,17 @@ function App() {
           onSubmit={createDatabase}
         />
       ) : null}
+      {databaseDeleteTarget ? (
+        <DeleteDatabaseDialog
+          database={databaseDeleteTarget}
+          deleting={databaseDeleting}
+          error={databaseDeleteError}
+          onClose={() => {
+            if (!databaseDeleting) setDatabaseDeleteTarget(null);
+          }}
+          onConfirm={() => void deleteDatabase()}
+        />
+      ) : null}
       {issueEditorOpen && projectDetail ? (
         <NewIssueDialog
           projectName={projectDetail.project.name}
@@ -1053,6 +1090,7 @@ function TopChrome({
   darkMode,
   onNewDatabase,
   onActivateDatabase,
+  onDeleteDatabase,
   onToggleDarkMode,
   onRefresh,
 }: {
@@ -1061,6 +1099,7 @@ function TopChrome({
   darkMode: boolean;
   onNewDatabase: () => void;
   onActivateDatabase: (id: string) => Promise<void>;
+  onDeleteDatabase: (database: ManagedDatabase) => void;
   onToggleDarkMode: () => void;
   onRefresh: () => Promise<void>;
 }) {
@@ -1085,17 +1124,31 @@ function TopChrome({
           <div className="toolbar-menu database-menu" role="menu" aria-label="Databases">
             <strong>Databases</strong>
             {(catalogue?.databases ?? []).map((database) => (
-              <button
-                key={database.id}
-                role="menuitemradio"
-                aria-checked={database.active}
-                disabled={database.active}
-                onClick={() => {
-                  setMenuOpen(false);
-                  void onActivateDatabase(database.id);
-                }}
-                title={database.path}
-              >{database.fileName}{database.active ? " (active)" : ""}</button>
+              <div className="database-menu-row" key={database.id} role="presentation">
+                <button
+                  className="database-select"
+                  role="menuitemradio"
+                  aria-checked={database.active}
+                  disabled={database.active}
+                  onClick={() => {
+                    setMenuOpen(false);
+                    void onActivateDatabase(database.id);
+                  }}
+                  title={database.path}
+                >{database.fileName}{database.active ? " (active)" : ""}</button>
+                {!database.active ? (
+                  <button
+                    className="database-delete"
+                    role="menuitem"
+                    aria-label={`Delete ${database.fileName}`}
+                    title={`Delete ${database.fileName}`}
+                    onClick={() => {
+                      setMenuOpen(false);
+                      onDeleteDatabase(database);
+                    }}
+                  ><Trash2 size={14} /></button>
+                ) : null}
+              </div>
             ))}
             <button role="menuitem" onClick={() => { setMenuOpen(false); onNewDatabase(); }}>Create database</button>
             <button role="menuitemcheckbox" aria-checked={darkMode} onClick={onToggleDarkMode}>Dark mode {darkMode ? "✓" : ""}</button>
@@ -1376,6 +1429,39 @@ function DatabaseDialog({ saving, error, onClose, onSubmit }: { saving: boolean;
           {error || pickerError ? <div className="create-error"><AlertTriangle size={14} />{error || pickerError}</div> : null}
           <div className="project-form-actions"><button type="button" onClick={onClose}>Cancel</button><button type="submit" disabled={saving}>{saving ? "Creating" : "Create database"}</button></div>
         </form>
+      </section>
+    </div>
+  );
+}
+
+function DeleteDatabaseDialog({
+  database,
+  deleting,
+  error,
+  onClose,
+  onConfirm,
+}: {
+  database: ManagedDatabase;
+  deleting: boolean;
+  error: string | null;
+  onClose: () => void;
+  onConfirm: () => void;
+}) {
+  return (
+    <div className="issue-dialog-backdrop" role="presentation" onMouseDown={onClose}>
+      <section className="issue-dialog database-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-database-dialog-title" onMouseDown={(event) => event.stopPropagation()}>
+        <button className="dialog-close" disabled={deleting} onClick={onClose} aria-label="Close delete database"><X size={16} /></button>
+        <h2 id="delete-database-dialog-title">Delete database?</h2>
+        <p>This permanently deletes the selected SQLite database and cannot be undone.</p>
+        <div className="database-delete-summary">
+          <strong>{database.fileName}</strong>
+          <code>{database.path}</code>
+        </div>
+        {error ? <div className="create-error"><AlertTriangle size={14} />{error}</div> : null}
+        <div className="project-form-actions">
+          <button type="button" disabled={deleting} onClick={onClose}>Cancel</button>
+          <button className="danger-action" type="button" disabled={deleting} onClick={onConfirm}>{deleting ? "Deleting" : "Delete database"}</button>
+        </div>
       </section>
     </div>
   );

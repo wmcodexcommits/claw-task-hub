@@ -15,6 +15,7 @@
   - `npm run harness-smoke`
   - `npm run ui-smoke`
   - `npm run public-hygiene`
+- Before every commit, run all six core checks above against the exact tree being committed. Do not commit if any check fails.
 - Use `docs/AGENTIC_HARNESS.md` as the canonical agent and harness contract.
 - Use context bindings for project-bound harness startup. Bind stable keys such as repository remote, working directory, branch, or thread id to the owning project; never store secrets in binding metadata.
 - Use visible issue identifiers such as `CTH-272`, `LOCAL-1`, or imported historical identifiers in conversation and tool calls.

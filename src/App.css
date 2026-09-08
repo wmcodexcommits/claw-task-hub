@@ -390,6 +390,34 @@ button:disabled {
   opacity: 1;
 }
 
+.database-menu-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.database-menu-row .database-select {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.database-menu-row .database-delete {
+  width: 32px;
+  flex: 0 0 32px;
+  padding: 0;
+  color: var(--muted);
+  display: grid;
+  place-items: center;
+}
+
+.database-menu-row .database-delete:hover:not(:disabled) {
+  color: var(--red);
+  background: var(--danger-soft);
+}
+
 .ghost-icon.active,
 .health-check.healthy {
   color: var(--green);
@@ -742,6 +770,32 @@ button:disabled {
 .database-dialog > p {
   color: var(--muted);
   line-height: 1.5;
+}
+
+.database-delete-summary {
+  display: grid;
+  gap: var(--space-2);
+  margin: var(--space-4) 0;
+  padding: var(--space-3);
+  border: 1px solid var(--danger-border);
+  border-radius: var(--control-radius);
+  background: var(--danger-soft);
+}
+
+.database-delete-summary code {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.project-form-actions .danger-action {
+  border-color: var(--danger-border);
+  background: var(--danger-soft);
+  color: var(--red);
+}
+
+.project-form-actions .danger-action:hover:not(:disabled) {
+  border-color: var(--red);
+  background: var(--danger-soft);
 }
 
 .database-form,
