@@ -212,6 +212,14 @@ async function waitForAppShell() {
 
 try {
 runNpm(["run", "-s", "seed"]);
+runHub("save_project", {
+  id: "project_claw_task_hub_mvp",
+  status: "In Progress",
+  priority: 2,
+  lead: "UI Smoke",
+  target_date: "2026-10-31",
+  source: "local",
+});
 seedBulkTodoIssues(70);
 runHub("save_issue", {
   id: "LOCAL-3",
@@ -277,8 +285,13 @@ assert(await page.locator(".searchbar input").getAttribute("placeholder") === "S
 
 await page.goto(`http://127.0.0.1:${webPort}/contexts/${encodeURIComponent("ui-smoke:project")}/activity`, { waitUntil: "domcontentloaded" });
 await waitForAppShell();
-await page.getByText("Write a project update...").waitFor({ state: "visible", timeout: 15000 });
+const projectUpdateBody = `UI smoke project update ${Date.now()}`;
+await page.getByLabel("Project update").waitFor({ state: "visible", timeout: 15000 });
 assert((await page.getByRole("button", { name: "Activity", exact: true }).getAttribute("class"))?.includes("active"), "Context URL did not activate the requested Activity tab");
+await page.getByLabel("Project health").selectOption("at_risk");
+await page.getByLabel("Project update").fill(projectUpdateBody);
+await page.getByRole("button", { name: "Post update", exact: true }).click();
+await page.getByText(projectUpdateBody, { exact: false }).waitFor({ state: "visible", timeout: 10000 });
 
 await page.goto(`http://127.0.0.1:${webPort}/issues/LOCAL-3`, { waitUntil: "domcontentloaded" });
 await waitForAppShell();
@@ -292,6 +305,43 @@ await page.screenshot({ path: "test-results/linearish-projects.png", fullPage: t
 assert(await page.getByText("Projects", { exact: true }).first().isVisible(), "Projects heading is missing");
 const publicProjectRow = page.locator(".project-row").filter({ hasText: "Claw Task Hub MVP" }).first();
 assert(await publicProjectRow.isVisible(), "Project table row is missing");
+assert(await publicProjectRow.getByText("At risk", { exact: true }).isVisible(), "Project row does not use the latest configured health update");
+assert(await publicProjectRow.getByText("High", { exact: true }).isVisible(), "Project row does not show the configured priority label");
+assert(await publicProjectRow.locator(".project-lead", { hasText: "UI Smoke" }).isVisible(), "Project row does not show the configured lead");
+assert(await publicProjectRow.getByText("Oct 31, 2026", { exact: true }).isVisible(), "Project row does not show the configured target date");
+assert(await publicProjectRow.getByText("In Progress", { exact: true }).isVisible(), "Project row does not show the configured status");
+
+await page.getByRole("button", { name: "Filter projects", exact: true }).click();
+await page.getByLabel("Search projects").fill("Claw Task Hub");
+await page.getByLabel("Filter projects by health").selectOption("at_risk");
+assert(await publicProjectRow.isVisible(), "Project filters hid a matching configured project");
+await page.getByLabel("Filter projects by health").selectOption("off_track");
+await page.getByText("No projects match the current filters.", { exact: true }).waitFor({ state: "visible" });
+await page.getByRole("button", { name: /Clear/i }).click();
+await publicProjectRow.waitFor({ state: "visible" });
+await page.getByRole("button", { name: "Configure project view", exact: true }).click();
+await page.getByLabel("Sort projects").selectOption("issues");
+assert((await page.getByLabel("Sort projects").inputValue()) === "issues", "Project view configuration did not apply issue-count sorting");
+
+await page.getByRole("button", { name: "New project", exact: true }).click();
+const newProjectDialog = page.getByRole("dialog", { name: "New project" });
+await newProjectDialog.waitFor({ state: "visible" });
+assert(await page.getByLabel("Project lead").isVisible(), "New project form does not expose lead configuration");
+assert(await page.getByLabel("Project target date").isVisible(), "New project form does not expose target-date configuration");
+await page.getByLabel("Project name").fill("UI Configured Project");
+await page.getByLabel("Project summary").fill("Created through the configured project form.");
+await page.getByLabel("Project status").selectOption("Planned");
+await page.getByLabel("Project priority").selectOption("4");
+await page.getByLabel("Project lead").fill("UI Owner");
+await page.getByLabel("Project target date").fill("2027-01-15");
+await newProjectDialog.getByRole("button", { name: "Create project", exact: true }).click();
+await page.locator(".project-hero h1", { hasText: "UI Configured Project" }).waitFor({ state: "visible", timeout: 10000 });
+assert(await page.getByText("Jan 15, 2027", { exact: true }).isVisible(), "New project target date did not reach the overview");
+await page.getByRole("button", { name: "Projects", exact: true }).click();
+const configuredProjectRow = page.locator(".project-row").filter({ hasText: "UI Configured Project" }).first();
+await configuredProjectRow.waitFor({ state: "visible", timeout: 10000 });
+assert(await configuredProjectRow.locator(".project-lead", { hasText: "UI Owner" }).isVisible(), "New project lead did not reach the project list");
+assert(await configuredProjectRow.getByText("Jan 15, 2027", { exact: true }).isVisible(), "New project target date did not reach the project list");
 
 await publicProjectRow.scrollIntoViewIfNeeded();
 await publicProjectRow.click();
@@ -319,7 +369,8 @@ assert(
 await page.screenshot({ path: "test-results/linearish-project-overview.png", fullPage: true });
 
 await page.getByRole("button", { name: "Activity", exact: true }).click();
-assert(await page.getByText("Write a project update...").isVisible(), "Activity update composer is missing");
+assert(await page.getByLabel("Project update").isVisible(), "Activity update composer is missing");
+assert(await page.getByText(projectUpdateBody, { exact: false }).isVisible(), "Posted project update is missing from the activity timeline");
 assert(await page.locator(".timeline-row").first().isVisible(), "Activity timeline is missing");
 await page.screenshot({ path: "test-results/linearish-project-activity.png", fullPage: true });
 
@@ -379,7 +430,16 @@ const scopedSearchRequest = page.waitForRequest((request) => {
 });
 await page.locator(".searchbar input").fill(createdTitle);
 await scopedSearchRequest;
-await page.locator(".linear-issue-row").filter({ hasText: createdTitle }).first().waitFor({ state: "visible", timeout: 10000 });
+const createdRow = page.locator(".linear-issue-row").filter({ hasText: createdTitle }).first();
+await createdRow.waitFor({ state: "visible", timeout: 10000 });
+await createdRow.dblclick();
+await page.locator(".issue-dialog").waitFor({ state: "visible", timeout: 10000 });
+const createdDialog = page.locator(".issue-dialog");
+await createdDialog.getByLabel("Blocking issue").fill("LOCAL-4");
+await createdDialog.getByLabel("Blocker reason").fill("UI smoke prerequisite");
+await createdDialog.getByRole("button", { name: "Add blocker", exact: true }).click();
+await createdDialog.locator(".dependency.open", { hasText: "LOCAL-4" }).waitFor({ state: "visible", timeout: 10000 });
+await page.locator(".dialog-close").click();
 await page.locator(".searchbar input").fill("");
 await page.locator(".group-head").first().waitFor({ state: "visible", timeout: 10000 });
 const firstIssueCode = (await page.locator(".linear-issue-row .issue-id").first().textContent())?.trim() ?? "";
@@ -392,6 +452,13 @@ await page.locator(".dialog-close").click();
 await page.getByRole("button", { name: /Blockers/i }).click();
 const blockerClass = await page.getByRole("button", { name: /Blockers/i }).getAttribute("class");
 assert(blockerClass?.includes("active"), "Blockers filter did not become active");
+const blockedRow = page.locator(".linear-issue-row").filter({ hasText: createdTitle }).first();
+await blockedRow.waitFor({ state: "visible", timeout: 10000 });
+await blockedRow.dblclick();
+await page.locator(".issue-dialog .dependency.open", { hasText: "LOCAL-4" }).waitFor({ state: "visible", timeout: 10000 });
+await page.locator(".issue-dialog").getByRole("button", { name: "Resolve", exact: true }).click();
+await page.locator(".issue-dialog .dependency.open", { hasText: "LOCAL-4" }).waitFor({ state: "detached", timeout: 10000 });
+await page.locator(".dialog-close").click();
 await page.screenshot({ path: "test-results/linearish-project-issues.png", fullPage: true });
 
 await page.getByRole("button", { name: "Paused", exact: true }).click();

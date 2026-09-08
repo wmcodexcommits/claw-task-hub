@@ -12,13 +12,50 @@ const clawDbPath = join(dataDir, "claw-task-hub.sqlite");
 type SqliteDatabase = InstanceType<typeof Database>;
 
 export function resolveDbPath(env: NodeJS.ProcessEnv = process.env, legacyExists = existsSync(legacyDbPath)) {
-  const defaultDbPath = legacyExists ? legacyDbPath : clawDbPath;
-  return env.CLAW_TASK_HUB_DB ?? env.CODEX_TASK_HUB_DB ?? defaultDbPath;
+  const explicit = env.CLAW_TASK_HUB_DB ?? env.CODEX_TASK_HUB_DB;
+  if (explicit) return explicit;
+
+  // Falling back is correct on a first run, and dangerous for an agent. The
+  // repo-local default is NOT necessarily the database anyone is looking at:
+  // a deployment that runs from .stack, or any other explicit path, leaves this
+  // file present, writable and empty of the work in progress. Writing here
+  // SUCCEEDS — same schema, same tool surface, plausible responses — and shows
+  // up nowhere. A project and eleven issues were created in it before anyone
+  // noticed.
+  //
+  // A caller that knows it must not guess sets CLAW_TASK_HUB_REQUIRE_DB=1 and
+  // gets an error instead of a silent second database.
+  if (isTruthyEnv(env.CLAW_TASK_HUB_REQUIRE_DB)) {
+    throw new Error(
+      "CLAW_TASK_HUB_REQUIRE_DB is set but no database was named. Set " +
+      "CLAW_TASK_HUB_DB to the database this process should use. Refusing to " +
+      "fall back to the repository default, which may not be the database in " +
+      "use: " + (legacyExists ? legacyDbPath : clawDbPath));
+  }
+  return legacyExists ? legacyDbPath : clawDbPath;
+}
+
+function isTruthyEnv(value: string | undefined) {
+  if (!value) return false;
+  const normalized = value.trim().toLowerCase();
+  return normalized !== "" && normalized !== "0" && normalized !== "false";
 }
 
 export const dbPath = resolveDbPath();
 mkdirSync(dirname(dbPath), { recursive: true });
 export const db = new Database(dbPath);
+
+// Say which database this process is using, always, on stderr so it cannot be
+// confused with tool output. The wrong-database incident cost an hour and would
+// have been one line to spot.
+if (!isTruthyEnv(process.env.CLAW_TASK_HUB_QUIET_DB)) {
+  const source = process.env.CLAW_TASK_HUB_DB
+    ? "CLAW_TASK_HUB_DB"
+    : process.env.CODEX_TASK_HUB_DB
+      ? "CODEX_TASK_HUB_DB"
+      : "repository default (no CLAW_TASK_HUB_DB set)";
+  process.stderr.write(`claw-task-hub: database ${dbPath} [${source}]\n`);
+}
 
 export function initializeDatabase(database: SqliteDatabase) {
   configureDatabase(database);
@@ -54,6 +91,7 @@ CREATE TABLE IF NOT EXISTS projects (
   status TEXT NOT NULL DEFAULT 'Backlog',
   priority INTEGER NOT NULL DEFAULT 3,
   lead TEXT,
+  target_date TEXT,
   source TEXT NOT NULL DEFAULT 'local',
   archived_at TEXT,
   created_at TEXT NOT NULL,
@@ -165,6 +203,33 @@ CREATE TABLE IF NOT EXISTS context_bindings (
   updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS project_updates (
+  id TEXT PRIMARY KEY,
+  external_id TEXT UNIQUE,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  body TEXT NOT NULL CHECK(length(body) <= 10000),
+  health TEXT NOT NULL DEFAULT 'on_track' CHECK(health IN ('on_track', 'at_risk', 'off_track', 'complete')),
+  author TEXT,
+  source TEXT NOT NULL DEFAULT 'local',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS issue_dependencies (
+  id TEXT PRIMARY KEY,
+  external_id TEXT UNIQUE,
+  issue_id TEXT NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
+  blocker_issue_id TEXT NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
+  reason TEXT CHECK(reason IS NULL OR length(reason) <= 2000),
+  status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open', 'resolved')),
+  resolved_at TEXT,
+  source TEXT NOT NULL DEFAULT 'local',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(issue_id, blocker_issue_id),
+  CHECK(issue_id <> blocker_issue_id)
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS issue_fts USING fts5(
   title,
   description,
@@ -195,6 +260,9 @@ CREATE INDEX IF NOT EXISTS idx_issue_claims_issue_active ON issue_claims(issue_i
 CREATE INDEX IF NOT EXISTS idx_issue_claims_session ON issue_claims(session_id, released_at);
 CREATE INDEX IF NOT EXISTS idx_context_bindings_project ON context_bindings(project_id);
 CREATE INDEX IF NOT EXISTS idx_context_bindings_lookup ON context_bindings(harness, repo_remote, branch, cwd, thread_id);
+CREATE INDEX IF NOT EXISTS idx_project_updates_project_created ON project_updates(project_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_issue_dependencies_issue_status ON issue_dependencies(issue_id, status);
+CREATE INDEX IF NOT EXISTS idx_issue_dependencies_blocker_status ON issue_dependencies(blocker_issue_id, status);
 `);
 }
 
@@ -241,6 +309,52 @@ const migrations: {
         CREATE INDEX IF NOT EXISTS idx_context_bindings_project ON context_bindings(project_id);
         CREATE INDEX IF NOT EXISTS idx_context_bindings_lookup ON context_bindings(harness, repo_remote, branch, cwd, thread_id);
       `);
+    },
+  },
+  {
+    id: "0004_project_updates_and_issue_dependencies",
+    description: "Add first-class project updates and explicit issue blockers",
+    up: (database) => {
+      database.exec(`
+        CREATE TABLE IF NOT EXISTS project_updates (
+          id TEXT PRIMARY KEY,
+          external_id TEXT UNIQUE,
+          project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+          body TEXT NOT NULL CHECK(length(body) <= 10000),
+          health TEXT NOT NULL DEFAULT 'on_track' CHECK(health IN ('on_track', 'at_risk', 'off_track', 'complete')),
+          author TEXT,
+          source TEXT NOT NULL DEFAULT 'local',
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS issue_dependencies (
+          id TEXT PRIMARY KEY,
+          external_id TEXT UNIQUE,
+          issue_id TEXT NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
+          blocker_issue_id TEXT NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
+          reason TEXT CHECK(reason IS NULL OR length(reason) <= 2000),
+          status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open', 'resolved')),
+          resolved_at TEXT,
+          source TEXT NOT NULL DEFAULT 'local',
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(issue_id, blocker_issue_id),
+          CHECK(issue_id <> blocker_issue_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_project_updates_project_created ON project_updates(project_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_issue_dependencies_issue_status ON issue_dependencies(issue_id, status);
+        CREATE INDEX IF NOT EXISTS idx_issue_dependencies_blocker_status ON issue_dependencies(blocker_issue_id, status);
+      `);
+    },
+  },
+  {
+    id: "0005_project_target_date",
+    description: "Store configured project target dates",
+    up: (database) => {
+      const columns = database.prepare("PRAGMA table_info(projects)").all() as { name: string }[];
+      if (!columns.some((column) => column.name === "target_date")) {
+        database.exec("ALTER TABLE projects ADD COLUMN target_date TEXT");
+      }
     },
   },
 ];

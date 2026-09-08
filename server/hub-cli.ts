@@ -5,17 +5,23 @@ import {
   endAgentSession,
   getContextBinding,
   getIssue,
+  getProject,
   heartbeatAgentSession,
   listAgentSessions,
   listContextBindings,
   listIssueClaims,
+  listIssueDependencies,
   listIssues,
+  listProjectUpdates,
   listProjects,
   listTeams,
   releaseIssueClaim,
   repairIssueInvariants,
   resolveContextProject,
+  resolveIssueDependency,
   saveComment,
+  saveIssueDependency,
+  saveProjectUpdate,
   startAgentSession,
   upsertContextBinding,
   upsertIssue,
@@ -69,11 +75,17 @@ try {
       tools: [
         "list_teams",
         "list_projects",
+        "get_project",
         "save_project",
+        "list_project_updates",
+        "save_project_update",
         "list_issues",
         "get_issue",
         "save_issue",
         "save_comment",
+        "list_issue_dependencies",
+        "save_issue_dependency",
+        "resolve_issue_dependency",
         "dashboard",
         "start_agent_session",
         "heartbeat_agent_session",
@@ -96,7 +108,13 @@ try {
     const input = parseArgs(raw);
     if (tool === "list_teams") print({ teams: listTeams() });
     else if (tool === "list_projects") print({ projects: listProjects() });
+    else if (tool === "get_project") {
+      requireString(input, "id", "get_project");
+      print({ project: getProject(input.id, { issues_per_status: input.issues_per_status }) });
+    }
     else if (tool === "save_project") print({ project: upsertProject(input) });
+    else if (tool === "list_project_updates") print({ updates: listProjectUpdates(input) });
+    else if (tool === "save_project_update") print({ update: saveProjectUpdate(input) });
     else if (tool === "list_issues") print({ issues: listIssues(input) });
     else if (tool === "save_context_binding" || tool === "upsert_context_binding") print({ binding: upsertContextBinding(input) });
     else if (tool === "get_context_binding") {
@@ -117,6 +135,9 @@ try {
       if (typeof input.body !== "string" || !input.body) throw new Error("save_comment requires body");
       print({ comment: saveComment(input) });
     }
+    else if (tool === "list_issue_dependencies") print({ dependencies: listIssueDependencies(input) });
+    else if (tool === "save_issue_dependency") print({ dependency: saveIssueDependency(input) });
+    else if (tool === "resolve_issue_dependency") print(resolveIssueDependency(input));
     else if (tool === "dashboard") print(dashboard());
     else if (tool === "start_agent_session") print({ session: startAgentSession(input) });
     else if (tool === "heartbeat_agent_session") print({ session: heartbeatAgentSession(input) });

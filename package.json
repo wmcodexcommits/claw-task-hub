@@ -19,11 +19,12 @@
     "open:context": "tsx tools/open-context.ts",
     "codex:open": "tsx tools/open-context.ts --harness codex --open",
     "migrate:linear": "tsx tools/linear-migration/migrate-linear.ts",
+    "sync:requisitions": "tsx tools/sync-requisition-tickets.ts",
     "mcp": "tsx server/mcp-server.ts",
     "check:server": "tsc -p tsconfig.server.json --noEmit",
     "build": "tsc -b && npm run check:server && vite build",
     "lint": "eslint .",
-    "store-regression": "tsx tests/store-regression.mjs",
+    "store-regression": "node --import tsx tests/store-regression.mjs",
     "harness-smoke": "node tests/harness-smoke.mjs",
     "open-context-smoke": "node tests/open-context-smoke.mjs",
     "posix-launcher-smoke": "node tests/posix-launcher-smoke.mjs",
@@ -32,7 +33,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "better-sqlite3": "^12.9.0",
+    "better-sqlite3": "^13.0.3",
     "cors": "^2.8.6",
     "express": "^5.2.1",
     "lucide-react": "^1.14.0",

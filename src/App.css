@@ -215,6 +215,16 @@ button:disabled {
   background: #181818;
 }
 
+.round-icon.active {
+  background: #303030;
+  color: var(--text);
+}
+
+.decorative {
+  cursor: default;
+  pointer-events: none;
+}
+
 .round-icon:hover,
 .ghost-icon:hover,
 .project-row:hover,
@@ -239,6 +249,83 @@ button:disabled {
   padding: 4px 0;
 }
 
+.project-view-config {
+  min-width: 760px;
+  min-height: 48px;
+  border-bottom: 1px solid var(--line);
+  background: #0d0d0d;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 7px 16px;
+}
+
+.project-filter-controls,
+.project-sort-control,
+.project-filter-controls label,
+.project-sort-control label,
+.project-search,
+.project-form label,
+.project-form-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.project-filter-controls {
+  min-width: 0;
+  flex: 1;
+}
+
+.project-filter-controls label,
+.project-sort-control label {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.project-filter-controls select,
+.project-sort-control select,
+.project-search,
+.project-filter-controls > button {
+  height: 32px;
+  border: 1px solid var(--line2);
+  border-radius: 6px;
+  background: #151515;
+  color: var(--text);
+}
+
+.project-filter-controls select,
+.project-sort-control select {
+  padding: 0 8px;
+}
+
+.project-search {
+  min-width: 190px;
+  padding: 0 9px;
+}
+
+.project-search input {
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--text);
+}
+
+.project-filter-controls > button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 10px;
+}
+
+.project-result-count {
+  margin-left: auto;
+  color: var(--dim);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
 .projects-table {
   width: 100%;
   display: grid;
@@ -248,7 +335,7 @@ button:disabled {
 .project-row {
   min-height: 48px;
   display: grid;
-  grid-template-columns: minmax(320px, 1fr) 80px 80px 80px 130px 70px 64px;
+  grid-template-columns: minmax(270px, 1fr) 118px 100px 140px 130px 70px 130px;
   align-items: center;
   gap: 12px;
   border: 0;
@@ -272,6 +359,136 @@ button:disabled {
   color: var(--text);
   font-weight: 750;
   min-width: 0;
+}
+
+.project-name > span:last-child {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.project-name strong,
+.project-name small,
+.project-lead,
+.project-target,
+.project-priority {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.project-name small {
+  color: var(--dim);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.project-priority,
+.project-lead,
+.health-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.health-badge {
+  color: #c9c9c9;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.health-badge.none {
+  color: var(--dim);
+}
+
+.health-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+  background: var(--green);
+  box-shadow: 0 0 0 3px rgb(53 184 107 / 0.13);
+}
+
+.health-badge.at_risk .health-dot {
+  background: var(--yellow);
+  box-shadow: 0 0 0 3px rgb(255 212 0 / 0.12);
+}
+
+.health-badge.off_track .health-dot {
+  background: var(--red);
+  box-shadow: 0 0 0 3px rgb(255 101 101 / 0.12);
+}
+
+.health-badge.complete .health-dot {
+  background: var(--blue);
+  box-shadow: 0 0 0 3px rgb(91 140 255 / 0.12);
+}
+
+.project-empty {
+  padding: 42px 16px;
+}
+
+.project-dialog {
+  width: min(720px, 100%);
+}
+
+.project-dialog h2 {
+  margin-top: 0;
+}
+
+.project-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.project-form label {
+  min-width: 0;
+  align-items: stretch;
+  flex-direction: column;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.project-form input,
+.project-form textarea,
+.project-form select {
+  width: 100%;
+  border: 1px solid var(--line2);
+  border-radius: 6px;
+  background: #151515;
+  color: var(--text);
+  padding: 9px 10px;
+  outline: 0;
+  resize: vertical;
+}
+
+.project-form input:focus,
+.project-form textarea:focus,
+.project-form select:focus {
+  border-color: #4a69a8;
+}
+
+.project-form-wide {
+  grid-column: 1 / -1;
+}
+
+.project-form-actions {
+  justify-content: flex-end;
+}
+
+.project-form-actions button {
+  border: 1px solid var(--line2);
+  border-radius: 6px;
+  background: #1d1d1d;
+  color: var(--text);
+  padding: 8px 13px;
+}
+
+.project-form-actions button[type="submit"] {
+  background: #315fb4;
+  border-color: #315fb4;
 }
 
 .project-name,
@@ -437,6 +654,26 @@ button:disabled {
   padding: 4px 9px;
   color: var(--muted);
   font-style: normal;
+}
+
+.composer-tabs select,
+.workflow-controls select {
+  border: 1px solid var(--line2);
+  border-radius: 999px;
+  background: #202020;
+  color: var(--text);
+  padding: 5px 10px;
+}
+
+.update-composer textarea {
+  min-height: 110px;
+  resize: vertical;
+  border: 1px solid var(--line2);
+  border-radius: 6px;
+  background: #101010;
+  color: var(--text);
+  padding: 12px;
+  font: inherit;
 }
 
 .composer-tabs strong {
@@ -752,6 +989,42 @@ button:disabled {
   background: #0b0b0b;
 }
 
+.workflow-controls {
+  margin: 20px 0;
+  border: 1px solid var(--line2);
+  border-radius: 7px;
+  padding: 12px;
+  display: grid;
+  gap: 10px;
+}
+
+.workflow-controls label,
+.dependency {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+}
+
+.dependency.resolved {
+  color: var(--muted);
+}
+
+.dependency-form {
+  display: grid;
+  grid-template-columns: minmax(130px, 0.8fr) minmax(180px, 1.2fr) auto;
+  gap: 8px;
+}
+
+.dependency-form input {
+  min-width: 0;
+  border: 1px solid var(--line2);
+  border-radius: 5px;
+  background: #141414;
+  color: var(--text);
+  padding: 7px 9px;
+}
+
 .issue-dialog-backdrop {
   position: fixed;
   inset: 0;
@@ -929,6 +1202,7 @@ button:disabled {
 .sicon.started { color: var(--yellow); }
 .sicon.blocker { color: var(--red); }
 .sicon.paused { color: var(--blue); }
+.sicon.canceled { color: var(--dim); }
 .sicon.backlog,
 .sicon.todo { color: #8f8f8f; }
 
@@ -970,10 +1244,10 @@ button:disabled {
 
 @media (max-width: 920px) {
   .project-row {
-    grid-template-columns: minmax(220px, 1fr) 50px 50px 50px;
+    grid-template-columns: minmax(220px, 1fr) 110px 90px 120px 54px;
   }
-  .project-row span:nth-child(5),
-  .project-row span:nth-child(7),
+  .project-row .project-target,
+  .project-row .status-pill,
   .project-head span:nth-child(5),
   .project-head span:nth-child(7) {
     display: none;
@@ -1053,15 +1327,29 @@ button:disabled {
   }
 
   .project-row {
-    grid-template-columns: minmax(0, 1fr) 46px 42px;
+    grid-template-columns: minmax(0, 1fr) 46px;
     gap: 8px;
   }
 
-  .project-row span:nth-child(4),
+  .project-row .health-badge,
+  .project-row .project-priority,
+  .project-row .project-lead,
+  .project-row .project-target,
+  .project-row .status-pill,
+  .project-head span:nth-child(2),
+  .project-head span:nth-child(3),
   .project-head span:nth-child(4),
-  .project-row strong:nth-child(6),
-  .project-head span:nth-child(6) {
+  .project-head span:nth-child(5),
+  .project-head span:nth-child(7) {
     display: none;
+  }
+
+  .project-form {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .project-form-wide {
+    grid-column: 1;
   }
 
   .properties-row,

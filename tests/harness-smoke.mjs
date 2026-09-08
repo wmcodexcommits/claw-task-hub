@@ -224,12 +224,18 @@ try {
   const tools = runHub("tools/list");
   assert(!tools.tools.includes("import_linear"), "import_linear must not be exposed to normal harness tools");
   assert(!tools.tools.includes("backfill_linear_descriptions"), "backfill_linear_descriptions must not be exposed to normal harness tools");
-  for (const name of ["dashboard", "list_projects", "save_project", "save_issue", "get_issue", "save_comment", "start_agent_session", "claim_issue", "release_issue_claim", "save_context_binding", "resolve_context_project"]) {
+  for (const name of [
+    "dashboard", "list_projects", "get_project", "save_project", "list_project_updates", "save_project_update",
+    "save_issue", "get_issue", "save_comment", "list_issue_dependencies", "save_issue_dependency",
+    "resolve_issue_dependency", "start_agent_session", "claim_issue", "release_issue_claim",
+    "save_context_binding", "resolve_context_project",
+  ]) {
     assert(tools.tools.includes(name), `expected harness tool is missing: ${name}`);
   }
   const mcpTools = runMcpToolsList();
   const listIssuesSchema = mcpTools.find((tool) => tool.name === "list_issues")?.inputSchema?.properties;
   assert(listIssuesSchema?.include_done?.type === "boolean", "MCP list_issues schema does not advertise include_done:boolean");
+  assert(listIssuesSchema?.blocked?.type === "boolean", "MCP list_issues schema does not advertise blocked:boolean");
   const saveIssueSchema = mcpTools.find((tool) => tool.name === "save_issue")?.inputSchema?.properties;
   assert(saveIssueSchema?.issue_id?.type === "string", "MCP save_issue schema does not advertise issue_id:string");
   assert(saveIssueSchema?.allow_no_project?.type === "boolean", "MCP save_issue schema does not advertise allow_no_project:boolean");
@@ -238,18 +244,66 @@ try {
   const saveContextBindingSchema = mcpTools.find((tool) => tool.name === "save_context_binding")?.inputSchema;
   assert(saveContextBindingSchema?.required?.includes("context_key"), "MCP save_context_binding schema does not require context_key");
   assert(saveContextBindingSchema?.properties?.project_id?.type === "string", "MCP save_context_binding schema does not advertise project_id:string");
+  const saveProjectUpdateSchema = mcpTools.find((tool) => tool.name === "save_project_update")?.inputSchema;
+  assert(saveProjectUpdateSchema?.required?.includes("project_id"), "MCP save_project_update schema does not require project_id");
+  assert(saveProjectUpdateSchema?.required?.includes("body"), "MCP save_project_update schema does not require body");
+  assert(saveProjectUpdateSchema?.properties?.body?.maxLength === 10000, "MCP save_project_update schema does not bound body length");
+  const saveProjectSchema = mcpTools.find((tool) => tool.name === "save_project")?.inputSchema?.properties;
+  assert(saveProjectSchema?.lead?.anyOf?.some((shape) => shape.type === "string"), "MCP save_project schema does not advertise lead");
+  assert(saveProjectSchema?.target_date?.anyOf?.some((shape) => shape.format === "date"), "MCP save_project schema does not advertise target_date");
+  assert(saveProjectSchema?.source?.type === "string", "MCP save_project schema does not advertise source");
+  const saveDependencySchema = mcpTools.find((tool) => tool.name === "save_issue_dependency")?.inputSchema;
+  assert(saveDependencySchema?.required?.includes("issue_id"), "MCP save_issue_dependency schema does not require issue_id");
+  assert(saveDependencySchema?.required?.includes("blocker_issue_id"), "MCP save_issue_dependency schema does not require blocker_issue_id");
 
   const dashboard = runHub("tools/call", "dashboard");
   assert(dashboard.counts.projects === 0, "fresh harness DB should start with no projects");
 
   const project = runHub("tools/call", "save_project", {
+    external_id: "harness-smoke-project",
     name: "Harness Smoke Project",
     summary: "Temp project created by harness smoke.",
+    status: "In Progress",
+    priority: 2,
+    lead: "Harness Agent",
+    target_date: "2026-11-30",
     source: "local",
   }).project;
   assert(project.id, "save_project did not return an id");
+  const projectUpdateByExternalId = runHub("tools/call", "save_project", {
+    external_id: "harness-smoke-project",
+    summary: "Updated without duplicating the project.",
+  }).project;
+  assert(projectUpdateByExternalId.id === project.id, "save_project external_id update created a duplicate project");
+  assert(projectUpdateByExternalId.name === project.name, "save_project partial update discarded the existing project name");
+  assert(projectUpdateByExternalId.lead === "Harness Agent", "save_project partial update discarded the configured lead");
+  assert(projectUpdateByExternalId.target_date === "2026-11-30", "save_project partial update discarded the configured target date");
   const projects = runHub("tools/call", "list_projects").projects;
   assert(projects.some((item) => item.id === project.id), "list_projects did not return the saved project");
+  assert(projects.filter((item) => item.external_id === "harness-smoke-project").length === 1, "save_project external_id update duplicated a project");
+  const firstProjectUpdate = runHub("tools/call", "save_project_update", {
+    external_id: "harness-smoke-update",
+    project_id: project.id,
+    body: "Harness status update one.",
+    health: "on_track",
+    author: "Harness Smoke",
+  }).update;
+  const secondProjectUpdate = runHub("tools/call", "save_project_update", {
+    external_id: "harness-smoke-update",
+    project_id: project.id,
+    body: "Harness status update revised.",
+    health: "at_risk",
+    author: "Harness Smoke",
+  }).update;
+  assert(secondProjectUpdate.id === firstProjectUpdate.id, "save_project_update external_id was not idempotent");
+  const projectsAfterHealthUpdate = runHub("tools/call", "list_projects").projects;
+  const configuredProject = projectsAfterHealthUpdate.find((item) => item.id === project.id);
+  assert(configuredProject?.health === "at_risk", "list_projects did not expose the latest configured project health");
+  assert(configuredProject?.target_date === "2026-11-30", "list_projects did not expose the configured project target date");
+  const projectUpdates = runHub("tools/call", "list_project_updates", { project_id: project.id }).updates;
+  assert(projectUpdates.length === 1 && projectUpdates[0].body === "Harness status update revised.", "list_project_updates missed the idempotent update");
+  const projectDetail = runHub("tools/call", "get_project", { id: project.id }).project;
+  assert(projectDetail.projectUpdates?.[0]?.id === firstProjectUpdate.id, "get_project did not expose first-class project updates");
   const contextBinding = runHub("tools/call", "save_context_binding", {
     context_key: "codex:harness-smoke",
     project_id: project.id,
@@ -302,6 +356,28 @@ try {
   }).issue;
   assert(/^[A-Z][A-Z0-9]{1,8}-\d{1,6}$/.test(createdIssue.identifier), `issue identifier is not short: ${createdIssue.identifier}`);
 
+  const blockerIssue = runHub("tools/call", "save_issue", {
+    title: "Harness smoke prerequisite",
+    description: "Explicit blocker used by harness smoke.",
+    project_id: project.id,
+    status: "Todo",
+    priority: 2,
+    labels: ["harness-smoke"],
+    source: "local",
+  }).issue;
+  const dependency = runHub("tools/call", "save_issue_dependency", {
+    external_id: "harness-smoke-dependency",
+    issue_id: createdIssue.identifier,
+    blocker_issue_id: blockerIssue.identifier,
+    reason: "Prerequisite must land first.",
+  }).dependency;
+  assert(dependency.status === "open", "save_issue_dependency did not create an open blocker");
+  const blockedIssue = runHub("tools/call", "get_issue", { id: createdIssue.identifier }).issue;
+  assert(blockedIssue.status_type === "blocked" && blockedIssue.blocker_count === 1, "get_issue did not derive Blocked from an unresolved dependency");
+  const blockerFilter = runHub("tools/call", "list_issues", { project_id: project.id, blocked: true }).issues;
+  assert(blockerFilter.some((issue) => issue.id === createdIssue.id), "list_issues blocked:true missed the dependency-blocked issue");
+  const dependencies = runHub("tools/call", "list_issue_dependencies", { issue_id: createdIssue.identifier }).dependencies;
+  assert(dependencies.length === 1 && dependencies[0].id === dependency.id, "list_issue_dependencies missed the open blocker");
   const fetched = runHub("tools/call", "get_issue", { id: createdIssue.identifier }).issue;
   assert(fetched.id === createdIssue.id, "get_issue did not resolve the visible identifier");
   const issueIdAliasUpdate = runHub("tools/call", "save_issue", {
@@ -342,6 +418,14 @@ try {
     ttl_minutes: 30,
   }).session;
   assert(session.id === "session-harness-smoke", "start_agent_session did not preserve requested session id");
+  const blockedClaimFailure = runHubExpectFailure("claim_issue", {
+    issue_id: createdIssue.identifier,
+    session_id: session.id,
+  });
+  assert(blockedClaimFailure.status !== 0, "claim_issue unexpectedly accepted dependency-blocked work");
+  assert(blockedClaimFailure.stderr.includes("is blocked; resolve its dependencies"), "claim_issue blocker guard did not explain the unresolved dependency");
+  runHub("tools/call", "resolve_issue_dependency", { dependency_id: dependency.id });
+  assert(runHub("tools/call", "list_issue_dependencies", { issue_id: createdIssue.identifier }).dependencies.length === 0, "resolve_issue_dependency left the blocker open");
   const claim = runHub("tools/call", "claim_issue", {
     issue_id: createdIssue.identifier,
     session_id: session.id,

@@ -89,7 +89,7 @@ npm run hub -- tools/list
 Create a project:
 
 ```powershell
-$json = '{"external_id":"demo-agent-project","name":"Demo Agent Project","summary":"Local task flow for an agent.","source":"local"}'
+$json = '{"external_id":"demo-agent-project","name":"Demo Agent Project","summary":"Local task flow for an agent.","status":"In Progress","priority":2,"lead":"Demo Agent","target_date":"2026-12-15","source":"local"}'
 $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
 npm run hub -- tools/call save_project "base64:$b64"
 ```
@@ -143,11 +143,17 @@ The CLI and MCP tool names are intentionally stable and harness-friendly:
 - `dashboard`
 - `list_teams`
 - `list_projects`
+- `get_project`
 - `save_project`
+- `list_project_updates`
+- `save_project_update`
 - `list_issues`
 - `get_issue`
 - `save_issue`
 - `save_comment`
+- `list_issue_dependencies`
+- `save_issue_dependency`
+- `resolve_issue_dependency`
 - `start_agent_session`
 - `heartbeat_agent_session`
 - `end_agent_session`
@@ -229,6 +235,23 @@ The UI accepts stable deep links:
 - `/workspace/issues`
 
 Context bindings are local metadata. They must not contain passwords, tokens, cookies, or private keys. Repository remotes are normalized to remove URL credentials before storage.
+
+## Canonical Requisition Tickets
+
+When Claw is checked out under the mainMCP workspace, reconcile the top-level
+canonical requisition registry into a dedicated local project:
+
+```bash
+npm run sync:requisitions
+npm run sync:requisitions -- --apply
+npm run sync:requisitions -- --check
+```
+
+The command is idempotent. It keeps library-owned requirements in their existing
+algorithm and math projects and creates stable tickets for the
+top-level alias, clause, policy, and source records. Override the canon database
+path with `MAINMCP_CANON_DB` when the default workspace-relative path does not
+apply.
 
 ## Local Data
 

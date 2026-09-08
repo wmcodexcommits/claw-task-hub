@@ -10,14 +10,19 @@ import {
   getIssue,
   getProject,
   listContextBindings,
+  listIssueDependencies,
   listIssueGroups,
   listIssues,
   listProjects,
+  listProjectUpdates,
   listTeams,
   parseIssueDisplayLimit,
   recentSyncRuns,
   resolveContextProject,
+  resolveIssueDependency,
   saveComment,
+  saveIssueDependency,
+  saveProjectUpdate,
   upsertContextBinding,
   upsertIssue,
   upsertProject,
@@ -134,13 +139,40 @@ app.get("/api/projects/:id", (req, res) => {
 
 app.post("/api/projects", (req, res) => {
   const schema = z.object({
-    name: z.string().min(1),
+    id: z.string().optional(),
+    external_id: z.string().optional(),
+    name: z.string().min(1).optional(),
     summary: z.string().optional(),
     description: z.string().optional(),
     status: z.string().optional(),
     priority: z.number().int().min(0).max(4).optional(),
+    lead: z.string().nullable().optional(),
+    target_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullable().optional(),
+    source: z.string().optional(),
+    archived_at: z.string().nullable().optional(),
+    created_at: z.string().optional(),
+    updated_at: z.string().optional(),
+  }).superRefine((value, ctx) => {
+    if (!value.id && !value.external_id && !value.name) {
+      ctx.addIssue({ code: "custom", path: ["name"], message: "name is required when creating a project" });
+    }
   });
   res.json({ project: upsertProject(schema.parse(req.body)) });
+});
+
+app.get("/api/projects/:id/updates", (req, res) => {
+  res.json({ updates: listProjectUpdates({ project_id: req.params.id, limit: req.query.limit as string | undefined }) });
+});
+
+app.post("/api/projects/:id/updates", (req, res) => {
+  const schema = z.object({
+    id: z.string().optional(),
+    external_id: z.string().optional(),
+    body: z.string().min(1).max(10000),
+    health: z.enum(["on_track", "at_risk", "off_track", "complete"]).optional(),
+    author: z.string().optional(),
+  });
+  res.json({ update: saveProjectUpdate({ ...schema.parse(req.body), project_id: req.params.id }) });
 });
 
 app.get("/api/issues", (req, res) => {
@@ -152,6 +184,7 @@ app.get("/api/issues", (req, res) => {
     status: req.query.status as string | undefined,
     status_type: req.query.status_type as string | undefined,
     include_done: req.query.include_done as string | undefined,
+    blocked: req.query.blocked as string | undefined,
     query: req.query.query as string | undefined,
     limit: req.query.limit ? Number(req.query.limit) : undefined,
     offset: req.query.offset ? Number(req.query.offset) : undefined,
@@ -191,7 +224,9 @@ app.post("/api/issues", (req, res) => {
     team_id: z.string().nullable().optional(),
     assignee: z.string().nullable().optional(),
     labels: z.array(z.string()).optional(),
-  }).superRefine((value, ctx) => {
+  // Unknown keys must REACH upsertIssue's guard. Stripping them here is the same silent
+  // discard the guard exists to stop — over HTTP, `state` would vanish before any check.
+  }).passthrough().superRefine((value, ctx) => {
     if (!value.id && !value.external_id && !value.identifier && !value.issue_id && !value.title) {
       ctx.addIssue({ code: "custom", path: ["title"], message: "title is required when creating an issue" });
     }
@@ -210,6 +245,85 @@ app.post("/api/issues/:id/comments", (req, res) => {
   res.json({ comment: saveComment({ ...schema.parse(req.body), issue_id: (issue as unknown as { id: string }).id }) });
 });
 
-app.listen(port, host, () => {
+app.get("/api/issues/:id/dependencies", (req, res) => {
+  res.json({
+    dependencies: listIssueDependencies({
+      issue_id: req.params.id,
+      include_resolved: req.query.include_resolved as string | undefined,
+      limit: req.query.limit as string | undefined,
+    }),
+  });
+});
+
+app.post("/api/issues/:id/dependencies", (req, res) => {
+  const schema = z.object({
+    id: z.string().optional(),
+    external_id: z.string().optional(),
+    blocker_issue_id: z.string().min(1),
+    reason: z.string().max(2000).optional(),
+  });
+  try {
+    res.json({ dependency: saveIssueDependency({ ...schema.parse(req.body), issue_id: req.params.id }) });
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.post("/api/issue-dependencies/:id/resolve", (req, res) => {
+  try {
+    res.json(resolveIssueDependency({ dependency_id: req.params.id }));
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+// express fires this callback even when the bind FAILED (verified: on
+// EADDRINUSE it runs with server.listening === false), so an unguarded log
+// here announces a success that did not happen, one line before the error.
+const server = app.listen(port, host, () => {
+  if (!server.listening) return;
   console.log(`Claw Task Hub API listening on http://${host}:${port}`);
+});
+
+// A launcher that loses the port must SAY SO.
+//
+// app.listen had no error handler, so EADDRINUSE surfaced as an uncaught
+// exception and was easily lost under concurrently. A manual `npm run dev`
+// started while the systemd service held 4781 died without a visible error,
+// and the already-running service went on answering with six-hour-old code
+// while the files on disk were edited three times. Nothing in the UI or the
+// API could show that, because the API was the stale thing.
+server.on("error", async (error: NodeJS.ErrnoException) => {
+  if (error.code !== "EADDRINUSE") {
+    console.error(`Claw Task Hub API failed to start: ${error.message}`);
+    process.exit(1);
+  }
+
+  console.error(`Claw Task Hub API cannot start: ${host}:${port} is already in use.`);
+
+  // Say WHAT holds it, where that is answerable. Another instance of this
+  // server identifies itself and names the database it is serving — which is
+  // the fact that matters, because a second instance on a different database
+  // is a different failure from a stale instance on the same one.
+  try {
+    const response = await fetch(`http://${host}:${port}/api/health`, {
+      signal: AbortSignal.timeout(2000),
+    });
+    const health = (await response.json()) as { ok?: boolean; dbPath?: string };
+    if (health?.ok) {
+      console.error(
+        `A Claw Task Hub instance is already running there, serving ${health.dbPath}.`);
+      console.error(
+        "If it is the systemd user service, restart it rather than starting a second one:");
+      console.error("  systemctl --user restart claw-task-hub.service");
+      console.error(
+        "Note that a running server keeps the code it started with — restart it after editing server/.");
+    } else {
+      console.error("Something is listening there, but it is not a Claw Task Hub API.");
+    }
+  } catch {
+    console.error(
+      "Something is listening there and did not answer /api/health. Set PORT to use a different port.");
+  }
+  process.exit(1);
 });

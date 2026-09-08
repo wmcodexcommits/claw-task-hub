@@ -94,6 +94,12 @@ Use these statuses unless a project has a documented local exception:
 
 When a task is done, write an acceptance comment before or while moving it to `Done`.
 
+Claims enforce this workflow: claiming ready work moves it to `In Progress`, releasing unfinished work moves it to `Todo`, and completing a claim moves it to `Done`. Record real blockers with `save_issue_dependency`; an unresolved dependency makes the issue effectively `Blocked` without discarding its underlying ready/in-progress state. Resolve it with `resolve_issue_dependency`. Priority is urgency, not blocker state.
+
+Use `save_project_update` for durable project-level reporting. Every update carries an explicit health value (`on_track`, `at_risk`, `off_track`, or `complete`) and appears in project activity; issue comments remain issue-level evidence.
+
+Configure project metadata with `save_project`: `status`, `priority`, `lead`, `target_date` (`YYYY-MM-DD`), and `source` are preserved by partial updates and displayed by the Projects UI. Project health is not guessed from status; the Projects UI uses the most recent `save_project_update` health value and shows `No update` until one exists.
+
 ## Agent Write Rules
 
 Agents must:
@@ -273,11 +279,17 @@ Canonical tool names:
 
 - `dashboard`
 - `list_projects`
+- `get_project`
 - `save_project`
+- `list_project_updates`
+- `save_project_update`
 - `list_issues`
 - `get_issue`
 - `save_issue`
 - `save_comment`
+- `list_issue_dependencies`
+- `save_issue_dependency`
+- `resolve_issue_dependency`
 - `list_teams`
 - `start_agent_session`
 - `heartbeat_agent_session`

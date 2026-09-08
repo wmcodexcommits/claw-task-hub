@@ -3,7 +3,6 @@ import type { FormEvent } from "react";
 import {
   Activity,
   AlertTriangle,
-  Bell,
   Box,
   CheckCircle2,
   Circle,
@@ -19,21 +18,32 @@ import {
   Plus,
   Search,
   SlidersHorizontal,
-  Star,
   UserRound,
   X,
 } from "lucide-react";
 import "./App.css";
 
+type ProjectHealth = "on_track" | "at_risk" | "off_track" | "complete";
+
 type Project = {
   id: string;
+  external_id?: string | null;
   name: string;
-  summary?: string;
-  description?: string;
+  summary?: string | null;
+  description?: string | null;
   status: string;
   priority: number;
   lead?: string | null;
+  target_date?: string | null;
+  source: string;
+  updated_at: string;
   issue_count: number;
+  done_count?: number;
+  active_count?: number;
+  blocker_count?: number;
+  health?: ProjectHealth | null;
+  latest_update_body?: string | null;
+  latest_update_at?: string | null;
 };
 
 type Issue = {
@@ -58,9 +68,30 @@ type Issue = {
   last_acceptance_at?: string | null;
   last_acceptance_comment?: IssueComment | null;
   comments?: IssueComment[];
+  blocker_count?: number;
+  blocking_count?: number;
+  dependencies?: IssueDependency[];
+  blocking?: IssueDependency[];
 };
 
 type IssueComment = { id: string; body: string; author: string; created_at: string };
+
+type IssueDependency = {
+  id: string;
+  status: "open" | "resolved";
+  reason?: string | null;
+  blocker_identifier: string;
+  blocker_title: string;
+  resolved_at?: string | null;
+};
+
+type ProjectUpdate = {
+  id: string;
+  body: string;
+  health: ProjectHealth;
+  author?: string | null;
+  created_at: string;
+};
 
 type IssueClaim = {
   id: string;
@@ -77,6 +108,9 @@ type ProjectTab = "overview" | "activity" | "issues";
 type StatusMode = "all" | "active" | "paused" | "backlog" | "todo" | "blockers";
 type IssueDisplayLimit = "50" | "100" | "200" | "all";
 type IssueStatusType = "started" | "blocked" | "paused" | "backlog" | "unstarted" | "completed" | "canceled";
+type ProjectStatusFilter = "all" | "active" | "paused" | "backlog" | "completed";
+type ProjectHealthFilter = "all" | ProjectHealth | "none";
+type ProjectSort = "updated" | "name" | "priority" | "target_date" | "issues";
 
 type ContextBinding = {
   id: string;
@@ -133,10 +167,13 @@ type ActivityEvent = {
   status_type: string;
   priority: number;
   updated_at: string;
-  type: "issue" | "comment";
-  verb: "completed" | "started" | "blocker" | "updated" | "commented";
+  type: "issue" | "comment" | "dependency" | "project_update";
+  verb: "completed" | "started" | "blocker" | "unblocked" | "updated" | "commented" | "project_updated";
   author?: string;
   body?: string;
+  health?: ProjectUpdate["health"];
+  blocker_identifier?: string;
+  blocker_title?: string;
 };
 
 type ProjectDetail = {
@@ -147,6 +184,7 @@ type ProjectDetail = {
   issues: Issue[];
   issueGroups?: ApiIssueGroup[];
   issueDisplayLimit?: IssueDisplayLimit;
+  projectUpdates: ProjectUpdate[];
   activity: ActivityEvent[];
 };
 
@@ -188,6 +226,14 @@ function App() {
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
   const [detailOpen, setDetailOpen] = useState(false);
+  const [projectEditorOpen, setProjectEditorOpen] = useState(false);
+  const [projectSaving, setProjectSaving] = useState(false);
+  const [projectFiltersOpen, setProjectFiltersOpen] = useState(false);
+  const [projectSettingsOpen, setProjectSettingsOpen] = useState(false);
+  const [projectQuery, setProjectQuery] = useState("");
+  const [projectStatusFilter, setProjectStatusFilter] = useState<ProjectStatusFilter>("all");
+  const [projectHealthFilter, setProjectHealthFilter] = useState<ProjectHealthFilter>("all");
+  const [projectSort, setProjectSort] = useState<ProjectSort>("updated");
   const pageRef = useRef<AppPage>("projects");
   const issueDisplayLimitRef = useRef<IssueDisplayLimit>(defaultIssueDisplayLimit);
   const projectDetailRef = useRef<ProjectDetail | null>(null);
@@ -463,8 +509,8 @@ function App() {
           title,
           description: String(data.get("description") ?? ""),
           project_id: projectDetail.project.id,
-          status: "Backlog",
-          status_type: "backlog",
+          status: "Todo",
+          status_type: "unstarted",
           priority: Number(data.get("priority") ?? 3),
           labels: ["local"],
         }),
@@ -477,6 +523,39 @@ function App() {
       setCreateError(error instanceof Error ? error.message : String(error));
     } finally {
       setCreating(false);
+    }
+  }
+
+  async function createProject(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const data = new FormData(form);
+    const name = String(data.get("name") ?? "").trim();
+    if (!name) return;
+    setCreateError(null);
+    setProjectSaving(true);
+    try {
+      const created = await api<{ project: Project }>("/projects", {
+        method: "POST",
+        body: JSON.stringify({
+          name,
+          summary: String(data.get("summary") ?? "").trim() || undefined,
+          description: String(data.get("description") ?? "").trim() || undefined,
+          status: String(data.get("status") ?? "Backlog"),
+          priority: Number(data.get("priority") ?? 3),
+          lead: String(data.get("lead") ?? "").trim() || null,
+          target_date: String(data.get("target_date") ?? "").trim() || null,
+          source: "local",
+        }),
+      });
+      form.reset();
+      setProjectEditorOpen(false);
+      await refresh(true);
+      await openProject(created.project);
+    } catch (error) {
+      setCreateError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setProjectSaving(false);
     }
   }
 
@@ -493,6 +572,64 @@ function App() {
     });
     form.reset();
     await openIssue(selectedIssue);
+  }
+
+  async function postProjectUpdate(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!projectDetail) return;
+    const form = event.currentTarget;
+    const data = new FormData(form);
+    const body = String(data.get("body") ?? "").trim();
+    if (!body) return;
+    setCreateError(null);
+    try {
+      await api(`/projects/${encodeURIComponent(projectDetail.project.id)}/updates`, {
+        method: "POST",
+        body: JSON.stringify({ body, health: String(data.get("health") ?? "on_track"), author: "Agent" }),
+      });
+      form.reset();
+      await refresh(true);
+    } catch (error) {
+      setCreateError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function addDependency(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!selectedIssue) return;
+    const form = event.currentTarget;
+    const data = new FormData(form);
+    const blockerIssueId = String(data.get("blocker_issue_id") ?? "").trim();
+    if (!blockerIssueId) return;
+    setCreateError(null);
+    try {
+      await api(`/issues/${encodeURIComponent(selectedIssue.id)}/dependencies`, {
+        method: "POST",
+        body: JSON.stringify({ blocker_issue_id: blockerIssueId, reason: String(data.get("reason") ?? "").trim() }),
+      });
+      form.reset();
+      await refresh(true);
+      await openIssue(selectedIssue);
+    } catch (error) {
+      setCreateError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function resolveDependency(dependencyId: string) {
+    if (!selectedIssue) return;
+    await api(`/issue-dependencies/${encodeURIComponent(dependencyId)}/resolve`, { method: "POST", body: "{}" });
+    await refresh(true);
+    await openIssue(selectedIssue);
+  }
+
+  async function updateIssueStatus(status: string) {
+    if (!selectedIssue) return;
+    const result = await api<{ issue: Issue }>("/issues", {
+      method: "POST",
+      body: JSON.stringify({ issue_id: selectedIssue.id, status }),
+    });
+    setSelectedIssue(result.issue);
+    await refresh(true);
   }
 
   const searchScope = `${page}:${page === "project" ? projectDetail?.project.id ?? "" : ""}`;
@@ -512,7 +649,7 @@ function App() {
         (statusMode === "paused" && statusType === "paused") ||
         (statusMode === "backlog" && statusType === "backlog") ||
         (statusMode === "todo" && statusType === "unstarted") ||
-        (statusMode === "blockers" && issue.priority === 1 && statusType !== "completed");
+        (statusMode === "blockers" && statusType === "blocked");
       return matchesText && matchesMode;
     });
   }, [matchingServerSearch, projectDetail?.issues, statusMode, trimmedQuery, workspaceIssues]);
@@ -542,10 +679,38 @@ function App() {
           onWorkspace={openWorkspacePage}
           onTab={changeTab}
           onProjectShortcut={downloadProjectShortcut}
+          statusMode={statusMode}
+          onStatusMode={setStatusMode}
+          projectFiltersOpen={projectFiltersOpen}
+          projectSettingsOpen={projectSettingsOpen}
+          onToggleProjectFilters={() => setProjectFiltersOpen((open) => !open)}
+          onToggleProjectSettings={() => setProjectSettingsOpen((open) => !open)}
+          onNewProject={() => {
+            setCreateError(null);
+            setProjectEditorOpen(true);
+          }}
         />
 
         {page === "projects" ? (
-          <ProjectsPage projects={projects} onOpenProject={openProject} />
+          <ProjectsPage
+            projects={projects}
+            filtersOpen={projectFiltersOpen}
+            settingsOpen={projectSettingsOpen}
+            query={projectQuery}
+            statusFilter={projectStatusFilter}
+            healthFilter={projectHealthFilter}
+            sort={projectSort}
+            onQuery={setProjectQuery}
+            onStatusFilter={setProjectStatusFilter}
+            onHealthFilter={setProjectHealthFilter}
+            onSort={setProjectSort}
+            onClearFilters={() => {
+              setProjectQuery("");
+              setProjectStatusFilter("all");
+              setProjectHealthFilter("all");
+            }}
+            onOpenProject={openProject}
+          />
         ) : page === "workspace" ? (
           <IssuesPage
             title="All issues"
@@ -564,11 +729,14 @@ function App() {
             onCreate={createIssue}
             onOpenIssue={openIssue}
             onAddComment={addComment}
+            onAddDependency={addDependency}
+            onResolveDependency={resolveDependency}
+            onStatusChange={updateIssueStatus}
           />
         ) : tab === "overview" && projectDetail ? (
           <ProjectOverview detail={projectDetail} onTab={changeTab} />
         ) : tab === "activity" && projectDetail ? (
-          <ProjectActivity detail={projectDetail} />
+          <ProjectActivity detail={projectDetail} onPostUpdate={postProjectUpdate} error={createError} />
         ) : projectDetail ? (
           <IssuesPage
             title={projectDetail.project.name}
@@ -587,12 +755,30 @@ function App() {
             onCreate={createIssue}
             onOpenIssue={openIssue}
             onAddComment={addComment}
+            onAddDependency={addDependency}
+            onResolveDependency={resolveDependency}
+            onStatusChange={updateIssueStatus}
           />
         ) : null}
       </section>
       <footer className="askbar">Ask Claw Task Hub</footer>
       {detailOpen && selectedIssue ? (
-        <IssueDialog issue={selectedIssue} onClose={() => setDetailOpen(false)} onAddComment={addComment} />
+        <IssueDialog
+          issue={selectedIssue}
+          onClose={() => setDetailOpen(false)}
+          onAddComment={addComment}
+          onAddDependency={addDependency}
+          onResolveDependency={resolveDependency}
+          onStatusChange={updateIssueStatus}
+        />
+      ) : null}
+      {projectEditorOpen ? (
+        <ProjectDialog
+          saving={projectSaving}
+          error={createError}
+          onClose={() => setProjectEditorOpen(false)}
+          onSubmit={createProject}
+        />
       ) : null}
     </main>
   );
@@ -605,10 +791,10 @@ function TopChrome() {
         <Database size={15} />
         <span>clawtaskhub</span>
       </div>
-      <button className="ghost-icon"><Plus size={16} /></button>
+      <span className="ghost-icon decorative" aria-hidden="true"><Plus size={16} /></span>
       <div className="address">{window.location.host || "localhost:5173"}</div>
-      <button className="ghost-icon"><Activity size={16} /></button>
-      <button className="ghost-icon"><MoreHorizontal size={17} /></button>
+      <span className="ghost-icon decorative" aria-hidden="true"><Activity size={16} /></span>
+      <span className="ghost-icon decorative" aria-hidden="true"><MoreHorizontal size={17} /></span>
     </header>
   );
 }
@@ -621,6 +807,13 @@ function HeaderBar({
   onWorkspace,
   onTab,
   onProjectShortcut,
+  statusMode,
+  onStatusMode,
+  projectFiltersOpen,
+  projectSettingsOpen,
+  onToggleProjectFilters,
+  onToggleProjectSettings,
+  onNewProject,
 }: {
   page: AppPage;
   tab: ProjectTab;
@@ -629,12 +822,19 @@ function HeaderBar({
   onWorkspace: () => void;
   onTab: (tab: ProjectTab) => void;
   onProjectShortcut: () => void;
+  statusMode: StatusMode;
+  onStatusMode: (mode: StatusMode) => void;
+  projectFiltersOpen: boolean;
+  projectSettingsOpen: boolean;
+  onToggleProjectFilters: () => void;
+  onToggleProjectSettings: () => void;
+  onNewProject: () => void;
 }) {
   const showProjectTabs = page === "project";
   return (
     <>
       <div className="crumbbar">
-        <button className="crumb-icon"><Layers size={15} /></button>
+        <span className="crumb-icon decorative" aria-hidden="true"><Layers size={15} /></span>
         {page === "projects" ? (
           <strong>Projects</strong>
         ) : page === "workspace" ? (
@@ -646,21 +846,24 @@ function HeaderBar({
             <strong>{project?.name}</strong>
           </>
         )}
-        <button className="ghost-icon"><Star size={15} /></button>
-        <button className="ghost-icon"><MoreHorizontal size={17} /></button>
         <div className="crumb-actions">
-          <button
-            className="project-shortcut-button"
-            disabled={!project}
-            title="Download project shortcut"
-            aria-label="Download project shortcut"
-            onClick={onProjectShortcut}
-          >
-            <Link size={15} />
-            <span>Shortcut</span>
-          </button>
-          <button className="ghost-icon"><Bell size={15} /></button>
-          <button className="ghost-icon"><Plus size={16} /></button>
+          {project ? (
+            <button
+              className="project-shortcut-button"
+              title="Download project shortcut"
+              aria-label="Download project shortcut"
+              onClick={onProjectShortcut}
+            >
+              <Link size={15} />
+              <span>Shortcut</span>
+            </button>
+          ) : null}
+          {page === "projects" ? (
+            <button className="project-shortcut-button" onClick={onNewProject} aria-label="New project">
+              <Plus size={15} />
+              <span>New project</span>
+            </button>
+          ) : null}
         </div>
       </div>
 
@@ -669,9 +872,9 @@ function HeaderBar({
           <button className="pill active">All projects</button>
         ) : page === "workspace" ? (
           <>
-            <button className="pill active">Active</button>
-            <button className="pill" onClick={onWorkspace}>All issues</button>
-            <button className="pill">Backlog</button>
+            <button className={statusMode === "active" ? "pill active" : "pill"} onClick={() => onStatusMode("active")}>Active</button>
+            <button className={statusMode === "all" ? "pill active" : "pill"} onClick={() => { onWorkspace(); onStatusMode("all"); }}>All issues</button>
+            <button className={statusMode === "backlog" ? "pill active" : "pill"} onClick={() => onStatusMode("backlog")}>Backlog</button>
           </>
         ) : showProjectTabs ? (
           <>
@@ -680,19 +883,109 @@ function HeaderBar({
             <button className={tab === "issues" ? "pill active" : "pill"} onClick={() => onTab("issues")}>Issues</button>
           </>
         ) : null}
-        <button className="stack-icon"><Layers size={14} /></button>
-        <div className="view-tools">
-          <button className="round-icon"><ListFilter size={15} /></button>
-          <button className="round-icon"><SlidersHorizontal size={15} /></button>
-        </div>
+        <span className="stack-icon decorative" aria-hidden="true"><Layers size={14} /></span>
+        {page === "projects" ? (
+          <div className="view-tools">
+            <button
+              className={projectFiltersOpen ? "round-icon active" : "round-icon"}
+              onClick={onToggleProjectFilters}
+              aria-label="Filter projects"
+              aria-expanded={projectFiltersOpen}
+            ><ListFilter size={15} /></button>
+            <button
+              className={projectSettingsOpen ? "round-icon active" : "round-icon"}
+              onClick={onToggleProjectSettings}
+              aria-label="Configure project view"
+              aria-expanded={projectSettingsOpen}
+            ><SlidersHorizontal size={15} /></button>
+          </div>
+        ) : null}
       </div>
     </>
   );
 }
 
-function ProjectsPage({ projects, onOpenProject }: { projects: Project[]; onOpenProject: (project: Project) => void }) {
+function ProjectsPage({
+  projects,
+  filtersOpen,
+  settingsOpen,
+  query,
+  statusFilter,
+  healthFilter,
+  sort,
+  onQuery,
+  onStatusFilter,
+  onHealthFilter,
+  onSort,
+  onClearFilters,
+  onOpenProject,
+}: {
+  projects: Project[];
+  filtersOpen: boolean;
+  settingsOpen: boolean;
+  query: string;
+  statusFilter: ProjectStatusFilter;
+  healthFilter: ProjectHealthFilter;
+  sort: ProjectSort;
+  onQuery: (value: string) => void;
+  onStatusFilter: (value: ProjectStatusFilter) => void;
+  onHealthFilter: (value: ProjectHealthFilter) => void;
+  onSort: (value: ProjectSort) => void;
+  onClearFilters: () => void;
+  onOpenProject: (project: Project) => void;
+}) {
+  const visibleProjects = useMemo(() => {
+    const normalizedQuery = query.trim().toLowerCase();
+    const filtered = projects.filter((project) => {
+      const text = [
+        project.name,
+        project.summary,
+        project.description,
+        project.status,
+        project.lead,
+        project.source,
+        project.latest_update_body,
+      ].filter(Boolean).join(" ").toLowerCase();
+      const statusType = resolveProjectStatusType(project.status);
+      const matchesStatus = statusFilter === "all" ||
+        (statusFilter === "active" && ["started", "blocked", "unstarted"].includes(statusType)) ||
+        statusType === statusFilter;
+      const matchesHealth = healthFilter === "all" ||
+        (healthFilter === "none" ? !project.health : project.health === healthFilter);
+      return (!normalizedQuery || text.includes(normalizedQuery)) && matchesStatus && matchesHealth;
+    });
+    return filtered.sort((left, right) => {
+      if (sort === "name") return left.name.localeCompare(right.name);
+      if (sort === "priority") return left.priority - right.priority || left.name.localeCompare(right.name);
+      if (sort === "issues") return right.issue_count - left.issue_count || left.name.localeCompare(right.name);
+      if (sort === "target_date") {
+        return (left.target_date || "9999-12-31").localeCompare(right.target_date || "9999-12-31") || left.name.localeCompare(right.name);
+      }
+      return (right.latest_update_at || right.updated_at).localeCompare(left.latest_update_at || left.updated_at);
+    });
+  }, [healthFilter, projects, query, sort, statusFilter]);
+  const filtersActive = Boolean(query.trim()) || statusFilter !== "all" || healthFilter !== "all";
+
   return (
     <section className="projects-screen">
+      {filtersOpen || settingsOpen ? (
+        <div className="project-view-config">
+          {filtersOpen ? (
+            <div className="project-filter-controls">
+              <label className="project-search"><Search size={15} /><input aria-label="Search projects" value={query} onChange={(event) => onQuery(event.target.value)} placeholder="Search projects" /></label>
+              <label><span>Status</span><select aria-label="Filter projects by status" value={statusFilter} onChange={(event) => onStatusFilter(event.target.value as ProjectStatusFilter)}><option value="all">All</option><option value="active">Active</option><option value="paused">Paused</option><option value="backlog">Backlog</option><option value="completed">Completed</option></select></label>
+              <label><span>Health</span><select aria-label="Filter projects by health" value={healthFilter} onChange={(event) => onHealthFilter(event.target.value as ProjectHealthFilter)}><option value="all">All</option><option value="on_track">On track</option><option value="at_risk">At risk</option><option value="off_track">Off track</option><option value="complete">Complete</option><option value="none">No update</option></select></label>
+              <button type="button" disabled={!filtersActive} onClick={onClearFilters}><X size={14} /> Clear</button>
+            </div>
+          ) : null}
+          {settingsOpen ? (
+            <div className="project-sort-control">
+              <label><span>Sort</span><select aria-label="Sort projects" value={sort} onChange={(event) => onSort(event.target.value as ProjectSort)}><option value="updated">Recently updated</option><option value="name">Name</option><option value="priority">Priority</option><option value="target_date">Target date</option><option value="issues">Issue count</option></select></label>
+            </div>
+          ) : null}
+          <span className="project-result-count">{visibleProjects.length} of {projects.length} projects</span>
+        </div>
+      ) : null}
       <div className="projects-table">
         <div className="project-row project-head">
           <span>Name</span>
@@ -703,19 +996,42 @@ function ProjectsPage({ projects, onOpenProject }: { projects: Project[]; onOpen
           <span>Issues</span>
           <span>Status</span>
         </div>
-        {projects.map((project) => (
+        {visibleProjects.map((project) => (
           <button key={project.id} className="project-row" onClick={() => onOpenProject(project)}>
-            <span className="project-name"><ProjectIcon project={project} /> {project.name}</span>
-            <span><Circle className="dim" size={15} /></span>
-            <span><PriorityBars priority={project.priority} /></span>
-            <span>{project.lead ? <Avatar label={project.lead} /> : <UserRound className="dim" size={16} />}</span>
-            <span className="dim">Target date</span>
-            <strong>{project.issue_count}</strong>
-            <span><StatusIcon statusType={project.status === "Done" ? "completed" : "started"} /></span>
+            <span className="project-name"><ProjectIcon project={project} /><span><strong>{project.name}</strong>{project.summary || project.description ? <small>{project.summary || project.description}</small> : null}</span></span>
+            <ProjectHealthBadge project={project} />
+            <span className="project-priority" title={`Priority: ${priorityName(project.priority)}`}><PriorityBars priority={project.priority} /> {priorityName(project.priority)}</span>
+            <span className="project-lead">{project.lead ? <><Avatar label={project.lead} /> {project.lead}</> : <><UserRound className="dim" size={16} /> <span className="dim">Unassigned</span></>}</span>
+            <span className={project.target_date ? "project-target" : "project-target dim"}>{project.target_date ? formatProjectDate(project.target_date) : "No target date"}</span>
+            <strong className="project-issues" title={`${project.done_count ?? 0} done, ${project.active_count ?? 0} active, ${project.blocker_count ?? 0} blocked`}>{project.issue_count}</strong>
+            <StatusPill status={project.status} statusType={resolveProjectStatusType(project.status)} />
           </button>
         ))}
+        {visibleProjects.length === 0 ? <div className="empty-list project-empty">No projects match the current filters.</div> : null}
       </div>
     </section>
+  );
+}
+
+function ProjectDialog({ saving, error, onClose, onSubmit }: { saving: boolean; error: string | null; onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) {
+  return (
+    <div className="issue-dialog-backdrop" role="presentation" onMouseDown={onClose}>
+      <section className="issue-dialog project-dialog" role="dialog" aria-modal="true" aria-labelledby="project-dialog-title" onMouseDown={(event) => event.stopPropagation()}>
+        <button className="dialog-close" onClick={onClose} aria-label="Close new project"><X size={16} /></button>
+        <h2 id="project-dialog-title">New project</h2>
+        <form className="project-form" onSubmit={onSubmit}>
+          <label><span>Name</span><input name="name" aria-label="Project name" required autoFocus /></label>
+          <label><span>Summary</span><input name="summary" aria-label="Project summary" /></label>
+          <label className="project-form-wide"><span>Description</span><textarea name="description" aria-label="Project description" rows={4} /></label>
+          <label><span>Status</span><select name="status" aria-label="Project status" defaultValue="Backlog"><option>Backlog</option><option>Planned</option><option>In Progress</option><option>Paused</option><option>Done</option><option>Canceled</option></select></label>
+          <label><span>Priority</span><select name="priority" aria-label="Project priority" defaultValue="3"><option value="1">Urgent</option><option value="2">High</option><option value="3">Medium</option><option value="4">Low</option></select></label>
+          <label><span>Lead</span><input name="lead" aria-label="Project lead" /></label>
+          <label><span>Target date</span><input name="target_date" aria-label="Project target date" type="date" /></label>
+          {error ? <div className="create-error project-form-wide"><AlertTriangle size={14} />{error}</div> : null}
+          <div className="project-form-actions project-form-wide"><button type="button" onClick={onClose}>Cancel</button><button type="submit" disabled={saving}>{saving ? "Saving" : "Create project"}</button></div>
+        </form>
+      </section>
+    </div>
   );
 }
 
@@ -732,11 +1048,12 @@ function ProjectOverview({ detail, onTab }: { detail: ProjectDetail; onTab: (tab
 
       <div className="properties-row">
         <span className="prop-label">Properties</span>
-        <StatusPill status={project.status || "In Progress"} statusType={project.status === "Done" ? "completed" : "started"} />
+        <StatusPill status={project.status || "In Progress"} statusType={resolveProjectStatusType(project.status)} />
+        <ProjectHealthBadge project={project} />
         <span className="prop-item"><PriorityBars priority={project.priority} /> {priorityName(project.priority)}</span>
         <span className="prop-item"><Avatar label={project.lead || "Unassigned"} /> {project.lead || "Unassigned"}</span>
-        <span className="prop-item">Apr 2026 -&gt; Target date</span>
-        <span className="prop-item"><Box size={14} /> Local workspace</span>
+        <span className="prop-item">{project.target_date ? formatProjectDate(project.target_date) : "No target date"}</span>
+        <span className="prop-item"><Box size={14} /> {projectSourceLabel(project.source)}</span>
       </div>
 
       <div className="resources-row">
@@ -748,40 +1065,59 @@ function ProjectOverview({ detail, onTab }: { detail: ProjectDetail; onTab: (tab
               <span>{issueCode(issue)} {issue.title}</span>
             </button>
           ))}
-          <button className="add-resource"><Plus size={14} /> Add resource</button>
+          <button className="add-resource" onClick={() => onTab("issues")}><Plus size={14} /> Add issue resource</button>
         </div>
       </div>
 
       <button className="update-box" onClick={() => onTab("activity")}>
         <MessageSquarePlus size={16} />
-        <span>Write first project update</span>
+        <span>{detail.projectUpdates.length ? "Write project update" : "Write first project update"}</span>
       </button>
     </section>
   );
 }
 
-function ProjectActivity({ detail }: { detail: ProjectDetail }) {
+function ProjectActivity({
+  detail,
+  onPostUpdate,
+  error,
+}: {
+  detail: ProjectDetail;
+  onPostUpdate: (event: FormEvent<HTMLFormElement>) => void;
+  error: string | null;
+}) {
   return (
     <section className="activity-linear">
-      <div className="update-composer">
+      <form className="update-composer" onSubmit={onPostUpdate}>
         <div className="composer-tabs">
-          <span>Comment</span>
           <strong>Update</strong>
-          <em>On track</em>
+          <select name="health" aria-label="Project health" defaultValue="on_track">
+            <option value="on_track">On track</option>
+            <option value="at_risk">At risk</option>
+            <option value="off_track">Off track</option>
+            <option value="complete">Complete</option>
+          </select>
         </div>
-        <p>Write a project update...</p>
+        <textarea name="body" aria-label="Project update" placeholder="Write a project update..." required maxLength={10000} />
         <div className="composer-props">
-          <span>Priority</span><strong>No priority -&gt; {priorityName(detail.project.priority)}</strong>
+          <span>Priority</span><strong>{priorityName(detail.project.priority)}</strong>
           <span>Lead</span><strong><Avatar label={detail.project.lead || "Unassigned"} /> {detail.project.lead || "Unassigned"}</strong>
-          <span>Progress</span><strong>{detail.counts.done} done / {detail.counts.started} in progress / {detail.counts.open} open</strong>
+          <span>Progress</span><strong>{detail.counts.done} done / {detail.counts.started} in progress / {detail.counts.blockers} blocked / {detail.counts.open} open</strong>
         </div>
-        <button disabled>Post update</button>
-      </div>
+        {error ? <div className="create-error"><AlertTriangle size={14} />{error}</div> : null}
+        <button type="submit">Post update</button>
+      </form>
       <div className="timeline">
-        {detail.activity.map((event) => (
+        {/* Optional-chained deliberately. An API response without this key threw a
+            TypeError here, React aborted the render, and the Activity tab went
+            blank — which reads as "the app is broken" rather than "the server
+            is running old code", and the real cause took a stale-process check
+            to find. A missing key now degrades to the empty state. */}
+        {(detail.projectUpdates?.length ?? 0) === 0 ? <div className="empty-list">No project updates yet</div> : null}
+        {(detail.activity ?? []).map((event) => (
           <div key={`${event.id}-${event.updated_at}`} className="timeline-row">
             <StatusIcon statusType={event.status_type} />
-            <span>{activityText(event)} / {formatDate(event.updated_at)}</span>
+            <span><strong>{activityText(event)}</strong>{event.body ? ` — ${event.body}` : ""} / {formatDate(event.updated_at)}</span>
           </div>
         ))}
       </div>
@@ -806,6 +1142,9 @@ function IssuesPage({
   onCreate,
   onOpenIssue,
   onAddComment,
+  onAddDependency,
+  onResolveDependency,
+  onStatusChange,
 }: {
   title: string;
   issues: Issue[];
@@ -823,6 +1162,9 @@ function IssuesPage({
   onCreate: (event: FormEvent<HTMLFormElement>) => void;
   onOpenIssue: (issue: Issue, reveal?: boolean) => void;
   onAddComment: (event: FormEvent<HTMLFormElement>) => void;
+  onAddDependency: (event: FormEvent<HTMLFormElement>) => void;
+  onResolveDependency: (dependencyId: string) => void;
+  onStatusChange: (status: string) => void;
 }) {
   void issues;
   const grouped = issueGroups;
@@ -839,8 +1181,7 @@ function IssuesPage({
             <option value="all">All</option>
           </select>
         </label>
-        <button className="round-icon"><ListFilter size={15} /></button>
-        <button className="round-icon"><SlidersHorizontal size={15} /></button>
+        <button className="round-icon" aria-label="Clear issue filters" title="Clear issue filters" onClick={() => { onQuery(""); onStatusMode("all"); }}><X size={15} /></button>
       </div>
       <div className="mode-row">
         <button className={statusMode === "blockers" ? "mode-chip danger active" : "mode-chip danger"} onClick={() => onStatusMode("blockers")}><AlertTriangle size={14} />Blockers</button>
@@ -868,7 +1209,12 @@ function IssuesPage({
       <div className="issues-and-detail">
         <div className="linear-issue-list">
           {grouped.length === 0 ? (
-            <div className="empty-list">No issues found</div>
+            /* Name what emptied the list. "No issues found" is true whether the
+               project is empty, a search matched nothing, or a status chip has
+               nothing in it — and Active and Paused are legitimately empty
+               whenever no issue is started or paused, which was reported as the
+               filter being broken. */
+            <div className="empty-list">{emptyListReason(statusMode, query)}</div>
           ) : grouped.map((group) => (
             <div key={group.key} className="issue-group">
               <div className="group-head"><span>⌄</span><StatusIcon statusType={group.statusType} /><strong>{group.label}</strong><em>{groupCountLabel(group)}</em><button><Plus size={14} /></button></div>
@@ -894,13 +1240,31 @@ function IssuesPage({
             </div>
           ))}
         </div>
-        <IssueDetail issue={selectedIssue} onAddComment={onAddComment} />
+        <IssueDetail
+          issue={selectedIssue}
+          onAddComment={onAddComment}
+          onAddDependency={onAddDependency}
+          onResolveDependency={onResolveDependency}
+          onStatusChange={onStatusChange}
+        />
       </div>
     </section>
   );
 }
 
-function IssueDetail({ issue, onAddComment }: { issue: Issue | null; onAddComment: (event: FormEvent<HTMLFormElement>) => void }) {
+type IssueWorkflowHandlers = {
+  onAddDependency: (event: FormEvent<HTMLFormElement>) => void;
+  onResolveDependency: (dependencyId: string) => void;
+  onStatusChange: (status: string) => void;
+};
+
+function IssueDetail({
+  issue,
+  onAddComment,
+  onAddDependency,
+  onResolveDependency,
+  onStatusChange,
+}: { issue: Issue | null; onAddComment: (event: FormEvent<HTMLFormElement>) => void } & IssueWorkflowHandlers) {
   if (!issue) return <aside className="issue-detail empty-detail">Select an issue</aside>;
   return (
     <aside className="issue-detail">
@@ -909,6 +1273,7 @@ function IssueDetail({ issue, onAddComment }: { issue: Issue | null; onAddCommen
       <div className="detail-pills"><PriorityPill priority={issue.priority} /><span>{issue.project_name}</span><span>{issue.team_name}</span></div>
       <p>{issue.description || "No description yet."}</p>
       <AgentStatePanel issue={issue} />
+      <IssueWorkflowControls issue={issue} onAddDependency={onAddDependency} onResolveDependency={onResolveDependency} onStatusChange={onStatusChange} />
       <div className="comments-box">
         <strong>Activity</strong>
         {issue.comments?.map((comment) => <article key={comment.id}><b>{comment.author}</b><span>{comment.body}</span></article>)}
@@ -918,7 +1283,14 @@ function IssueDetail({ issue, onAddComment }: { issue: Issue | null; onAddCommen
   );
 }
 
-function IssueDialog({ issue, onClose, onAddComment }: { issue: Issue; onClose: () => void; onAddComment: (event: FormEvent<HTMLFormElement>) => void }) {
+function IssueDialog({
+  issue,
+  onClose,
+  onAddComment,
+  onAddDependency,
+  onResolveDependency,
+  onStatusChange,
+}: { issue: Issue; onClose: () => void; onAddComment: (event: FormEvent<HTMLFormElement>) => void } & IssueWorkflowHandlers) {
   return (
     <div className="issue-dialog-backdrop" role="presentation" onMouseDown={onClose}>
       <section className="issue-dialog" role="dialog" aria-modal="true" aria-labelledby="issue-dialog-title" onMouseDown={(event) => event.stopPropagation()}>
@@ -928,6 +1300,7 @@ function IssueDialog({ issue, onClose, onAddComment }: { issue: Issue; onClose: 
         <div className="detail-pills"><PriorityPill priority={issue.priority} /><span>{issue.project_name}</span><span>{issue.team_name}</span></div>
         <p>{issue.description || "No description yet."}</p>
         <AgentStatePanel issue={issue} />
+        <IssueWorkflowControls issue={issue} onAddDependency={onAddDependency} onResolveDependency={onResolveDependency} onStatusChange={onStatusChange} />
         <div className="comments-box">
           <strong>Activity</strong>
           {issue.comments?.map((comment) => <article key={comment.id}><b>{comment.author}</b><span>{comment.body}</span></article>)}
@@ -935,6 +1308,37 @@ function IssueDialog({ issue, onClose, onAddComment }: { issue: Issue; onClose: 
         </div>
       </section>
     </div>
+  );
+}
+
+function IssueWorkflowControls({ issue, onAddDependency, onResolveDependency, onStatusChange }: { issue: Issue } & IssueWorkflowHandlers) {
+  return (
+    <section className="workflow-controls">
+      <label>
+        <span>Status</span>
+        <select aria-label="Issue status" value={issue.status} onChange={(event) => onStatusChange(event.target.value)}>
+          <option value="Backlog">Backlog</option>
+          <option value="Todo">Todo</option>
+          <option value="In Progress">In Progress</option>
+          <option value="Blocked">Blocked</option>
+          <option value="Paused">Paused</option>
+          <option value="Done">Done</option>
+          <option value="Canceled">Canceled</option>
+        </select>
+      </label>
+      <strong>Blocked by</strong>
+      {issue.dependencies?.length ? issue.dependencies.map((dependency) => (
+        <article key={dependency.id} className={dependency.status === "open" ? "dependency open" : "dependency resolved"}>
+          <span>{dependency.blocker_identifier} {dependency.blocker_title}{dependency.reason ? ` — ${dependency.reason}` : ""}</span>
+          {dependency.status === "open" ? <button type="button" onClick={() => onResolveDependency(dependency.id)}>Resolve</button> : <em>Resolved</em>}
+        </article>
+      )) : <span className="dim">No blockers</span>}
+      <form className="dependency-form" onSubmit={onAddDependency}>
+        <input name="blocker_issue_id" aria-label="Blocking issue" placeholder="Blocking issue, e.g. CTH-123" required />
+        <input name="reason" aria-label="Blocker reason" placeholder="Why it blocks this issue" maxLength={2000} />
+        <button type="submit">Add blocker</button>
+      </form>
+    </section>
   );
 }
 
@@ -1171,6 +1575,22 @@ function apiGroupToUiGroup(group: ApiIssueGroup): UiIssueGroup {
   };
 }
 
+function emptyListReason(statusMode: StatusMode, query: string) {
+  const trimmed = query.trim();
+  if (trimmed) return `No issues match "${trimmed}"${statusMode === "all" ? "" : ` in ${statusModeLabel(statusMode)}`}`;
+  if (statusMode === "all") return "No issues yet";
+  return `No issues in ${statusModeLabel(statusMode)}`;
+}
+
+function statusModeLabel(statusMode: StatusMode) {
+  if (statusMode === "blockers") return "Blockers";
+  if (statusMode === "active") return "Active";
+  if (statusMode === "paused") return "Paused";
+  if (statusMode === "backlog") return "Backlog";
+  if (statusMode === "todo") return "Todo";
+  return "All statuses";
+}
+
 function groupMatchesStatusMode(statusType: IssueStatusType, statusMode: StatusMode) {
   return (
     statusMode === "all" ||
@@ -1212,6 +1632,9 @@ function groupIssues(issues: Issue[]): UiIssueGroup[] {
 }
 
 function resolveUiStatusType(issue: Pick<Issue, "status" | "status_type">) {
+  // An unresolved dependency is an effective Blocked state even when the
+  // issue's persisted workflow status remains Todo or In Progress.
+  if (issue.status_type === "blocked") return "blocked";
   const status = issue.status.trim().toLowerCase();
   if (["done", "completed"].includes(status)) return "completed";
   if (["in progress", "started"].includes(status)) return "started";
@@ -1223,8 +1646,8 @@ function resolveUiStatusType(issue: Pick<Issue, "status" | "status_type">) {
 }
 
 function ProjectIcon({ project, large }: { project: Project; large?: boolean }) {
-  const status = project.status.trim().toLowerCase();
-  const icon = status === "done" || status === "completed" ? "✓" : status === "paused" ? "◷" : "◇";
+  const statusType = resolveProjectStatusType(project.status);
+  const icon = statusType === "completed" ? "✓" : statusType === "paused" ? "◷" : statusType === "canceled" ? "×" : "◇";
   return <span className={large ? "project-icon large" : "project-icon"}>{icon}</span>;
 }
 
@@ -1234,6 +1657,7 @@ function StatusIcon({ statusType }: { statusType: string }) {
   if (statusType === "started") return <Clock3 className="sicon started" size={16} />;
   if (statusType === "paused") return <CircleDot className="sicon paused" size={16} />;
   if (statusType === "backlog") return <Circle className="sicon backlog" size={16} />;
+  if (statusType === "canceled") return <X className="sicon canceled" size={16} />;
   return <CircleDot className="sicon todo" size={16} />;
 }
 
@@ -1249,11 +1673,23 @@ function PriorityBars({ priority }: { priority: number }) {
   return <span className={`pbars p${priority}`}><i /><i /><i /></span>;
 }
 
+function ProjectHealthBadge({ project }: { project: Project }) {
+  if (!project.health) {
+    return <span className="health-badge none" title="No project update has set health"><Circle size={14} /> No update</span>;
+  }
+  return (
+    <span className={`health-badge ${project.health}`} title={project.latest_update_body || `Health: ${projectHealthLabel(project.health)}`}>
+      <span className="health-dot" /> {projectHealthDisplayLabel(project.health)}
+    </span>
+  );
+}
+
 function Avatar({ label }: { label: string }) {
   return <span className="avatar">{label.split(" ").map((part) => part[0]).join("").slice(0, 2).toUpperCase()}</span>;
 }
 
 function priorityName(priority: number) {
+  if (priority === 0) return "No priority";
   if (priority === 1) return "Urgent";
   if (priority === 2) return "High";
   if (priority === 4) return "Low";
@@ -1268,11 +1704,53 @@ function resourceIcon(issue: Issue) {
 }
 
 function activityText(event: ActivityEvent) {
+  if (event.type === "project_update") return `${event.author || "Agent"} posted ${projectHealthLabel(event.health)} update`;
+  if (event.type === "dependency") {
+    return event.verb === "unblocked"
+      ? `${event.identifier} resolved blocker ${event.blocker_identifier}`
+      : `${event.identifier} blocked by ${event.blocker_identifier}`;
+  }
   if (event.type === "comment") return `${event.author || "Agent"} commented`;
   if (event.verb === "completed") return `${event.identifier} completed`;
   if (event.verb === "started") return `${event.identifier} moved to In Progress`;
   if (event.verb === "blocker") return `${event.identifier} marked blocker`;
   return `${event.identifier} updated`;
+}
+
+function projectHealthLabel(health?: ProjectUpdate["health"]) {
+  if (health === "at_risk") return "at-risk";
+  if (health === "off_track") return "off-track";
+  if (health === "complete") return "complete";
+  return "on-track";
+}
+
+function projectHealthDisplayLabel(health: ProjectHealth) {
+  if (health === "at_risk") return "At risk";
+  if (health === "off_track") return "Off track";
+  if (health === "complete") return "Complete";
+  return "On track";
+}
+
+function resolveProjectStatusType(value: string): IssueStatusType {
+  const status = value.trim().toLowerCase().replace(/[_-]+/g, " ");
+  if (["done", "completed", "complete", "finished"].includes(status)) return "completed";
+  if (["canceled", "cancelled"].includes(status)) return "canceled";
+  if (["paused", "pause", "suspended"].includes(status)) return "paused";
+  if (["backlog", "planned", "planning"].includes(status)) return "backlog";
+  if (["todo", "to do", "unstarted"].includes(status)) return "unstarted";
+  if (["blocked", "off track"].includes(status)) return "blocked";
+  return "started";
+}
+
+function projectSourceLabel(source: string) {
+  if (source === "local") return "Local workspace";
+  return `${source.charAt(0).toUpperCase()}${source.slice(1)} source`;
+}
+
+function formatProjectDate(value: string) {
+  const date = /^\d{4}-\d{2}-\d{2}$/.test(value) ? new Date(`${value}T00:00:00Z`) : new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat(displayDateLocale, { month: "short", day: "numeric", year: "numeric", timeZone: "UTC" }).format(date);
 }
 
 function formatShortDate(value: string) {
