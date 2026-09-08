@@ -1,0 +1,2 @@
+Harmless Unicode should be accepted by the public hygiene check.
+Привет. Українська. Български.
