@@ -102,7 +102,7 @@ function runMcpToolsList() {
   return toolsList.result.tools;
 }
 
-function runMcpToolExpectFailure(tool, payload = {}) {
+function runMcpTool(tool, payload = {}) {
   const input = [
     JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
     JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: tool, arguments: payload } }),
@@ -268,7 +268,7 @@ try {
   assert(!tools.tools.includes("import_linear"), "import_linear must not be exposed to normal harness tools");
   assert(!tools.tools.includes("backfill_linear_descriptions"), "backfill_linear_descriptions must not be exposed to normal harness tools");
   for (const name of [
-    "dashboard", "list_projects", "get_project", "save_project", "list_project_updates", "save_project_update",
+    "dashboard", "list_projects", "refresh_data", "get_project", "save_project", "list_project_updates", "save_project_update",
     "save_issue", "get_issue", "save_comment", "list_issue_dependencies", "save_issue_dependency",
     "resolve_issue_dependency", "start_agent_session", "claim_issue", "release_issue_claim",
     "save_context_binding", "resolve_context_project",
@@ -276,6 +276,13 @@ try {
     assert(tools.tools.includes(name), `expected harness tool is missing: ${name}`);
   }
   const mcpTools = runMcpToolsList();
+  const mcpRefreshTool = mcpTools.find((tool) => tool.name === "refresh_data");
+  assert(mcpRefreshTool, "MCP refresh_data tool is missing");
+  const mcpRefreshCall = runMcpTool("refresh_data", { include_issues: false });
+  assert(!mcpRefreshCall.message?.result?.isError, `MCP refresh_data failed: ${JSON.stringify(mcpRefreshCall.message)}`);
+  const mcpRefreshSnapshot = JSON.parse(mcpRefreshCall.message.result.content[0].text);
+  assert(Array.isArray(mcpRefreshSnapshot.projects), "MCP refresh_data did not return the shared project snapshot");
+  assert(mcpRefreshSnapshot.includes_issues === false, "MCP refresh_data ignored include_issues:false");
   const listIssuesSchema = mcpTools.find((tool) => tool.name === "list_issues")?.inputSchema?.properties;
   assert(listIssuesSchema?.include_done?.type === "boolean", "MCP list_issues schema does not advertise include_done:boolean");
   assert(listIssuesSchema?.blocked?.type === "boolean", "MCP list_issues schema does not advertise blocked:boolean");
@@ -585,14 +592,14 @@ try {
   assert(linearFailure.status !== 0, "import_linear unexpectedly succeeded");
   assert(linearFailure.elapsedMs < 5000, "import_linear did not fail fast locally");
   assert(linearFailure.stderr.includes("Unknown tool: import_linear"), "import_linear failure did not explain missing normal-runtime tool");
-  const linearMcpFailure = runMcpToolExpectFailure("import_linear", {});
+  const linearMcpFailure = runMcpTool("import_linear", {});
   assert(linearMcpFailure.message?.error?.message?.includes("Unknown tool: import_linear"), "MCP import_linear failure did not explain missing normal-runtime tool");
   assert(linearMcpFailure.elapsedMs < 5000, "MCP import_linear did not fail fast locally");
   const backfillFailure = runHubExpectFailure("backfill_linear_descriptions", {});
   assert(backfillFailure.status !== 0, "backfill_linear_descriptions unexpectedly succeeded");
   assert(backfillFailure.elapsedMs < 5000, "backfill_linear_descriptions did not fail fast locally");
   assert(backfillFailure.stderr.includes("Unknown tool: backfill_linear_descriptions"), "backfill_linear_descriptions failure did not explain missing normal-runtime tool");
-  const backfillMcpFailure = runMcpToolExpectFailure("backfill_linear_descriptions", {});
+  const backfillMcpFailure = runMcpTool("backfill_linear_descriptions", {});
   assert(backfillMcpFailure.message?.error?.message?.includes("Unknown tool: backfill_linear_descriptions"), "MCP backfill_linear_descriptions failure did not explain missing normal-runtime tool");
   assert(backfillMcpFailure.elapsedMs < 5000, "MCP backfill_linear_descriptions did not fail fast locally");
   const migrationFailure = runMigrationExpectFailure();

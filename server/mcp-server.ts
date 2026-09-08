@@ -27,6 +27,7 @@ import {
   upsertIssue,
   upsertProject,
 } from "./store.js";
+import { dataSnapshot } from "./data-snapshot.js";
 
 let stdin = Buffer.alloc(0);
 
@@ -51,6 +52,10 @@ const tools = [
   tool("dashboard", "Return local Claw Task Hub dashboard counts."),
   tool("list_teams", "List local teams."),
   tool("list_projects", "List local projects."),
+  tool("refresh_data", "Explicitly read a fresh UI data snapshot from the active local database. This does not poll or mutate data.", {
+    issues_per_status: { oneOf: [{ type: "number", enum: [50, 100, 200] }, { type: "string", enum: ["50", "100", "200", "all"] }] },
+    include_issues: { type: "boolean" },
+  }),
   tool("get_project", "Get one project with status counts, blockers, updates, and activity.", {
     id: { type: "string" },
     issues_per_status: { anyOf: [{ type: "number" }, { type: "string" }] },
@@ -243,6 +248,7 @@ async function callTool(name: string, args: Record<string, unknown>) {
   if (name === "dashboard") return dashboard();
   if (name === "list_teams") return { teams: listTeams() };
   if (name === "list_projects") return { projects: listProjects() };
+  if (name === "refresh_data") return dataSnapshot(args);
   if (name === "get_project") return { project: getProject(String(args.id), { issues_per_status: args.issues_per_status }) };
   if (name === "save_project") return { project: upsertProject(args) };
   if (name === "list_project_updates") return { updates: listProjectUpdates(args as { project_id: string }) };

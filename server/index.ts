@@ -1,7 +1,11 @@
 import cors from "cors";
 import express from "express";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 import { z } from "zod";
-import { dbPath } from "./db.js";
+import { activateManagedDatabase, createManagedDatabase, databaseIdFromName, dbPath, listManagedDatabases } from "./db.js";
+import { dataSnapshot } from "./data-snapshot.js";
 import {
   dashboard,
   deleteContextBinding,
@@ -31,6 +35,9 @@ import {
 ensureDefaultTeam();
 
 const app = express();
+const execFileAsync = promisify(execFile);
+const databasePickerScript = fileURLToPath(new URL("./select-database-path.py", import.meta.url));
+let databasePickerActive = false;
 
 const port = Number(process.env.PORT ?? 4781);
 const host = process.env.CLAW_TASK_HUB_HOST ?? "127.0.0.1";
@@ -73,6 +80,54 @@ app.use(express.json({ limit: "5mb" }));
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true, dbPath, mode: "local", host });
 });
+
+app.get("/api/databases", (_req, res) => res.json(listManagedDatabases()));
+app.post("/api/filesystem/database-path", async (req, res) => {
+  const schema = z.object({ name: z.string().trim().min(1).max(80).optional() });
+  if (databasePickerActive) return res.status(409).json({ error: "A database location picker is already open" });
+  databasePickerActive = true;
+  try {
+    const value = schema.parse(req.body);
+    const suggestedName = databaseIdFromName(value.name ?? "claw-task-hub");
+    const { stdout } = await execFileAsync("python3", [databasePickerScript, suggestedName], {
+      timeout: 300_000,
+      maxBuffer: 64 * 1024,
+    });
+    const result = JSON.parse(stdout.trim()) as { path?: string; cancelled?: boolean; error?: string };
+    if (result.error) return res.status(503).json({ error: result.error });
+    res.json(result.path ? { path: result.path } : { cancelled: true });
+  } catch (error) {
+    res.status(503).json({ error: error instanceof Error ? error.message : String(error) });
+  } finally {
+    databasePickerActive = false;
+  }
+});
+app.post("/api/databases", (req, res) => {
+  const schema = z.object({
+    name: z.string().trim().min(1).max(80),
+    path: z.string().trim().max(4096).optional(),
+  });
+  try {
+    const value = schema.parse(req.body);
+    const catalogue = createManagedDatabase(value.name, value.path);
+    ensureDefaultTeam();
+    res.status(201).json(catalogue);
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+app.post("/api/databases/:id/activate", (req, res) => {
+  try {
+    const catalogue = activateManagedDatabase(req.params.id);
+    ensureDefaultTeam();
+    res.json(catalogue);
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.get("/api/snapshot", (req, res) => res.json(dataSnapshot(req.query)));
+app.post("/api/refresh", (req, res) => res.json(dataSnapshot(req.body)));
 
 app.get("/api/dashboard", (_req, res) => res.json(dashboard()));
 app.get("/api/sync-runs", (_req, res) => res.json({ runs: recentSyncRuns() }));

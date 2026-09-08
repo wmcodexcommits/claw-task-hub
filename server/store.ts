@@ -1031,7 +1031,7 @@ export function upsertIssue(input: IssueInput) {
   const maxAttempts = retryAutomaticIdentifier ? 3 : 1;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
-      const issueKey = upsertIssueTransaction.immediate(input);
+      const issueKey = db.transaction((transactionInput: IssueInput) => upsertIssueLocked(transactionInput)).immediate(input);
       const issue = getIssue(issueKey);
       if (!issue) throw new Error(`Saved issue not found: ${issueKey}`);
       return issue;
@@ -1042,8 +1042,6 @@ export function upsertIssue(input: IssueInput) {
   }
   throw new Error("save_issue failed after retrying automatic identifier allocation");
 }
-
-const upsertIssueTransaction = db.transaction((input: IssueInput) => upsertIssueLocked(input));
 
 function upsertIssueLocked(input: IssueInput) {
   const at = nowIso();

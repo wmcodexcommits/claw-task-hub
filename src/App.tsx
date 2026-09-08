@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent } from "react";
+import { createPortal } from "react-dom";
 import {
   Activity,
   AlertTriangle,
@@ -9,7 +10,9 @@ import {
   CircleDot,
   Clock3,
   Database,
+  Diamond,
   Flag,
+  FolderOpen,
   Layers,
   Link,
   ListFilter,
@@ -53,7 +56,7 @@ type Issue = {
   title: string;
   description?: string;
   status: string;
-  status_type: string;
+  status_type: IssueStatusType;
   priority: number;
   assignee?: string | null;
   project_id?: string;
@@ -108,6 +111,7 @@ type ProjectTab = "overview" | "activity" | "issues";
 type StatusMode = "all" | "active" | "started" | "paused" | "backlog" | "todo" | "blockers" | "completed" | "canceled";
 type IssueDisplayLimit = "50" | "100" | "200" | "all";
 type IssueStatusType = "started" | "blocked" | "paused" | "backlog" | "unstarted" | "completed" | "canceled";
+type IssueDraftPriority = "1" | "2" | "3" | "4";
 type IssuePriorityFilter = "all" | "1" | "2" | "3" | "4";
 type ProjectStatusFilter = "all" | "active" | "paused" | "backlog" | "completed";
 type ProjectHealthFilter = "all" | ProjectHealth | "none";
@@ -192,11 +196,30 @@ type ProjectDetail = {
   activity: ActivityEvent[];
 };
 
-type Dashboard = {
-  counts: { projects: number; issues: number; done: number; active: number };
-  byStatus: { status: string; count: number }[];
-  recent: Issue[];
+type ManagedDatabase = {
+  id: string;
+  name: string;
+  fileName: string;
+  path: string;
+  active: boolean;
 };
+
+type DatabaseCatalogue = {
+  active: ManagedDatabase;
+  databases: ManagedDatabase[];
+};
+
+type RefreshSnapshot = {
+  refreshed_at: string;
+  projects: Project[];
+  issues: Issue[];
+  issueGroups: ApiIssueGroup[];
+  issueDisplayLimit: IssueDisplayLimit;
+  databases: DatabaseCatalogue;
+  includes_issues: boolean;
+};
+
+type HealthState = "unknown" | "checking" | "healthy" | "error";
 
 const apiBase = import.meta.env.VITE_CLAW_TASK_HUB_API_BASE ?? "http://127.0.0.1:4781/api";
 const displayDateLocale = "en-US";
@@ -215,6 +238,42 @@ async function fetchProjectDetail(projectId: string, issueLimit: IssueDisplayLim
   return api<ProjectDetail>(`/projects/${encodeURIComponent(projectId)}?issues_per_status=${encodeURIComponent(issueLimit)}`);
 }
 
+async function fetchRefreshSnapshot(issueLimit: IssueDisplayLimit, includeIssues: boolean, explicitRefresh: boolean): Promise<RefreshSnapshot> {
+  const refreshParams = new URLSearchParams({
+    issues_per_status: String(issueLimit),
+    include_issues: String(includeIssues),
+  });
+  try {
+    return explicitRefresh
+      ? await api<RefreshSnapshot>("/refresh", {
+          method: "POST",
+          body: JSON.stringify({ issues_per_status: issueLimit, include_issues: includeIssues }),
+        })
+      : await api<RefreshSnapshot>(`/snapshot?${refreshParams.toString()}`);
+  } catch {
+    // Keep the UI usable while an already-running local API is being upgraded.
+    const [projectsResult, issuesResult, databases] = await Promise.all([
+      api<{ projects: Project[] }>("/projects"),
+      includeIssues
+        ? api<{ issues: Issue[]; issueGroups?: ApiIssueGroup[] }>(`/issues?per_status_limit=${encodeURIComponent(issueLimit)}`)
+        : Promise.resolve({ issues: [], issueGroups: [] }),
+      api<DatabaseCatalogue>("/databases").catch(() => ({
+        active: { id: "configured.sqlite", name: "claw-task-hub", fileName: "configured.sqlite", path: "", active: true },
+        databases: [],
+      })),
+    ]);
+    return {
+      refreshed_at: new Date().toISOString(),
+      projects: projectsResult.projects,
+      issues: issuesResult.issues,
+      issueGroups: issuesResult.issueGroups ?? [],
+      issueDisplayLimit: issueLimit,
+      databases,
+      includes_issues: includeIssues,
+    };
+  }
+}
+
 function App() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [workspaceIssues, setWorkspaceIssues] = useState<Issue[]>([]);
@@ -227,14 +286,22 @@ function App() {
   const [query, setQuery] = useState("");
   const [statusMode, setStatusMode] = useState<StatusMode>("all");
   const [issueDisplayLimit, setIssueDisplayLimit] = useState<IssueDisplayLimit>(defaultIssueDisplayLimit);
+  const [issueDraftPriority, setIssueDraftPriority] = useState<IssueDraftPriority>("3");
   const [issuePriorityFilter, setIssuePriorityFilter] = useState<IssuePriorityFilter>("all");
   const [issueAssigneeFilter, setIssueAssigneeFilter] = useState("all");
   const [issueLabelFilter, setIssueLabelFilter] = useState("all");
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
   const [detailOpen, setDetailOpen] = useState(false);
+  const [issueEditorOpen, setIssueEditorOpen] = useState(false);
   const [projectEditorOpen, setProjectEditorOpen] = useState(false);
   const [projectSaving, setProjectSaving] = useState(false);
+  const [databaseEditorOpen, setDatabaseEditorOpen] = useState(false);
+  const [databaseSaving, setDatabaseSaving] = useState(false);
+  const [databaseError, setDatabaseError] = useState<string | null>(null);
+  const [databaseCatalogue, setDatabaseCatalogue] = useState<DatabaseCatalogue | null>(null);
+  const [healthState, setHealthState] = useState<HealthState>("unknown");
+  const [darkMode, setDarkMode] = useState(() => window.localStorage.getItem("claw-task-hub-theme") !== "light");
   const [projectFiltersOpen, setProjectFiltersOpen] = useState(false);
   const [projectSettingsOpen, setProjectSettingsOpen] = useState(false);
   const [projectQuery, setProjectQuery] = useState("");
@@ -249,7 +316,7 @@ function App() {
   const [routingReady, setRoutingReady] = useState(false);
   const refreshInFlightRef = useRef(false);
   const lastRefreshStartedAtRef = useRef(0);
-  const refreshTimerRef = useRef<number | null>(null);
+  const refreshGenerationRef = useRef(0);
 
   useEffect(() => {
     pageRef.current = page;
@@ -266,6 +333,11 @@ function App() {
   useEffect(() => {
     issueDisplayLimitRef.current = issueDisplayLimit;
   }, [issueDisplayLimit]);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = darkMode ? "dark" : "light";
+    window.localStorage.setItem("claw-task-hub-theme", darkMode ? "dark" : "light");
+  }, [darkMode]);
 
   const applyRouteFromLocation = useCallback(async () => {
     const route = parseRoute(window.location);
@@ -367,7 +439,7 @@ function App() {
     replaceBrowserPath(path);
   }, [issueAssigneeFilter, issueDisplayLimit, issueLabelFilter, issuePriorityFilter, page, projectDetail?.project.id, query, routingReady, statusMode, tab]);
 
-  const refresh = useCallback(async (force = false) => {
+  const refresh = useCallback(async (force = false, explicitRefresh = false) => {
     if (refreshInFlightRef.current) return;
     const startedAt = Date.now();
     if (!force && startedAt - lastRefreshStartedAtRef.current < 1200) return;
@@ -379,20 +451,22 @@ function App() {
       issueId: selectedIssueRef.current?.id,
       issueDisplayLimit: issueDisplayLimitRef.current,
     };
+    const generation = ++refreshGenerationRef.current;
     try {
-      const [dash, proj, issueList, detail, selected] = await Promise.all([
-      api<Dashboard>("/dashboard"),
-      api<{ projects: Project[] }>("/projects"),
-      api<{ issues: Issue[]; issueGroups?: ApiIssueGroup[] }>(`/issues?per_status_limit=${encodeURIComponent(snapshot.issueDisplayLimit)}`),
-      snapshot.page === "project" && snapshot.projectId
-        ? api<ProjectDetail>(`/projects/${encodeURIComponent(snapshot.projectId)}?issues_per_status=${encodeURIComponent(snapshot.issueDisplayLimit)}`)
-        : Promise.resolve(null),
-      snapshot.issueId ? api<{ issue: Issue }>(`/issues/${encodeURIComponent(snapshot.issueId)}`).catch(() => null) : Promise.resolve(null),
+      const [fresh, detail, selected] = await Promise.all([
+        fetchRefreshSnapshot(snapshot.issueDisplayLimit, snapshot.page === "workspace", explicitRefresh),
+        snapshot.page === "project" && snapshot.projectId
+          ? api<ProjectDetail>(`/projects/${encodeURIComponent(snapshot.projectId)}?issues_per_status=${encodeURIComponent(snapshot.issueDisplayLimit)}`)
+          : Promise.resolve(null),
+        snapshot.issueId ? api<{ issue: Issue }>(`/issues/${encodeURIComponent(snapshot.issueId)}`).catch(() => null) : Promise.resolve(null),
       ]);
-      void dash;
-      setProjects(proj.projects);
-      setWorkspaceIssues(issueList.issues);
-      setWorkspaceIssueGroups(issueList.issueGroups ?? []);
+      if (generation !== refreshGenerationRef.current) return;
+      setDatabaseCatalogue(fresh.databases);
+      setProjects(fresh.projects);
+      if (fresh.includes_issues) {
+        setWorkspaceIssues(fresh.issues);
+        setWorkspaceIssueGroups(fresh.issueGroups);
+      }
       const samePage = pageRef.current === snapshot.page;
       const sameProject = projectDetailRef.current?.project.id === snapshot.projectId;
       const sameIssueContext = samePage && (snapshot.page !== "project" || sameProject);
@@ -402,7 +476,7 @@ function App() {
         setSelectedIssue(detail.issues.find((issue) => issue.id === snapshot.issueId) ?? detail.issues[0] ?? null);
       }
     } finally {
-      refreshInFlightRef.current = false;
+      if (generation === refreshGenerationRef.current) refreshInFlightRef.current = false;
     }
   }, []);
 
@@ -411,24 +485,23 @@ function App() {
   }, [refresh]);
 
   useEffect(() => {
-    const schedule = () => {
-      refreshTimerRef.current = window.setTimeout(async () => {
-        if (document.visibilityState === "visible") await refresh();
-        schedule();
-      }, 2000);
+    let active = true;
+    const pollHealth = async () => {
+      if (active) setHealthState("checking");
+      try {
+        await api<{ ok: true }>("/health");
+        if (active) setHealthState("healthy");
+      } catch {
+        if (active) setHealthState("error");
+      }
     };
-    const refreshVisible = () => {
-      if (document.visibilityState === "visible") void refresh(true);
-    };
-    schedule();
-    window.addEventListener("focus", refreshVisible);
-    document.addEventListener("visibilitychange", refreshVisible);
+    void pollHealth();
+    const timer = window.setInterval(() => void pollHealth(), 5000);
     return () => {
-      if (refreshTimerRef.current) window.clearTimeout(refreshTimerRef.current);
-      window.removeEventListener("focus", refreshVisible);
-      document.removeEventListener("visibilitychange", refreshVisible);
+      active = false;
+      window.clearInterval(timer);
     };
-  }, [refresh]);
+  }, []);
 
   useEffect(() => {
     const trimmed = query.trim();
@@ -466,6 +539,7 @@ function App() {
   }
 
   function openProjectsPage() {
+    pageRef.current = "projects";
     setPage("projects");
     setProjectDetail(null);
     setSelectedIssue(null);
@@ -474,6 +548,7 @@ function App() {
   }
 
   function openWorkspacePage() {
+    pageRef.current = "workspace";
     setPage("workspace");
     setProjectDetail(null);
     setSelectedIssue(workspaceIssues[0] ?? null);
@@ -485,6 +560,7 @@ function App() {
     setIssueLabelFilter("all");
     setCreateError(null);
     pushBrowserPath(workspaceRoutePath({ query: "", statusMode: "all", issueDisplayLimit, priorityFilter: "all", assigneeFilter: "all", labelFilter: "all" }));
+    void refresh(true);
   }
 
   function changeTab(nextTab: ProjectTab) {
@@ -537,11 +613,13 @@ function App() {
           project_id: projectDetail.project.id,
           status: "Todo",
           status_type: "unstarted",
-          priority: Number(data.get("priority") ?? 3),
+          priority: Number(issueDraftPriority),
           labels: ["local"],
         }),
       });
       form.reset();
+      setIssueDraftPriority("3");
+      setIssueEditorOpen(false);
       await refresh();
       await openIssue(created.issue);
       changeTab("issues");
@@ -583,6 +661,71 @@ function App() {
     } finally {
       setProjectSaving(false);
     }
+  }
+
+  async function createDatabase(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const data = new FormData(form);
+    const name = String(data.get("name") ?? "").trim();
+    const path = String(data.get("path") ?? "").trim();
+    if (!name) return;
+    setDatabaseError(null);
+    setDatabaseSaving(true);
+    try {
+      const catalogue = await api<DatabaseCatalogue>("/databases", {
+        method: "POST",
+        body: JSON.stringify({ name, path: path || undefined }),
+      });
+      form.reset();
+      setDatabaseCatalogue(catalogue);
+      setDatabaseEditorOpen(false);
+      resetForDatabaseChange();
+      await refreshAfterDatabaseChange();
+    } catch (error) {
+      setDatabaseError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setDatabaseSaving(false);
+    }
+  }
+
+  async function activateDatabase(id: string) {
+    if (databaseCatalogue?.active.id === id) return;
+    setDatabaseError(null);
+    try {
+      const catalogue = await api<DatabaseCatalogue>(`/databases/${encodeURIComponent(id)}/activate`, {
+        method: "POST",
+        body: "{}",
+      });
+      setDatabaseCatalogue(catalogue);
+      resetForDatabaseChange();
+      await refreshAfterDatabaseChange();
+    } catch (error) {
+      setDatabaseError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  function resetForDatabaseChange() {
+    setProjects([]);
+    setWorkspaceIssues([]);
+    setWorkspaceIssueGroups([]);
+    setProjectDetail(null);
+    setSelectedIssue(null);
+    setServerSearchResult(null);
+    setPage("projects");
+    setTab("overview");
+    clearIssueFilters();
+    setProjectQuery("");
+    setProjectStatusFilter("all");
+    setProjectHealthFilter("all");
+    replaceBrowserPath("/projects");
+  }
+
+  async function refreshAfterDatabaseChange() {
+    refreshGenerationRef.current += 1;
+    refreshInFlightRef.current = false;
+    lastRefreshStartedAtRef.current = 0;
+    await refresh(true);
   }
 
   async function addComment(event: FormEvent<HTMLFormElement>) {
@@ -699,16 +842,7 @@ function App() {
       ].filter(Boolean).join(" ").toLowerCase();
       const matchesText = !lower || text.includes(lower);
       const statusType = resolveUiStatusType(issue);
-      const matchesMode =
-        statusMode === "all" ||
-        (statusMode === "active" && ["started", "blocked", "paused"].includes(statusType)) ||
-        (statusMode === "started" && statusType === "started") ||
-        (statusMode === "paused" && statusType === "paused") ||
-        (statusMode === "backlog" && statusType === "backlog") ||
-        (statusMode === "todo" && statusType === "unstarted") ||
-        (statusMode === "blockers" && statusType === "blocked") ||
-        (statusMode === "completed" && statusType === "completed") ||
-        (statusMode === "canceled" && statusType === "canceled");
+      const matchesMode = matchesStatusMode(statusMode, statusType);
       const matchesPriority = issuePriorityFilter === "all" || issue.priority === Number(issuePriorityFilter);
       const matchesAssignee =
         issueAssigneeFilter === "all" ||
@@ -718,10 +852,12 @@ function App() {
     });
   }, [issueAssigneeFilter, issueFilterSource, issueLabelFilter, issuePriorityFilter, statusMode, trimmedQuery]);
   const visibleIssueGroups = useMemo(() => {
-    if (trimmedQuery || statusMode !== "all" || hasAdvancedIssueFilters || !sourceIssueGroups.length) return groupIssues(filteredIssues);
-    return sourceIssueGroups
-      .map(apiGroupToUiGroup)
-      .filter((group) => group.items.length);
+    if (!trimmedQuery && !hasAdvancedIssueFilters && sourceIssueGroups.length) {
+      return sourceIssueGroups
+        .map(apiGroupToUiGroup)
+        .filter((group) => group.items.length && matchesStatusMode(statusMode, group.statusType));
+    }
+    return groupIssues(filteredIssues);
   }, [filteredIssues, hasAdvancedIssueFilters, sourceIssueGroups, statusMode, trimmedQuery]);
   const visibleSelectedIssue = selectedIssue && filteredIssues.some((issue) => issue.id === selectedIssue.id)
     ? selectedIssue
@@ -751,7 +887,18 @@ function App() {
 
   return (
     <main className="linear-shell">
-      <TopChrome />
+      <TopChrome
+        catalogue={databaseCatalogue}
+        healthState={healthState}
+        darkMode={darkMode}
+        onNewDatabase={() => {
+          setDatabaseError(null);
+          setDatabaseEditorOpen(true);
+        }}
+        onActivateDatabase={activateDatabase}
+        onToggleDarkMode={() => setDarkMode((enabled) => !enabled)}
+        onRefresh={() => refresh(true, true)}
+      />
       <section className="linear-page">
         <HeaderBar
           page={page}
@@ -761,8 +908,6 @@ function App() {
           onWorkspace={openWorkspacePage}
           onTab={changeTab}
           onProjectShortcut={downloadProjectShortcut}
-          statusMode={statusMode}
-          onStatusMode={setStatusMode}
           projectFiltersOpen={projectFiltersOpen}
           projectSettingsOpen={projectSettingsOpen}
           onToggleProjectFilters={() => setProjectFiltersOpen((open) => !open)}
@@ -807,8 +952,6 @@ function App() {
             labelFilter={issueLabelFilter}
             assignees={issueAssignees}
             labels={issueLabels}
-            creating={creating}
-            createError={createError}
             canCreate={false}
             onQuery={setQuery}
             onStatusMode={setStatusMode}
@@ -817,7 +960,7 @@ function App() {
             onAssigneeFilter={setIssueAssigneeFilter}
             onLabelFilter={setIssueLabelFilter}
             onClearFilters={clearIssueFilters}
-            onCreate={createIssue}
+            onNewIssue={() => setIssueEditorOpen(true)}
             onOpenIssue={openIssue}
             onAddComment={addComment}
             onAddDependency={addDependency}
@@ -842,8 +985,6 @@ function App() {
             labelFilter={issueLabelFilter}
             assignees={issueAssignees}
             labels={issueLabels}
-            creating={creating}
-            createError={createError}
             canCreate={true}
             onQuery={setQuery}
             onStatusMode={setStatusMode}
@@ -852,7 +993,10 @@ function App() {
             onAssigneeFilter={setIssueAssigneeFilter}
             onLabelFilter={setIssueLabelFilter}
             onClearFilters={clearIssueFilters}
-            onCreate={createIssue}
+            onNewIssue={() => {
+              setCreateError(null);
+              setIssueEditorOpen(true);
+            }}
             onOpenIssue={openIssue}
             onAddComment={addComment}
             onAddDependency={addDependency}
@@ -880,21 +1024,85 @@ function App() {
           onSubmit={createProject}
         />
       ) : null}
+      {databaseEditorOpen ? (
+        <DatabaseDialog
+          saving={databaseSaving}
+          error={databaseError}
+          onClose={() => setDatabaseEditorOpen(false)}
+          onSubmit={createDatabase}
+        />
+      ) : null}
+      {issueEditorOpen && projectDetail ? (
+        <NewIssueDialog
+          projectName={projectDetail.project.name}
+          priority={issueDraftPriority}
+          saving={creating}
+          error={createError}
+          onPriority={setIssueDraftPriority}
+          onClose={() => setIssueEditorOpen(false)}
+          onSubmit={createIssue}
+        />
+      ) : null}
     </main>
   );
 }
 
-function TopChrome() {
+function TopChrome({
+  catalogue,
+  healthState,
+  darkMode,
+  onNewDatabase,
+  onActivateDatabase,
+  onToggleDarkMode,
+  onRefresh,
+}: {
+  catalogue: DatabaseCatalogue | null;
+  healthState: HealthState;
+  darkMode: boolean;
+  onNewDatabase: () => void;
+  onActivateDatabase: (id: string) => Promise<void>;
+  onToggleDarkMode: () => void;
+  onRefresh: () => Promise<void>;
+}) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const activeName = catalogue?.active.name ?? "claw-task-hub";
   return (
     <header className="top-chrome">
       <div className="window-tab">
         <Database size={15} />
-        <span>clawtaskhub</span>
+        <span>{activeName}</span>
       </div>
-      <span className="ghost-icon decorative" aria-hidden="true"><Plus size={16} /></span>
-      <div className="address">{window.location.host || "localhost:5173"}</div>
-      <span className="ghost-icon decorative" aria-hidden="true"><Activity size={16} /></span>
-      <span className="ghost-icon decorative" aria-hidden="true"><MoreHorizontal size={17} /></span>
+      <div className="address">Claw Task Hub</div>
+      <span
+        className={`ghost-icon health-check ${healthState}`}
+        role="status"
+        aria-label={healthState === "healthy" ? "Server healthy" : healthState === "error" ? "Server unavailable" : "Checking server health"}
+        title={healthState === "healthy" ? "Server healthy" : healthState === "error" ? "Server health check failed" : "Check server health"}
+      ><Activity size={16} /></span>
+      <div className="toolbar-menu-wrap">
+        <button className={menuOpen ? "ghost-icon active" : "ghost-icon"} aria-label="Manage databases" aria-expanded={menuOpen} onClick={() => setMenuOpen((open) => !open)}><MoreHorizontal size={17} /></button>
+        {menuOpen ? (
+          <div className="toolbar-menu database-menu" role="menu" aria-label="Databases">
+            <strong>Databases</strong>
+            {(catalogue?.databases ?? []).map((database) => (
+              <button
+                key={database.id}
+                role="menuitemradio"
+                aria-checked={database.active}
+                disabled={database.active}
+                onClick={() => {
+                  setMenuOpen(false);
+                  void onActivateDatabase(database.id);
+                }}
+                title={database.path}
+              >{database.fileName}{database.active ? " (active)" : ""}</button>
+            ))}
+            <button role="menuitem" onClick={() => { setMenuOpen(false); onNewDatabase(); }}>Create database</button>
+            <button role="menuitemcheckbox" aria-checked={darkMode} onClick={onToggleDarkMode}>Dark mode {darkMode ? "✓" : ""}</button>
+            <button role="menuitem" onClick={() => { setMenuOpen(false); void onRefresh(); }}>Refresh data</button>
+          </div>
+        ) : null}
+      </div>
     </header>
   );
 }
@@ -907,8 +1115,6 @@ function HeaderBar({
   onWorkspace,
   onTab,
   onProjectShortcut,
-  statusMode,
-  onStatusMode,
   projectFiltersOpen,
   projectSettingsOpen,
   onToggleProjectFilters,
@@ -922,8 +1128,6 @@ function HeaderBar({
   onWorkspace: () => void;
   onTab: (tab: ProjectTab) => void;
   onProjectShortcut: () => void;
-  statusMode: StatusMode;
-  onStatusMode: (mode: StatusMode) => void;
   projectFiltersOpen: boolean;
   projectSettingsOpen: boolean;
   onToggleProjectFilters: () => void;
@@ -968,13 +1172,10 @@ function HeaderBar({
       </div>
 
       <div className="view-tabs">
-        {page === "projects" ? (
-          <button className="pill active">All projects</button>
-        ) : page === "workspace" ? (
+        {page === "projects" || page === "workspace" ? (
           <>
-            <button className={statusMode === "active" ? "pill active" : "pill"} onClick={() => onStatusMode("active")}>Active</button>
-            <button className={statusMode === "all" ? "pill active" : "pill"} onClick={() => { onWorkspace(); onStatusMode("all"); }}>All issues</button>
-            <button className={statusMode === "backlog" ? "pill active" : "pill"} onClick={() => onStatusMode("backlog")}>Backlog</button>
+            <button className={page === "projects" ? "pill active" : "pill"} aria-current={page === "projects" ? "page" : undefined} onClick={onProjects}>All projects</button>
+            <button className={page === "workspace" ? "pill active" : "pill"} aria-current={page === "workspace" ? "page" : undefined} onClick={onWorkspace}>All issues</button>
           </>
         ) : showProjectTabs ? (
           <>
@@ -983,7 +1184,6 @@ function HeaderBar({
             <button className={tab === "issues" ? "pill active" : "pill"} onClick={() => onTab("issues")}>Issues</button>
           </>
         ) : null}
-        <span className="stack-icon decorative" aria-hidden="true"><Layers size={14} /></span>
         {page === "projects" ? (
           <div className="view-tools">
             <button
@@ -1073,14 +1273,14 @@ function ProjectsPage({
           {filtersOpen ? (
             <div className="project-filter-controls">
               <label className="project-search"><Search size={15} /><input aria-label="Search projects" value={query} onChange={(event) => onQuery(event.target.value)} placeholder="Search projects" /></label>
-              <label><span>Status</span><select aria-label="Filter projects by status" value={statusFilter} onChange={(event) => onStatusFilter(event.target.value as ProjectStatusFilter)}><option value="all">All</option><option value="active">Active</option><option value="paused">Paused</option><option value="backlog">Backlog</option><option value="completed">Completed</option></select></label>
-              <label><span>Health</span><select aria-label="Filter projects by health" value={healthFilter} onChange={(event) => onHealthFilter(event.target.value as ProjectHealthFilter)}><option value="all">All</option><option value="on_track">On track</option><option value="at_risk">At risk</option><option value="off_track">Off track</option><option value="complete">Complete</option><option value="none">No update</option></select></label>
+              <InlineDropdown label="Status" ariaLabel="Filter projects by status" control="status" value={statusFilter} options={[{ value: "all", label: "All" }, { value: "active", label: "Active" }, { value: "paused", label: "Paused" }, { value: "backlog", label: "Backlog" }, { value: "completed", label: "Completed" }]} onChange={(value) => onStatusFilter(value as ProjectStatusFilter)} />
+              <InlineDropdown label="Health" ariaLabel="Filter projects by health" control="health" value={healthFilter} options={[{ value: "all", label: "All" }, { value: "on_track", label: "On track" }, { value: "at_risk", label: "At risk" }, { value: "off_track", label: "Off track" }, { value: "complete", label: "Complete" }, { value: "none", label: "No update" }]} onChange={(value) => onHealthFilter(value as ProjectHealthFilter)} />
               <button type="button" disabled={!filtersActive} onClick={onClearFilters}><X size={14} /> Clear</button>
             </div>
           ) : null}
           {settingsOpen ? (
             <div className="project-sort-control">
-              <label><span>Sort</span><select aria-label="Sort projects" value={sort} onChange={(event) => onSort(event.target.value as ProjectSort)}><option value="updated">Recently updated</option><option value="name">Name</option><option value="priority">Priority</option><option value="target_date">Target date</option><option value="issues">Issue count</option></select></label>
+              <InlineDropdown label="Sort" ariaLabel="Sort projects" control="sort" value={sort} options={[{ value: "updated", label: "Recently updated" }, { value: "name", label: "Name" }, { value: "priority", label: "Priority" }, { value: "target_date", label: "Target date" }, { value: "issues", label: "Issue count" }]} onChange={(value) => onSort(value as ProjectSort)} />
             </div>
           ) : null}
           <span className="project-result-count">{visibleProjects.length} of {projects.length} projects</span>
@@ -1088,7 +1288,7 @@ function ProjectsPage({
       ) : null}
       <div className="projects-table">
         <div className="project-row project-head">
-          <span>Name</span>
+          <span className="project-name project-name-head"><span className="project-icon" aria-hidden="true" /><span>Name</span></span>
           <span>Health</span>
           <span>Priority</span>
           <span>Lead</span>
@@ -1107,7 +1307,7 @@ function ProjectsPage({
             <StatusPill status={project.status} statusType={resolveProjectStatusType(project.status)} />
           </button>
         ))}
-        {visibleProjects.length === 0 ? <div className="empty-list project-empty">No projects match the current filters.</div> : null}
+        {visibleProjects.length === 0 ? <div className="empty-list project-empty">{projects.length === 0 ? "No projects yet." : "No projects match the current filters."}</div> : null}
       </div>
     </section>
   );
@@ -1135,13 +1335,93 @@ function ProjectDialog({ saving, error, onClose, onSubmit }: { saving: boolean; 
   );
 }
 
+function DatabaseDialog({ saving, error, onClose, onSubmit }: { saving: boolean; error: string | null; onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) {
+  const nameRef = useRef<HTMLInputElement>(null);
+  const pathRef = useRef<HTMLInputElement>(null);
+  const [picking, setPicking] = useState(false);
+  const [pickerError, setPickerError] = useState<string | null>(null);
+
+  async function browseForDatabase() {
+    setPickerError(null);
+    setPicking(true);
+    try {
+      const result = await api<{ path?: string; cancelled?: boolean }>("/filesystem/database-path", {
+        method: "POST",
+        body: JSON.stringify({ name: nameRef.current?.value.trim() || "claw-task-hub" }),
+      });
+      if (result.path && pathRef.current) pathRef.current.value = result.path;
+    } catch (browseError) {
+      setPickerError(`${browseError instanceof Error ? browseError.message : String(browseError)} Enter an absolute path manually.`);
+    } finally {
+      setPicking(false);
+    }
+  }
+
+  return (
+    <div className="issue-dialog-backdrop" role="presentation" onMouseDown={onClose}>
+      <section className="issue-dialog database-dialog" role="dialog" aria-modal="true" aria-labelledby="database-dialog-title" onMouseDown={(event) => event.stopPropagation()}>
+        <button className="dialog-close" onClick={onClose} aria-label="Close new database"><X size={16} /></button>
+        <h2 id="database-dialog-title">New database</h2>
+        <p>Choose where to store the new SQLite database, then make it active. Existing databases are preserved and remain available from the database menu.</p>
+        <form className="database-form" onSubmit={onSubmit}>
+          <label><span>Name</span><input ref={nameRef} name="name" aria-label="Database name" required autoFocus maxLength={80} /></label>
+          <label>
+            <span>Location</span>
+            <div className="database-path-control">
+              <input ref={pathRef} name="path" aria-label="Database location" placeholder="Default managed database folder" maxLength={4096} />
+              <button type="button" disabled={picking} onClick={() => void browseForDatabase()}><FolderOpen size={15} />{picking ? "Choosing…" : "Browse…"}</button>
+            </div>
+            <small>Leave blank to use the managed database folder, or choose an absolute `.sqlite` path.</small>
+          </label>
+          {error || pickerError ? <div className="create-error"><AlertTriangle size={14} />{error || pickerError}</div> : null}
+          <div className="project-form-actions"><button type="button" onClick={onClose}>Cancel</button><button type="submit" disabled={saving}>{saving ? "Creating" : "Create database"}</button></div>
+        </form>
+      </section>
+    </div>
+  );
+}
+
+function NewIssueDialog({
+  projectName,
+  priority,
+  saving,
+  error,
+  onPriority,
+  onClose,
+  onSubmit,
+}: {
+  projectName: string;
+  priority: IssueDraftPriority;
+  saving: boolean;
+  error: string | null;
+  onPriority: (value: IssueDraftPriority) => void;
+  onClose: () => void;
+  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+}) {
+  return (
+    <div className="issue-dialog-backdrop" role="presentation" onMouseDown={onClose}>
+      <section className="issue-dialog new-issue-dialog" role="dialog" aria-modal="true" aria-labelledby="new-issue-dialog-title" onMouseDown={(event) => event.stopPropagation()}>
+        <button className="dialog-close" onClick={onClose} aria-label="Close new issue"><X size={16} /></button>
+        <h2 id="new-issue-dialog-title">New issue</h2>
+        <p>New issue in {projectName}</p>
+        <form className="new-issue-form" onSubmit={onSubmit}>
+          <label><span>Title</span><input name="title" aria-label="Issue title" required autoFocus /></label>
+          <label><span>Description</span><textarea name="description" aria-label="Issue description" rows={5} /></label>
+          <div className="new-issue-priority"><span>Priority</span><IssuePriorityPicker value={priority} onChange={onPriority} /></div>
+          {error ? <div className="create-error"><AlertTriangle size={14} />{error}</div> : null}
+          <div className="project-form-actions"><button type="button" onClick={onClose}>Cancel</button><button type="submit" disabled={saving}>{saving ? "Creating" : "Create issue"}</button></div>
+        </form>
+      </section>
+    </div>
+  );
+}
+
 function ProjectOverview({ detail, onTab }: { detail: ProjectDetail; onTab: (tab: ProjectTab) => void }) {
   const project = detail.project;
   const topResources = detail.issues.slice(0, 16);
   return (
     <section className="project-overview-linear">
       <div className="project-hero">
-        <ProjectIcon project={project} large />
         <h1>{project.name}</h1>
         <p>{project.summary || project.description || "Browse every local issue imported from history or created by agents."}</p>
       </div>
@@ -1238,8 +1518,6 @@ function IssuesPage({
   labelFilter,
   assignees,
   labels,
-  creating,
-  createError,
   canCreate,
   onQuery,
   onStatusMode,
@@ -1248,7 +1526,7 @@ function IssuesPage({
   onAssigneeFilter,
   onLabelFilter,
   onClearFilters,
-  onCreate,
+  onNewIssue,
   onOpenIssue,
   onAddComment,
   onAddDependency,
@@ -1267,8 +1545,6 @@ function IssuesPage({
   labelFilter: string;
   assignees: string[];
   labels: string[];
-  creating: boolean;
-  createError: string | null;
   canCreate: boolean;
   onQuery: (value: string) => void;
   onStatusMode: (mode: StatusMode) => void;
@@ -1277,7 +1553,7 @@ function IssuesPage({
   onAssigneeFilter: (value: string) => void;
   onLabelFilter: (value: string) => void;
   onClearFilters: () => void;
-  onCreate: (event: FormEvent<HTMLFormElement>) => void;
+  onNewIssue: () => void;
   onOpenIssue: (issue: Issue, reveal?: boolean) => void;
   onAddComment: (event: FormEvent<HTMLFormElement>) => void;
   onAddDependency: (event: FormEvent<HTMLFormElement>) => void;
@@ -1285,22 +1561,26 @@ function IssuesPage({
   onStatusChange: (status: string) => void;
 }) {
   const grouped = issueGroups;
+  const issueLimitEnabled = grouped.some((group) => group.total > 50);
   const filtersActive = Boolean(query.trim()) || statusMode !== "all" || priorityFilter !== "all" || assigneeFilter !== "all" || labelFilter !== "all";
   return (
     <section className="issues-screen">
       <div className="issue-filter-row">
         <div className="searchbar"><Search size={16} /><input aria-label={`Search ${title}`} value={query} onChange={(event) => onQuery(event.target.value)} placeholder={`Search ${title}`} /></div>
-        <label className="issue-limit-control">
-          <span>Rows/group</span>
-          <select aria-label="Issues per status" value={issueDisplayLimit} onChange={(event) => onIssueDisplayLimit(event.target.value as IssueDisplayLimit)}>
-            <option value="50">50</option>
-            <option value="100">100</option>
-            <option value="200">200</option>
-            <option value="all">All</option>
-          </select>
-        </label>
+        <InlineDropdown
+          className="issue-limit-control"
+          label="Rows/group"
+          ariaLabel="Issues per status"
+          control="rows"
+          value={issueDisplayLimit}
+          options={[{ value: "50", label: "50" }, { value: "100", label: "100" }, { value: "200", label: "200" }, { value: "all", label: "All" }]}
+          disabled={!issueLimitEnabled}
+          title={issueLimitEnabled ? "Set the maximum rows shown in each status group" : "Every status group already has 50 or fewer issues"}
+          onChange={(value) => onIssueDisplayLimit(value as IssueDisplayLimit)}
+        />
         <span className="filter-results" aria-live="polite">{issues.length} shown</span>
-        <button className="round-icon" aria-label="Clear issue filters" title="Clear issue filters" disabled={!filtersActive} onClick={onClearFilters}><X size={15} /></button>
+        {filtersActive ? <button className="clear-filter-button" onClick={onClearFilters}><X size={14} /> Clear filters</button> : null}
+        {canCreate ? <button className="primary-action" type="button" onClick={onNewIssue}><Plus size={15} /> New issue</button> : null}
       </div>
       <div className="mode-row">
         <button className={statusMode === "blockers" ? "mode-chip danger active" : "mode-chip danger"} onClick={() => onStatusMode("blockers")}><AlertTriangle size={14} />Blockers</button>
@@ -1313,82 +1593,18 @@ function IssuesPage({
         <button className={statusMode === "completed" ? "mode-chip active" : "mode-chip"} onClick={() => onStatusMode("completed")}>Done</button>
         <button className={statusMode === "canceled" ? "mode-chip active" : "mode-chip"} onClick={() => onStatusMode("canceled")}>Canceled</button>
         <div className="issue-advanced-filters">
-          <label>
-            <span>Priority</span>
-            <select aria-label="Filter issues by priority" value={priorityFilter} onChange={(event) => onPriorityFilter(event.target.value as IssuePriorityFilter)}>
-              <option value="all">All</option>
-              <option value="1">P1</option>
-              <option value="2">P2</option>
-              <option value="3">P3</option>
-              <option value="4">P4</option>
-            </select>
-          </label>
-          <label>
-            <span>Assignee</span>
-            <select aria-label="Filter issues by assignee" value={assigneeFilter} onChange={(event) => onAssigneeFilter(event.target.value)}>
-              <option value="all">All</option>
-              <option value="unassigned">Unassigned</option>
-              {assignees.map((assignee) => <option key={assignee} value={assignee}>{assignee}</option>)}
-            </select>
-          </label>
-          <label>
-            <span>Label</span>
-            <select aria-label="Filter issues by label" value={labelFilter} onChange={(event) => onLabelFilter(event.target.value)}>
-              <option value="all">All</option>
-              {labels.map((label) => <option key={label} value={label}>{label}</option>)}
-            </select>
-          </label>
+          <InlineDropdown label="Priority" ariaLabel="Filter issues by priority" control="priority" value={priorityFilter} options={[{ value: "all", label: "All" }, { value: "1", label: "P1" }, { value: "2", label: "P2" }, { value: "3", label: "P3" }, { value: "4", label: "P4" }]} onChange={(value) => onPriorityFilter(value as IssuePriorityFilter)} />
+          <InlineDropdown label="Assignee" ariaLabel="Filter issues by assignee" control="assignee" value={assigneeFilter} options={[{ value: "all", label: "All" }, { value: "unassigned", label: "Unassigned" }, ...assignees.map((assignee) => ({ value: assignee, label: assignee }))]} onChange={onAssigneeFilter} />
+          <InlineDropdown label="Label" ariaLabel="Filter issues by label" control="label" value={labelFilter} options={[{ value: "all", label: "All" }, ...labels.map((label) => ({ value: label, label }))]} onChange={onLabelFilter} />
         </div>
       </div>
-      {canCreate ? (
-        <form className="linear-create" onSubmit={onCreate}>
-          <Plus size={16} />
-          <input name="title" aria-label="Issue title" placeholder={`New issue in ${title}`} />
-          <select name="priority" aria-label="Issue priority" defaultValue="3"><option value="1">P1</option><option value="2">P2</option><option value="3">P3</option><option value="4">P4</option></select>
-          <input name="description" aria-label="Issue description" placeholder="Short note" />
-          <button disabled={creating}>{creating ? "Saving" : "Add"}</button>
-        </form>
-      ) : (
-        <div className="linear-create disabled-create">
-          <Plus size={16} />
-          <span>Open a project to create an issue</span>
-        </div>
-      )}
-      {createError ? <div className="create-error"><AlertTriangle size={14} />{createError}</div> : null}
       <div className="issues-and-detail">
-        <div className="linear-issue-list">
-          {grouped.length === 0 ? (
-            /* Name what emptied the list. "No issues found" is true whether the
-               project is empty, a search matched nothing, or a status chip has
-               nothing in it — and Active and Paused are legitimately empty
-               whenever no issue is started or paused, which was reported as the
-               filter being broken. */
-            <div className="empty-list">{emptyListReason(statusMode, query, filtersActive)}</div>
-          ) : grouped.map((group) => (
-            <div key={group.key} className="issue-group">
-              <div className="group-head"><span>⌄</span><StatusIcon statusType={group.statusType} /><strong>{group.label}</strong><em>{groupCountLabel(group)}</em><span aria-hidden="true"><Plus size={14} /></span></div>
-              {group.items.map((issue) => {
-                const statusType = resolveUiStatusType(issue);
-                return (
-                  <button
-                    key={issue.id}
-                    className={selectedIssue?.id === issue.id ? "linear-issue-row active" : "linear-issue-row"}
-                    onClick={() => onOpenIssue(issue)}
-                    onDoubleClick={() => onOpenIssue(issue, true)}
-                  >
-                    <PriorityBars priority={issue.priority} />
-                    <span className="issue-id">{issueCode(issue)}</span>
-                    <StatusIcon statusType={statusType} />
-                    <strong>{issue.title}</strong>
-                    <span className="relation">{issue.project_name}</span>
-                    <AgentStateInline issue={issue} />
-                    <time>{formatShortDate(issue.updated_at)}</time>
-                  </button>
-                );
-              })}
-            </div>
-          ))}
-        </div>
+        <VirtualizedIssueList
+          groups={grouped}
+          selectedIssueId={selectedIssue?.id}
+          emptyMessage={emptyListReason(statusMode, query, filtersActive)}
+          onOpenIssue={onOpenIssue}
+        />
         <IssueDetail
           issue={selectedIssue}
           onAddComment={onAddComment}
@@ -1398,6 +1614,270 @@ function IssuesPage({
         />
       </div>
     </section>
+  );
+}
+
+const issueGroupHeaderHeight = 36;
+const issueRowHeight = 44;
+const issueListOverscan = 440;
+
+type InlineDropdownOption = { value: string; label: string };
+
+function InlineDropdown({
+  label,
+  ariaLabel,
+  control,
+  value,
+  options,
+  disabled = false,
+  className = "",
+  title,
+  onChange,
+}: {
+  label: string;
+  ariaLabel: string;
+  control: "status" | "health" | "sort" | "rows" | "priority" | "assignee" | "label";
+  value: string;
+  options: InlineDropdownOption[];
+  disabled?: boolean;
+  className?: string;
+  title?: string;
+  onChange: (value: string) => void;
+}) {
+  const rootRef = useRef<HTMLDivElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const [open, setOpen] = useState(false);
+  const [menuStyle, setMenuStyle] = useState<{ left: number; top?: number; bottom?: number; width: number; maxHeight: number } | null>(null);
+  const selectedLabel = options.find((option) => option.value === value)?.label ?? value;
+
+  const positionMenu = useCallback(() => {
+    const trigger = rootRef.current;
+    if (!trigger) return;
+    const rect = trigger.getBoundingClientRect();
+    const below = window.innerHeight - rect.bottom - 4;
+    const above = rect.top - 4;
+    const useAbove = below < 120 && above > below;
+    setMenuStyle({
+      left: rect.left,
+      ...(useAbove ? { bottom: window.innerHeight - rect.top + 4 } : { top: rect.bottom + 4 }),
+      width: rect.width,
+      maxHeight: Math.max(88, Math.min(280, useAbove ? above : below)),
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!open) return;
+    const closeOutside = (event: PointerEvent) => {
+      const target = event.target as Node;
+      if (!rootRef.current?.contains(target) && !menuRef.current?.contains(target)) setOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setOpen(false);
+        rootRef.current?.querySelector<HTMLButtonElement>(".inline-select-trigger")?.focus();
+      }
+    };
+    const reposition = () => positionMenu();
+    document.addEventListener("pointerdown", closeOutside);
+    document.addEventListener("keydown", closeOnEscape);
+    window.addEventListener("resize", reposition);
+    window.addEventListener("scroll", reposition, true);
+    return () => {
+      document.removeEventListener("pointerdown", closeOutside);
+      document.removeEventListener("keydown", closeOnEscape);
+      window.removeEventListener("resize", reposition);
+      window.removeEventListener("scroll", reposition, true);
+    };
+  }, [open, positionMenu]);
+
+  return (
+    <div ref={rootRef} className={`inline-control ${className}`.trim()} data-control={control} title={title}>
+      <button
+        type="button"
+        className="inline-select-trigger"
+        aria-label={ariaLabel}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        data-value={value}
+        disabled={disabled}
+        onClick={() => {
+          if (!open) positionMenu();
+          setOpen((current) => !current);
+        }}
+        onKeyDown={(event) => {
+          if (["ArrowDown", "ArrowUp"].includes(event.key)) {
+            event.preventDefault();
+            positionMenu();
+            setOpen(true);
+          }
+        }}
+      >
+        <span>{label}</span>
+        <strong>{selectedLabel}</strong>
+      </button>
+      {open && menuStyle ? createPortal(
+        <div ref={menuRef} className="inline-dropdown-menu" role="listbox" aria-label={`${ariaLabel} options`} style={menuStyle}>
+          {options.map((option) => (
+            <button
+              key={option.value}
+              type="button"
+              role="option"
+              aria-selected={option.value === value}
+              onClick={() => {
+                onChange(option.value);
+                setOpen(false);
+                rootRef.current?.querySelector<HTMLButtonElement>(".inline-select-trigger")?.focus();
+              }}
+            >{option.label}</button>
+          ))}
+        </div>,
+        document.body,
+      ) : null}
+    </div>
+  );
+}
+
+function VirtualizedIssueList({
+  groups,
+  selectedIssueId,
+  emptyMessage,
+  onOpenIssue,
+}: {
+  groups: UiIssueGroup[];
+  selectedIssueId?: string;
+  emptyMessage: string;
+  onOpenIssue: (issue: Issue, reveal?: boolean) => void;
+}) {
+  const listRef = useRef<HTMLDivElement>(null);
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => new Set());
+  const [viewport, setViewport] = useState({ scrollTop: 0, height: 720 });
+  const layouts = useMemo(() => {
+    return groups.reduce<{ layouts: { group: UiIssueGroup; collapsed: boolean; top: number; height: number }[]; nextTop: number }>((result, group) => {
+      const collapsed = collapsedGroups.has(group.key);
+      const height = issueGroupHeaderHeight + (collapsed ? 0 : group.items.length * issueRowHeight);
+      return {
+        layouts: [...result.layouts, { group, collapsed, top: result.nextTop, height }],
+        nextTop: result.nextTop + height,
+      };
+    }, { layouts: [], nextTop: 0 }).layouts;
+  }, [collapsedGroups, groups]);
+  const totalHeight = layouts.reduce((height, layout) => height + layout.height, 0);
+
+  useEffect(() => {
+    const list = listRef.current;
+    if (!list) return;
+    const measure = () => setViewport((current) => ({ scrollTop: list.scrollTop, height: list.clientHeight || current.height }));
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(list);
+    return () => observer.disconnect();
+  }, []);
+
+  if (groups.length === 0) {
+    return <div className="linear-issue-list"><div className="empty-list">{emptyMessage}</div></div>;
+  }
+
+  const visibleTop = Math.max(0, viewport.scrollTop - issueListOverscan);
+  const visibleBottom = viewport.scrollTop + viewport.height + issueListOverscan;
+  return (
+    <div
+      ref={listRef}
+      className="linear-issue-list"
+      onScroll={(event) => setViewport({ scrollTop: event.currentTarget.scrollTop, height: event.currentTarget.clientHeight })}
+    >
+      <div className="virtual-issue-space" style={{ height: totalHeight }}>
+        {layouts.map(({ group, collapsed, top, height }) => {
+          const rowTop = top + issueGroupHeaderHeight;
+          const firstRow = collapsed ? 0 : Math.max(0, Math.floor((visibleTop - rowTop) / issueRowHeight));
+          const lastRow = collapsed ? 0 : Math.min(group.items.length, Math.ceil((visibleBottom - rowTop) / issueRowHeight));
+          const visibleIssues = firstRow < lastRow ? group.items.slice(firstRow, lastRow) : [];
+          return (
+            <div
+              key={group.key}
+              className="issue-group"
+              data-total={group.total}
+              data-returned={group.items.length}
+              style={{ top, height }}
+            >
+              <div className="group-head">
+                <button
+                  type="button"
+                  className="group-toggle"
+                  aria-label={`${collapsed ? "Expand" : "Collapse"} ${group.label}`}
+                  aria-expanded={!collapsed}
+                  onClick={() => setCollapsedGroups((current) => {
+                    const next = new Set(current);
+                    if (next.has(group.key)) next.delete(group.key);
+                    else next.add(group.key);
+                    return next;
+                  })}
+                ><span aria-hidden="true">{collapsed ? "›" : "⌄"}</span></button>
+                <StatusIcon statusType={group.statusType} />
+                <strong>{group.label}</strong>
+                <em>{groupCountLabel(group)}</em>
+              </div>
+              {visibleIssues.map((issue, visibleIndex) => {
+                const issueIndex = firstRow + visibleIndex;
+                return (
+                  <button
+                    key={issue.id}
+                    className={selectedIssueId === issue.id ? "linear-issue-row active" : "linear-issue-row"}
+                    style={{ top: issueGroupHeaderHeight + issueIndex * issueRowHeight }}
+                    onClick={() => onOpenIssue(issue)}
+                    onDoubleClick={() => onOpenIssue(issue, true)}
+                  >
+                    <span className="issue-id">{issueCode(issue)}</span>
+                    <StatusIcon statusType={resolveUiStatusType(issue)} />
+                    <strong>{issue.title}</strong>
+                    <span className="relation">{issue.project_name}</span>
+                    <AgentStateInline issue={issue} />
+                    <time>{formatShortDate(issue.updated_at)}</time>
+                  </button>
+                );
+              })}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function IssuePriorityPicker({ value, onChange }: { value: IssueDraftPriority; onChange: (value: IssueDraftPriority) => void }) {
+  const [open, setOpen] = useState(false);
+  const options: { value: IssueDraftPriority; label: string }[] = [
+    { value: "1", label: "P1 Urgent" },
+    { value: "2", label: "P2 High" },
+    { value: "3", label: "P3 Medium" },
+    { value: "4", label: "P4 Low" },
+  ];
+  return (
+    <div className="issue-priority-picker">
+      <button
+        type="button"
+        className={`priority-picker-pill p${value}`}
+        aria-label={`New issue priority P${value}`}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={() => setOpen((current) => !current)}
+      ><Flag size={13} />P{value}</button>
+      {open ? (
+        <div className="priority-picker-menu" role="menu" aria-label="New issue priority choices">
+          {options.map((option) => (
+            <button
+              key={option.value}
+              type="button"
+              role="menuitemradio"
+              aria-checked={value === option.value}
+              onClick={() => {
+                onChange(option.value);
+                setOpen(false);
+              }}
+            >{option.label}</button>
+          ))}
+        </div>
+      ) : null}
+    </div>
   );
 }
 
@@ -1759,6 +2239,18 @@ function statusModeLabel(statusMode: StatusMode) {
   return "All statuses";
 }
 
+function matchesStatusMode(statusMode: StatusMode, statusType: IssueStatusType) {
+  return statusMode === "all" ||
+    (statusMode === "active" && ["started", "blocked", "paused"].includes(statusType)) ||
+    (statusMode === "started" && statusType === "started") ||
+    (statusMode === "paused" && statusType === "paused") ||
+    (statusMode === "backlog" && statusType === "backlog") ||
+    (statusMode === "todo" && statusType === "unstarted") ||
+    (statusMode === "blockers" && statusType === "blocked") ||
+    (statusMode === "completed" && statusType === "completed") ||
+    (statusMode === "canceled" && statusType === "canceled");
+}
+
 function groupCountLabel(group: UiIssueGroup) {
   return group.truncated ? `${group.returned}/${group.total}` : String(group.total);
 }
@@ -1803,10 +2295,8 @@ function resolveUiStatusType(issue: Pick<Issue, "status" | "status_type">) {
   return issue.status_type;
 }
 
-function ProjectIcon({ project, large }: { project: Project; large?: boolean }) {
-  const statusType = resolveProjectStatusType(project.status);
-  const icon = statusType === "completed" ? "✓" : statusType === "paused" ? "◷" : statusType === "canceled" ? "×" : "◇";
-  return <span className={large ? "project-icon large" : "project-icon"}>{icon}</span>;
+function ProjectIcon({ project }: { project: Project }) {
+  return <span className="project-icon" title={`${project.name} project`}><Diamond size={11} strokeWidth={1.4} /></span>;
 }
 
 function StatusIcon({ statusType }: { statusType: string }) {

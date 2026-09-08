@@ -27,6 +27,7 @@ import {
   upsertIssue,
   upsertProject,
 } from "./store.js";
+import { dataSnapshot } from "./data-snapshot.js";
 
 const [, , mode, ...args] = process.argv;
 
@@ -75,6 +76,7 @@ try {
       tools: [
         "list_teams",
         "list_projects",
+        "refresh_data",
         "get_project",
         "save_project",
         "list_project_updates",
@@ -108,6 +110,7 @@ try {
     const input = parseArgs(raw);
     if (tool === "list_teams") print({ teams: listTeams() });
     else if (tool === "list_projects") print({ projects: listProjects() });
+    else if (tool === "refresh_data") print(dataSnapshot(input));
     else if (tool === "get_project") {
       requireString(input, "id", "get_project");
       print({ project: getProject(input.id, { issues_per_status: input.issues_per_status }) });
