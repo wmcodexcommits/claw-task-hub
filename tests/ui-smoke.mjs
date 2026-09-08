@@ -837,7 +837,11 @@ await page.getByRole("button", { name: "Manage databases", exact: true }).click(
 assert(await page.getByRole("menu", { name: "Databases" }).isVisible(), "Database manager did not open");
 assert(await page.getByRole("menuitemradio", { name: new RegExp(`${createdCatalogue.active.fileName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}.*active`, "i") }).isVisible(), "Database manager does not identify the active database by exact filename");
 
-const activeDeleteResponse = await fetch(`${env.VITE_CLAW_TASK_HUB_API_BASE}/databases/${encodeURIComponent(createdCatalogue.active.id)}`, { method: "DELETE" });
+const activeDeleteResponse = await fetch(`${env.VITE_CLAW_TASK_HUB_API_BASE}/databases/${encodeURIComponent(createdCatalogue.active.id)}`, {
+  method: "DELETE",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ confirm: true }),
+});
 assert(activeDeleteResponse.status === 409, `Active database deletion returned ${activeDeleteResponse.status} instead of 409`);
 assert(existsSync(selectedDatabasePath), "Active database deletion protection removed the database file");
 
