@@ -709,7 +709,7 @@ function ProjectsPage({ projects, onOpenProject }: { projects: Project[]; onOpen
             <span><Circle className="dim" size={15} /></span>
             <span><PriorityBars priority={project.priority} /></span>
             <span>{project.lead ? <Avatar label={project.lead} /> : <UserRound className="dim" size={16} />}</span>
-            <span className="dim">Target date</span>
+            <span className="dim">—</span>
             <strong>{project.issue_count}</strong>
             <span><StatusIcon statusType={project.status === "Done" ? "completed" : "started"} /></span>
           </button>
@@ -735,7 +735,7 @@ function ProjectOverview({ detail, onTab }: { detail: ProjectDetail; onTab: (tab
         <StatusPill status={project.status || "In Progress"} statusType={project.status === "Done" ? "completed" : "started"} />
         <span className="prop-item"><PriorityBars priority={project.priority} /> {priorityName(project.priority)}</span>
         <span className="prop-item"><Avatar label={project.lead || "Unassigned"} /> {project.lead || "Unassigned"}</span>
-        <span className="prop-item">Apr 2026 -&gt; Target date</span>
+        <span className="prop-item">No target date</span>
         <span className="prop-item"><Box size={14} /> Local workspace</span>
       </div>
 

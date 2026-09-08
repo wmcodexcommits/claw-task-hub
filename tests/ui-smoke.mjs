@@ -292,6 +292,7 @@ await page.screenshot({ path: "test-results/linearish-projects.png", fullPage: t
 assert(await page.getByText("Projects", { exact: true }).first().isVisible(), "Projects heading is missing");
 const publicProjectRow = page.locator(".project-row").filter({ hasText: "Claw Task Hub MVP" }).first();
 assert(await publicProjectRow.isVisible(), "Project table row is missing");
+assert(!(await publicProjectRow.textContent()).includes("Target date"), "Project row displays placeholder target-date text as data");
 
 await publicProjectRow.scrollIntoViewIfNeeded();
 await publicProjectRow.click();
@@ -301,6 +302,8 @@ assert(await page.getByRole("button", { name: "Activity", exact: true }).isVisib
 assert(await page.getByRole("button", { name: "Issues", exact: true }).isVisible(), "Issues tab is missing");
 assert(await page.getByText("Properties").isVisible(), "Overview properties are missing");
 assert(await page.getByText("Resources").isVisible(), "Overview resources are missing");
+assert(await page.getByText("No target date", { exact: true }).isVisible(), "Overview does not disclose that the target date is missing");
+assert(!(await page.locator(".project-overview-linear").textContent()).includes("Apr 2026"), "Overview still displays a fabricated target date");
 const [shortcutDownload] = await Promise.all([
   page.waitForEvent("download"),
   page.getByRole("button", { name: "Download project shortcut" }).click(),
