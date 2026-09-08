@@ -105,9 +105,10 @@ type IssueClaim = {
 
 type AppPage = "projects" | "workspace" | "project";
 type ProjectTab = "overview" | "activity" | "issues";
-type StatusMode = "all" | "active" | "paused" | "backlog" | "todo" | "blockers";
+type StatusMode = "all" | "active" | "started" | "paused" | "backlog" | "todo" | "blockers" | "completed" | "canceled";
 type IssueDisplayLimit = "50" | "100" | "200" | "all";
 type IssueStatusType = "started" | "blocked" | "paused" | "backlog" | "unstarted" | "completed" | "canceled";
+type IssuePriorityFilter = "all" | "1" | "2" | "3" | "4";
 type ProjectStatusFilter = "all" | "active" | "paused" | "backlog" | "completed";
 type ProjectHealthFilter = "all" | ProjectHealth | "none";
 type ProjectSort = "updated" | "name" | "priority" | "target_date" | "issues";
@@ -137,6 +138,9 @@ type RouteDescriptor = {
   statusMode: StatusMode;
   query: string;
   issueDisplayLimit: IssueDisplayLimit;
+  priorityFilter: IssuePriorityFilter;
+  assigneeFilter: string;
+  labelFilter: string;
 };
 
 type ApiIssueGroup = {
@@ -223,6 +227,9 @@ function App() {
   const [query, setQuery] = useState("");
   const [statusMode, setStatusMode] = useState<StatusMode>("all");
   const [issueDisplayLimit, setIssueDisplayLimit] = useState<IssueDisplayLimit>(defaultIssueDisplayLimit);
+  const [issuePriorityFilter, setIssuePriorityFilter] = useState<IssuePriorityFilter>("all");
+  const [issueAssigneeFilter, setIssueAssigneeFilter] = useState("all");
+  const [issueLabelFilter, setIssueLabelFilter] = useState("all");
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
   const [detailOpen, setDetailOpen] = useState(false);
@@ -267,6 +274,9 @@ function App() {
     setIssueDisplayLimit(route.issueDisplayLimit);
     setQuery(route.query);
     setStatusMode(route.statusMode);
+    setIssuePriorityFilter(route.priorityFilter);
+    setIssueAssigneeFilter(route.assigneeFilter);
+    setIssueLabelFilter(route.labelFilter);
     setCreateError(null);
     try {
       if (route.kind === "project" && route.projectId) {
@@ -350,9 +360,12 @@ function App() {
       query,
       statusMode,
       issueDisplayLimit,
+      priorityFilter: issuePriorityFilter,
+      assigneeFilter: issueAssigneeFilter,
+      labelFilter: issueLabelFilter,
     });
     replaceBrowserPath(path);
-  }, [issueDisplayLimit, page, projectDetail?.project.id, query, routingReady, statusMode, tab]);
+  }, [issueAssigneeFilter, issueDisplayLimit, issueLabelFilter, issuePriorityFilter, page, projectDetail?.project.id, query, routingReady, statusMode, tab]);
 
   const refresh = useCallback(async (force = false) => {
     if (refreshInFlightRef.current) return;
@@ -445,6 +458,9 @@ function App() {
     setTab(nextTab);
     setQuery("");
     setStatusMode("all");
+    setIssuePriorityFilter("all");
+    setIssueAssigneeFilter("all");
+    setIssueLabelFilter("all");
     setCreateError(null);
     pushBrowserPath(projectRoutePath(project.id, nextTab));
   }
@@ -464,14 +480,24 @@ function App() {
     setTab("issues");
     setQuery("");
     setStatusMode("all");
+    setIssuePriorityFilter("all");
+    setIssueAssigneeFilter("all");
+    setIssueLabelFilter("all");
     setCreateError(null);
-    pushBrowserPath(workspaceRoutePath({ query: "", statusMode: "all", issueDisplayLimit }));
+    pushBrowserPath(workspaceRoutePath({ query: "", statusMode: "all", issueDisplayLimit, priorityFilter: "all", assigneeFilter: "all", labelFilter: "all" }));
   }
 
   function changeTab(nextTab: ProjectTab) {
     setTab(nextTab);
     if (projectDetailRef.current?.project.id) {
-      pushBrowserPath(projectRoutePath(projectDetailRef.current.project.id, nextTab, { query, statusMode, issueDisplayLimit }));
+      pushBrowserPath(projectRoutePath(projectDetailRef.current.project.id, nextTab, {
+        query,
+        statusMode,
+        issueDisplayLimit,
+        priorityFilter: issuePriorityFilter,
+        assigneeFilter: issueAssigneeFilter,
+        labelFilter: issueLabelFilter,
+      }));
     }
   }
 
@@ -636,35 +662,91 @@ function App() {
   const trimmedQuery = query.trim();
   const matchingServerSearch =
     trimmedQuery && serverSearchResult?.query === trimmedQuery && serverSearchResult.scope === searchScope ? serverSearchResult.issues : null;
+  const sourceIssueGroups = projectDetail?.issueGroups ?? workspaceIssueGroups;
+  const loadedIssueSource = useMemo(() => {
+    const groupedIssues = sourceIssueGroups.flatMap((group) => group.issues);
+    const fallbackIssues = projectDetail?.issues ?? workspaceIssues;
+    const unique = new Map<string, Issue>();
+    for (const issue of groupedIssues.length ? groupedIssues : fallbackIssues) unique.set(issue.id, issue);
+    return [...unique.values()];
+  }, [projectDetail?.issues, sourceIssueGroups, workspaceIssues]);
+  const issueFilterSource = useMemo(
+    () => trimmedQuery ? matchingServerSearch ?? [] : loadedIssueSource,
+    [loadedIssueSource, matchingServerSearch, trimmedQuery],
+  );
+  const issueAssignees = useMemo(
+    () => [...new Set(loadedIssueSource.map((issue) => issue.assignee?.trim()).filter((value): value is string => Boolean(value)))].sort((a, b) => a.localeCompare(b)),
+    [loadedIssueSource],
+  );
+  const issueLabels = useMemo(
+    () => [...new Set(loadedIssueSource.flatMap((issue) => issue.labels ?? []).filter(Boolean))].sort((a, b) => a.localeCompare(b)),
+    [loadedIssueSource],
+  );
+  const hasAdvancedIssueFilters = issuePriorityFilter !== "all" || issueAssigneeFilter !== "all" || issueLabelFilter !== "all";
   const filteredIssues = useMemo(() => {
-    const activeIssues = trimmedQuery ? matchingServerSearch ?? [] : projectDetail?.issues ?? workspaceIssues;
     const lower = trimmedQuery.toLowerCase();
-    return activeIssues.filter((issue) => {
-      const text = `${issue.id} ${issue.external_id ?? ""} ${issue.identifier ?? ""} ${issue.title} ${issue.description ?? ""}`.toLowerCase();
+    return issueFilterSource.filter((issue) => {
+      const text = [
+        issue.id,
+        issue.external_id,
+        issue.identifier,
+        issue.title,
+        issue.description,
+        issue.assignee,
+        issue.project_name,
+        issue.team_name,
+        ...(issue.labels ?? []),
+      ].filter(Boolean).join(" ").toLowerCase();
       const matchesText = !lower || text.includes(lower);
       const statusType = resolveUiStatusType(issue);
       const matchesMode =
         statusMode === "all" ||
         (statusMode === "active" && ["started", "blocked", "paused"].includes(statusType)) ||
+        (statusMode === "started" && statusType === "started") ||
         (statusMode === "paused" && statusType === "paused") ||
         (statusMode === "backlog" && statusType === "backlog") ||
         (statusMode === "todo" && statusType === "unstarted") ||
-        (statusMode === "blockers" && statusType === "blocked");
-      return matchesText && matchesMode;
+        (statusMode === "blockers" && statusType === "blocked") ||
+        (statusMode === "completed" && statusType === "completed") ||
+        (statusMode === "canceled" && statusType === "canceled");
+      const matchesPriority = issuePriorityFilter === "all" || issue.priority === Number(issuePriorityFilter);
+      const matchesAssignee =
+        issueAssigneeFilter === "all" ||
+        (issueAssigneeFilter === "unassigned" ? !issue.assignee?.trim() : issue.assignee === issueAssigneeFilter);
+      const matchesLabel = issueLabelFilter === "all" || issue.labels?.includes(issueLabelFilter);
+      return matchesText && matchesMode && matchesPriority && matchesAssignee && matchesLabel;
     });
-  }, [matchingServerSearch, projectDetail?.issues, statusMode, trimmedQuery, workspaceIssues]);
-  const sourceIssueGroups = trimmedQuery ? null : projectDetail?.issueGroups ?? workspaceIssueGroups;
+  }, [issueAssigneeFilter, issueFilterSource, issueLabelFilter, issuePriorityFilter, statusMode, trimmedQuery]);
   const visibleIssueGroups = useMemo(() => {
-    if (trimmedQuery || statusMode === "blockers" || !sourceIssueGroups?.length) return groupIssues(filteredIssues);
+    if (trimmedQuery || statusMode !== "all" || hasAdvancedIssueFilters || !sourceIssueGroups.length) return groupIssues(filteredIssues);
     return sourceIssueGroups
       .map(apiGroupToUiGroup)
-      .filter((group) => groupMatchesStatusMode(group.statusType, statusMode))
       .filter((group) => group.items.length);
-  }, [filteredIssues, sourceIssueGroups, statusMode, trimmedQuery]);
+  }, [filteredIssues, hasAdvancedIssueFilters, sourceIssueGroups, statusMode, trimmedQuery]);
+  const visibleSelectedIssue = selectedIssue && filteredIssues.some((issue) => issue.id === selectedIssue.id)
+    ? selectedIssue
+    : filteredIssues[0] ?? null;
+
+  useEffect(() => {
+    if (page !== "workspace" && (page !== "project" || tab !== "issues")) return;
+    const currentIssueId = selectedIssueRef.current?.id;
+    if (currentIssueId && filteredIssues.some((issue) => issue.id === currentIssueId)) return;
+    const nextIssue = filteredIssues[0] ?? null;
+    selectedIssueRef.current = nextIssue;
+    setSelectedIssue(nextIssue);
+  }, [filteredIssues, page, tab]);
 
   function downloadProjectShortcut() {
     if (!projectDetail?.project) return;
     downloadShortcut(projectDetail.project, "issues");
+  }
+
+  function clearIssueFilters() {
+    setQuery("");
+    setStatusMode("all");
+    setIssuePriorityFilter("all");
+    setIssueAssigneeFilter("all");
+    setIssueLabelFilter("all");
   }
 
   return (
@@ -716,16 +798,25 @@ function App() {
             title="All issues"
             issues={filteredIssues}
             issueGroups={visibleIssueGroups}
-            selectedIssue={selectedIssue}
+            selectedIssue={visibleSelectedIssue}
             query={query}
             statusMode={statusMode}
             issueDisplayLimit={issueDisplayLimit}
+            priorityFilter={issuePriorityFilter}
+            assigneeFilter={issueAssigneeFilter}
+            labelFilter={issueLabelFilter}
+            assignees={issueAssignees}
+            labels={issueLabels}
             creating={creating}
             createError={createError}
             canCreate={false}
             onQuery={setQuery}
             onStatusMode={setStatusMode}
             onIssueDisplayLimit={changeIssueDisplayLimit}
+            onPriorityFilter={setIssuePriorityFilter}
+            onAssigneeFilter={setIssueAssigneeFilter}
+            onLabelFilter={setIssueLabelFilter}
+            onClearFilters={clearIssueFilters}
             onCreate={createIssue}
             onOpenIssue={openIssue}
             onAddComment={addComment}
@@ -742,16 +833,25 @@ function App() {
             title={projectDetail.project.name}
             issues={filteredIssues}
             issueGroups={visibleIssueGroups}
-            selectedIssue={selectedIssue}
+            selectedIssue={visibleSelectedIssue}
             query={query}
             statusMode={statusMode}
             issueDisplayLimit={issueDisplayLimit}
+            priorityFilter={issuePriorityFilter}
+            assigneeFilter={issueAssigneeFilter}
+            labelFilter={issueLabelFilter}
+            assignees={issueAssignees}
+            labels={issueLabels}
             creating={creating}
             createError={createError}
             canCreate={true}
             onQuery={setQuery}
             onStatusMode={setStatusMode}
             onIssueDisplayLimit={changeIssueDisplayLimit}
+            onPriorityFilter={setIssuePriorityFilter}
+            onAssigneeFilter={setIssueAssigneeFilter}
+            onLabelFilter={setIssueLabelFilter}
+            onClearFilters={clearIssueFilters}
             onCreate={createIssue}
             onOpenIssue={openIssue}
             onAddComment={addComment}
@@ -1133,12 +1233,21 @@ function IssuesPage({
   query,
   statusMode,
   issueDisplayLimit,
+  priorityFilter,
+  assigneeFilter,
+  labelFilter,
+  assignees,
+  labels,
   creating,
   createError,
   canCreate,
   onQuery,
   onStatusMode,
   onIssueDisplayLimit,
+  onPriorityFilter,
+  onAssigneeFilter,
+  onLabelFilter,
+  onClearFilters,
   onCreate,
   onOpenIssue,
   onAddComment,
@@ -1153,12 +1262,21 @@ function IssuesPage({
   query: string;
   statusMode: StatusMode;
   issueDisplayLimit: IssueDisplayLimit;
+  priorityFilter: IssuePriorityFilter;
+  assigneeFilter: string;
+  labelFilter: string;
+  assignees: string[];
+  labels: string[];
   creating: boolean;
   createError: string | null;
   canCreate: boolean;
   onQuery: (value: string) => void;
   onStatusMode: (mode: StatusMode) => void;
   onIssueDisplayLimit: (value: IssueDisplayLimit) => void;
+  onPriorityFilter: (value: IssuePriorityFilter) => void;
+  onAssigneeFilter: (value: string) => void;
+  onLabelFilter: (value: string) => void;
+  onClearFilters: () => void;
   onCreate: (event: FormEvent<HTMLFormElement>) => void;
   onOpenIssue: (issue: Issue, reveal?: boolean) => void;
   onAddComment: (event: FormEvent<HTMLFormElement>) => void;
@@ -1166,14 +1284,14 @@ function IssuesPage({
   onResolveDependency: (dependencyId: string) => void;
   onStatusChange: (status: string) => void;
 }) {
-  void issues;
   const grouped = issueGroups;
+  const filtersActive = Boolean(query.trim()) || statusMode !== "all" || priorityFilter !== "all" || assigneeFilter !== "all" || labelFilter !== "all";
   return (
     <section className="issues-screen">
       <div className="issue-filter-row">
-        <div className="searchbar"><Search size={16} /><input value={query} onChange={(event) => onQuery(event.target.value)} placeholder={`Search ${title}`} /></div>
+        <div className="searchbar"><Search size={16} /><input aria-label={`Search ${title}`} value={query} onChange={(event) => onQuery(event.target.value)} placeholder={`Search ${title}`} /></div>
         <label className="issue-limit-control">
-          <span>Per status</span>
+          <span>Rows/group</span>
           <select aria-label="Issues per status" value={issueDisplayLimit} onChange={(event) => onIssueDisplayLimit(event.target.value as IssueDisplayLimit)}>
             <option value="50">50</option>
             <option value="100">100</option>
@@ -1181,22 +1299,53 @@ function IssuesPage({
             <option value="all">All</option>
           </select>
         </label>
-        <button className="round-icon" aria-label="Clear issue filters" title="Clear issue filters" onClick={() => { onQuery(""); onStatusMode("all"); }}><X size={15} /></button>
+        <span className="filter-results" aria-live="polite">{issues.length} shown</span>
+        <button className="round-icon" aria-label="Clear issue filters" title="Clear issue filters" disabled={!filtersActive} onClick={onClearFilters}><X size={15} /></button>
       </div>
       <div className="mode-row">
         <button className={statusMode === "blockers" ? "mode-chip danger active" : "mode-chip danger"} onClick={() => onStatusMode("blockers")}><AlertTriangle size={14} />Blockers</button>
         <button className={statusMode === "all" ? "mode-chip active" : "mode-chip"} onClick={() => onStatusMode("all")}>All statuses</button>
         <button className={statusMode === "active" ? "mode-chip active" : "mode-chip"} onClick={() => onStatusMode("active")}>Active</button>
+        <button className={statusMode === "started" ? "mode-chip active" : "mode-chip"} onClick={() => onStatusMode("started")}>In progress</button>
         <button className={statusMode === "paused" ? "mode-chip active" : "mode-chip"} onClick={() => onStatusMode("paused")}>Paused</button>
         <button className={statusMode === "backlog" ? "mode-chip active" : "mode-chip"} onClick={() => onStatusMode("backlog")}>Backlog</button>
         <button className={statusMode === "todo" ? "mode-chip active" : "mode-chip"} onClick={() => onStatusMode("todo")}>Todo</button>
+        <button className={statusMode === "completed" ? "mode-chip active" : "mode-chip"} onClick={() => onStatusMode("completed")}>Done</button>
+        <button className={statusMode === "canceled" ? "mode-chip active" : "mode-chip"} onClick={() => onStatusMode("canceled")}>Canceled</button>
+        <div className="issue-advanced-filters">
+          <label>
+            <span>Priority</span>
+            <select aria-label="Filter issues by priority" value={priorityFilter} onChange={(event) => onPriorityFilter(event.target.value as IssuePriorityFilter)}>
+              <option value="all">All</option>
+              <option value="1">P1</option>
+              <option value="2">P2</option>
+              <option value="3">P3</option>
+              <option value="4">P4</option>
+            </select>
+          </label>
+          <label>
+            <span>Assignee</span>
+            <select aria-label="Filter issues by assignee" value={assigneeFilter} onChange={(event) => onAssigneeFilter(event.target.value)}>
+              <option value="all">All</option>
+              <option value="unassigned">Unassigned</option>
+              {assignees.map((assignee) => <option key={assignee} value={assignee}>{assignee}</option>)}
+            </select>
+          </label>
+          <label>
+            <span>Label</span>
+            <select aria-label="Filter issues by label" value={labelFilter} onChange={(event) => onLabelFilter(event.target.value)}>
+              <option value="all">All</option>
+              {labels.map((label) => <option key={label} value={label}>{label}</option>)}
+            </select>
+          </label>
+        </div>
       </div>
       {canCreate ? (
         <form className="linear-create" onSubmit={onCreate}>
           <Plus size={16} />
-          <input name="title" placeholder={`New issue in ${title}`} />
-          <select name="priority" defaultValue="3"><option value="1">P1</option><option value="2">P2</option><option value="3">P3</option><option value="4">P4</option></select>
-          <input name="description" placeholder="Short note" />
+          <input name="title" aria-label="Issue title" placeholder={`New issue in ${title}`} />
+          <select name="priority" aria-label="Issue priority" defaultValue="3"><option value="1">P1</option><option value="2">P2</option><option value="3">P3</option><option value="4">P4</option></select>
+          <input name="description" aria-label="Issue description" placeholder="Short note" />
           <button disabled={creating}>{creating ? "Saving" : "Add"}</button>
         </form>
       ) : (
@@ -1214,10 +1363,10 @@ function IssuesPage({
                nothing in it — and Active and Paused are legitimately empty
                whenever no issue is started or paused, which was reported as the
                filter being broken. */
-            <div className="empty-list">{emptyListReason(statusMode, query)}</div>
+            <div className="empty-list">{emptyListReason(statusMode, query, filtersActive)}</div>
           ) : grouped.map((group) => (
             <div key={group.key} className="issue-group">
-              <div className="group-head"><span>⌄</span><StatusIcon statusType={group.statusType} /><strong>{group.label}</strong><em>{groupCountLabel(group)}</em><button><Plus size={14} /></button></div>
+              <div className="group-head"><span>⌄</span><StatusIcon statusType={group.statusType} /><strong>{group.label}</strong><em>{groupCountLabel(group)}</em><span aria-hidden="true"><Plus size={14} /></span></div>
               {group.items.map((issue) => {
                 const statusType = resolveUiStatusType(issue);
                 return (
@@ -1277,7 +1426,7 @@ function IssueDetail({
       <div className="comments-box">
         <strong>Activity</strong>
         {issue.comments?.map((comment) => <article key={comment.id}><b>{comment.author}</b><span>{comment.body}</span></article>)}
-        <form onSubmit={onAddComment}><input name="body" placeholder="Add an agent note" /><button>Add</button></form>
+        <form onSubmit={onAddComment}><input name="body" aria-label="Add agent note" placeholder="Add an agent note" /><button>Add</button></form>
       </div>
     </aside>
   );
@@ -1304,7 +1453,7 @@ function IssueDialog({
         <div className="comments-box">
           <strong>Activity</strong>
           {issue.comments?.map((comment) => <article key={comment.id}><b>{comment.author}</b><span>{comment.body}</span></article>)}
-          <form onSubmit={onAddComment}><input name="body" placeholder="Add an agent note" /><button>Add</button></form>
+          <form onSubmit={onAddComment}><input name="body" aria-label="Add agent note" placeholder="Add an agent note" /><button>Add</button></form>
         </div>
       </section>
     </div>
@@ -1347,33 +1496,37 @@ function parseRoute(location: Location): RouteDescriptor {
   const query = params.get("q") ?? params.get("query") ?? "";
   const issueDisplayLimit = parseIssueDisplayLimitParam(params.get("limit") ?? params.get("issues_per_status"));
   const statusMode = parseStatusModeParam(params.get("status"));
+  const priorityFilter = parseIssuePriorityFilter(params.get("priority"));
+  const assigneeFilter = params.get("assignee") || "all";
+  const labelFilter = params.get("label") || "all";
+  const issueFilters = { statusMode, query, issueDisplayLimit, priorityFilter, assigneeFilter, labelFilter };
   const queryTab = parseProjectTab(params.get("tab"));
   const contextKey = params.get("context_key");
   const projectId = params.get("project_id");
   const issueId = params.get("issue");
   if (contextKey) {
-    return { kind: "context", contextKey, tab: queryTab ?? "issues", tabExplicit: Boolean(queryTab), statusMode, query, issueDisplayLimit };
+    return { kind: "context", contextKey, tab: queryTab ?? "issues", tabExplicit: Boolean(queryTab), ...issueFilters };
   }
   if (issueId) {
-    return { kind: "issue", issueId, tab: "issues", statusMode, query, issueDisplayLimit };
+    return { kind: "issue", issueId, tab: "issues", ...issueFilters };
   }
   if (projectId) {
-    return { kind: "project", projectId, tab: queryTab ?? "issues", statusMode, query, issueDisplayLimit };
+    return { kind: "project", projectId, tab: queryTab ?? "issues", ...issueFilters };
   }
   const segments = location.pathname.split("/").map((part) => part.trim()).filter(Boolean).map(decodeUrlSegment);
-  if (!segments.length) return { kind: "projects", tab: "overview", statusMode, query, issueDisplayLimit };
-  if (segments[0] === "workspace") return { kind: "workspace", tab: "issues", statusMode, query, issueDisplayLimit };
+  if (!segments.length) return { kind: "projects", tab: "overview", ...issueFilters };
+  if (segments[0] === "workspace") return { kind: "workspace", tab: "issues", ...issueFilters };
   if (segments[0] === "issues" && segments[1]) {
-    return { kind: "issue", issueId: segments[1], tab: "issues", statusMode, query, issueDisplayLimit };
+    return { kind: "issue", issueId: segments[1], tab: "issues", ...issueFilters };
   }
   if (segments[0] === "contexts" && segments[1]) {
     const pathTab = parseProjectTab(segments[2]);
-    return { kind: "context", contextKey: segments[1], tab: pathTab ?? queryTab ?? "issues", tabExplicit: Boolean(pathTab || queryTab), statusMode, query, issueDisplayLimit };
+    return { kind: "context", contextKey: segments[1], tab: pathTab ?? queryTab ?? "issues", tabExplicit: Boolean(pathTab || queryTab), ...issueFilters };
   }
   if (segments[0] === "projects" && segments[1]) {
-    return { kind: "project", projectId: segments[1], tab: parseProjectTab(segments[2]) ?? queryTab ?? "overview", statusMode, query, issueDisplayLimit };
+    return { kind: "project", projectId: segments[1], tab: parseProjectTab(segments[2]) ?? queryTab ?? "overview", ...issueFilters };
   }
-  return { kind: "projects", tab: "overview", statusMode, query, issueDisplayLimit };
+  return { kind: "projects", tab: "overview", ...issueFilters };
 }
 
 function currentRoutePath(input: {
@@ -1383,6 +1536,9 @@ function currentRoutePath(input: {
   query: string;
   statusMode: StatusMode;
   issueDisplayLimit: IssueDisplayLimit;
+  priorityFilter: IssuePriorityFilter;
+  assigneeFilter: string;
+  labelFilter: string;
 }) {
   if (input.page === "project" && input.projectId) {
     return projectRoutePath(input.projectId, input.tab, input);
@@ -1391,7 +1547,7 @@ function currentRoutePath(input: {
   return "/projects";
 }
 
-function projectRoutePath(projectId: string, tab: ProjectTab = "overview", options: Partial<Pick<RouteDescriptor, "query" | "statusMode" | "issueDisplayLimit">> = {}) {
+function projectRoutePath(projectId: string, tab: ProjectTab = "overview", options: Partial<Pick<RouteDescriptor, "query" | "statusMode" | "issueDisplayLimit" | "priorityFilter" | "assigneeFilter" | "labelFilter">> = {}) {
   return `/projects/${encodeURIComponent(projectId)}/${tab}${routeQuery(options)}`;
 }
 
@@ -1421,7 +1577,7 @@ function safeFileName(value: string) {
   );
 }
 
-function workspaceRoutePath(options: Partial<Pick<RouteDescriptor, "query" | "statusMode" | "issueDisplayLimit">> = {}) {
+function workspaceRoutePath(options: Partial<Pick<RouteDescriptor, "query" | "statusMode" | "issueDisplayLimit" | "priorityFilter" | "assigneeFilter" | "labelFilter">> = {}) {
   return `/workspace/issues${routeQuery(options)}`;
 }
 
@@ -1429,12 +1585,15 @@ function issueRoutePath(issue: Issue) {
   return `/issues/${encodeURIComponent(issueCode(issue))}`;
 }
 
-function routeQuery(options: Partial<Pick<RouteDescriptor, "query" | "statusMode" | "issueDisplayLimit">>) {
+function routeQuery(options: Partial<Pick<RouteDescriptor, "query" | "statusMode" | "issueDisplayLimit" | "priorityFilter" | "assigneeFilter" | "labelFilter">>) {
   const params = new URLSearchParams();
   const query = options.query?.trim();
   if (query) params.set("q", query);
   if (options.statusMode && options.statusMode !== "all") params.set("status", options.statusMode);
   if (options.issueDisplayLimit && options.issueDisplayLimit !== defaultIssueDisplayLimit) params.set("limit", options.issueDisplayLimit);
+  if (options.priorityFilter && options.priorityFilter !== "all") params.set("priority", options.priorityFilter);
+  if (options.assigneeFilter && options.assigneeFilter !== "all") params.set("assignee", options.assigneeFilter);
+  if (options.labelFilter && options.labelFilter !== "all") params.set("label", options.labelFilter);
   const value = params.toString();
   return value ? `?${value}` : "";
 }
@@ -1455,7 +1614,12 @@ function parseProjectTab(value: string | null | undefined): ProjectTab | null {
 }
 
 function parseStatusModeParam(value: string | null | undefined): StatusMode {
-  if (value === "active" || value === "paused" || value === "backlog" || value === "todo" || value === "blockers") return value;
+  if (value === "active" || value === "started" || value === "paused" || value === "backlog" || value === "todo" || value === "blockers" || value === "completed" || value === "canceled") return value;
+  return "all";
+}
+
+function parseIssuePriorityFilter(value: string | null | undefined): IssuePriorityFilter {
+  if (value === "1" || value === "2" || value === "3" || value === "4") return value;
   return "all";
 }
 
@@ -1575,9 +1739,10 @@ function apiGroupToUiGroup(group: ApiIssueGroup): UiIssueGroup {
   };
 }
 
-function emptyListReason(statusMode: StatusMode, query: string) {
+function emptyListReason(statusMode: StatusMode, query: string, filtersActive: boolean) {
   const trimmed = query.trim();
   if (trimmed) return `No issues match "${trimmed}"${statusMode === "all" ? "" : ` in ${statusModeLabel(statusMode)}`}`;
+  if (filtersActive) return "No issues match the active filters";
   if (statusMode === "all") return "No issues yet";
   return `No issues in ${statusModeLabel(statusMode)}`;
 }
@@ -1585,20 +1750,13 @@ function emptyListReason(statusMode: StatusMode, query: string) {
 function statusModeLabel(statusMode: StatusMode) {
   if (statusMode === "blockers") return "Blockers";
   if (statusMode === "active") return "Active";
+  if (statusMode === "started") return "In progress";
   if (statusMode === "paused") return "Paused";
   if (statusMode === "backlog") return "Backlog";
   if (statusMode === "todo") return "Todo";
+  if (statusMode === "completed") return "Done";
+  if (statusMode === "canceled") return "Canceled";
   return "All statuses";
-}
-
-function groupMatchesStatusMode(statusType: IssueStatusType, statusMode: StatusMode) {
-  return (
-    statusMode === "all" ||
-    (statusMode === "active" && ["started", "blocked", "paused"].includes(statusType)) ||
-    (statusMode === "paused" && statusType === "paused") ||
-    (statusMode === "backlog" && statusType === "backlog") ||
-    (statusMode === "todo" && statusType === "unstarted")
-  );
 }
 
 function groupCountLabel(group: UiIssueGroup) {

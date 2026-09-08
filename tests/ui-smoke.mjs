@@ -257,6 +257,56 @@ runHub("save_issue", {
   labels: ["ui-smoke"],
   source: "local",
 });
+runHub("save_issue", {
+  id: "LOCAL-6",
+  external_id: "LOCAL-6",
+  identifier: "LOCAL-6",
+  title: "Combined filter target",
+  description: "Matches priority, assignee, and label filters together.",
+  project_id: "project_claw_task_hub_mvp",
+  status: "In Progress",
+  priority: 1,
+  assignee: "Filter Agent",
+  labels: ["filter-target", "ui-smoke"],
+  source: "local",
+});
+runHub("save_issue", {
+  id: "LOCAL-7",
+  external_id: "LOCAL-7",
+  identifier: "LOCAL-7",
+  title: "Priority-only filter decoy",
+  description: "Matches P1 but not the requested assignee.",
+  project_id: "project_claw_task_hub_mvp",
+  status: "Todo",
+  priority: 1,
+  labels: ["filter-decoy", "ui-smoke"],
+  source: "local",
+});
+runHub("save_issue", {
+  id: "LOCAL-8",
+  external_id: "LOCAL-8",
+  identifier: "LOCAL-8",
+  title: "Assignee-only filter decoy",
+  description: "Matches the assignee and label but not P1.",
+  project_id: "project_claw_task_hub_mvp",
+  status: "Paused",
+  priority: 2,
+  assignee: "Filter Agent",
+  labels: ["filter-target", "ui-smoke"],
+  source: "local",
+});
+runHub("save_issue", {
+  id: "LOCAL-9",
+  external_id: "LOCAL-9",
+  identifier: "LOCAL-9",
+  title: "Persistent blocked filter target",
+  description: "Remains blocked after the dependency-backed issue is resolved.",
+  project_id: "project_claw_task_hub_mvp",
+  status: "Blocked",
+  priority: 3,
+  labels: ["blocked-filter", "ui-smoke"],
+  source: "local",
+});
 runHub("save_comment", {
   issue_id: "LOCAL-1",
   body: "UI smoke seeded activity comment.",
@@ -282,6 +332,10 @@ await waitForAppShell();
 await page.getByRole("button", { name: "Issues", exact: true }).waitFor({ state: "visible", timeout: 15000 });
 assert((await page.getByRole("button", { name: "Issues", exact: true }).getAttribute("class"))?.includes("active"), "Direct project issues URL did not activate the Issues tab");
 assert(await page.locator(".searchbar input").getAttribute("placeholder") === "Search Claw Task Hub MVP", "Direct project issues URL did not load the project issue view");
+assert(await page.getByRole("textbox", { name: "Search Claw Task Hub MVP" }).isVisible(), "Issue search does not have an accessible name");
+assert(await page.getByRole("textbox", { name: "Issue title" }).isVisible(), "Issue title field does not have an accessible name");
+assert(await page.getByRole("combobox", { name: "Issue priority" }).isVisible(), "Issue priority field does not have an accessible name");
+assert(await page.getByRole("textbox", { name: "Issue description" }).isVisible(), "Issue description field does not have an accessible name");
 
 await page.goto(`http://127.0.0.1:${webPort}/contexts/${encodeURIComponent("ui-smoke:project")}/activity`, { waitUntil: "domcontentloaded" });
 await waitForAppShell();
@@ -410,11 +464,36 @@ assert(todoRowsAt100 > todoRowsAt50, `Todo group did not expand after selecting 
 await page.getByRole("button", { name: "All statuses", exact: true }).click();
 const allGroupLabelsAfterLimitChange = (await page.locator(".group-head strong").allTextContents()).map((label) => label.trim());
 assert(allGroupLabelsAfterLimitChange.includes("Canceled"), "Canceled issues are not shown as a status group");
+const priorityFilter = page.getByLabel("Filter issues by priority");
+const assigneeFilter = page.getByLabel("Filter issues by assignee");
+const labelFilter = page.getByLabel("Filter issues by label");
+assert(await priorityFilter.isVisible(), "Priority filter is missing");
+assert(await assigneeFilter.isVisible(), "Assignee filter is missing");
+assert(await labelFilter.isVisible(), "Label filter is missing");
+await priorityFilter.selectOption("1");
+let filteredRows = await page.locator(".linear-issue-row").allTextContents();
+assert(filteredRows.some((row) => row.includes("Combined filter target")), "P1 filter omitted the matching issue");
+assert(filteredRows.some((row) => row.includes("Priority-only filter decoy")), "P1 filter omitted another P1 issue");
+assert(!filteredRows.some((row) => row.includes("Assignee-only filter decoy")), "P1 filter included a P2 issue");
+await assigneeFilter.selectOption("Filter Agent");
+await labelFilter.selectOption("filter-target");
+filteredRows = await page.locator(".linear-issue-row").allTextContents();
+assert(filteredRows.length === 1 && filteredRows[0].includes("Combined filter target"), `combined filters returned the wrong rows: ${filteredRows.join(" | ")}`);
+await page.locator(".issue-detail h2", { hasText: "Combined filter target" }).waitFor({ state: "visible", timeout: 10000 });
+await page.waitForFunction(() => {
+  const params = new URL(window.location.href).searchParams;
+  return params.get("priority") === "1" && params.get("assignee") === "Filter Agent" && params.get("label") === "filter-target";
+});
+assert(await page.getByText("1 shown", { exact: true }).isVisible(), "Filtered result count is wrong");
+await page.getByRole("button", { name: "Clear issue filters" }).click();
+assert((await priorityFilter.inputValue()) === "all", "Clear filters did not reset priority");
+assert((await assigneeFilter.inputValue()) === "all", "Clear filters did not reset assignee");
+assert((await labelFilter.inputValue()) === "all", "Clear filters did not reset label");
 const createdTitle = `UI smoke routed issue ${Date.now()}`;
 await page.locator(".linear-create input[name='title']").fill(createdTitle);
 await page.locator(".linear-create input[name='description']").fill("Created from a project page to verify issue routing.");
 await page.locator(".linear-create button").click();
-await page.getByText(createdTitle, { exact: true }).waitFor({ state: "visible", timeout: 10000 });
+await page.locator(".linear-issue-row").filter({ hasText: createdTitle }).first().waitFor({ state: "visible", timeout: 10000 });
 const routedIssues = runHub("list_issues", {
   project_id: "project_claw_task_hub_mvp",
   query: createdTitle,
@@ -459,7 +538,15 @@ await page.locator(".issue-dialog .dependency.open", { hasText: "LOCAL-4" }).wai
 await page.locator(".issue-dialog").getByRole("button", { name: "Resolve", exact: true }).click();
 await page.locator(".issue-dialog .dependency.open", { hasText: "LOCAL-4" }).waitFor({ state: "detached", timeout: 10000 });
 await page.locator(".dialog-close").click();
+await page.locator(".linear-issue-row", { hasText: "Persistent blocked filter target" }).waitFor({ state: "visible", timeout: 10000 });
+const remainingBlockerRows = await page.locator(".linear-issue-row").allTextContents();
+assert(remainingBlockerRows.length === 1 && remainingBlockerRows[0].includes("Persistent blocked filter target"), `Blockers filter retained non-blocked rows: ${remainingBlockerRows.join(" | ")}`);
+await page.locator(".issue-detail h2", { hasText: "Persistent blocked filter target" }).waitFor({ state: "visible", timeout: 10000 });
+await page.setViewportSize({ width: 960, height: 900 });
+const advancedFiltersBox = await page.locator(".issue-advanced-filters").boundingBox();
+assert(advancedFiltersBox && advancedFiltersBox.x >= 0 && advancedFiltersBox.x + advancedFiltersBox.width <= 960, "Advanced issue filters overflow the 960px viewport");
 await page.screenshot({ path: "test-results/linearish-project-issues.png", fullPage: true });
+await page.setViewportSize({ width: 1280, height: 960 });
 
 await page.getByRole("button", { name: "Paused", exact: true }).click();
 const pausedButtonClass = await page.getByRole("button", { name: "Paused", exact: true }).getAttribute("class");

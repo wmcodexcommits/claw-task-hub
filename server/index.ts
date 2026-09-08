@@ -61,7 +61,7 @@ const allowedOrigins = new Set([
 
 app.use(cors({
   origin(origin, callback) {
-    if (!origin || unsafeBind || allowedOrigins.has(origin)) {
+    if (!origin || allowedOrigins.has(origin)) {
       callback(null, true);
       return;
     }

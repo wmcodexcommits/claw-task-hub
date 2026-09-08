@@ -220,6 +220,49 @@ async function assertApiRejectsUnsafeBind() {
   assert(stderr.includes("Refusing to bind Claw Task Hub API"), "unsafe bind failure did not explain the local-first guard");
 }
 
+async function assertUnsafeBindStillChecksCors() {
+  const port = await getFreePort();
+  const allowedOrigin = "https://trusted.example";
+  const child = spawnNpm(["run", "-s", "api"], {
+    PORT: String(port),
+    CLAW_TASK_HUB_HOST: "0.0.0.0",
+    CLAW_TASK_HUB_UNSAFE_BIND: "1",
+    CLAW_TASK_HUB_CORS_ORIGINS: allowedOrigin,
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout?.on("data", (chunk) => {
+    stdout += chunk.toString();
+  });
+  child.stderr?.on("data", (chunk) => {
+    stderr += chunk.toString();
+  });
+  try {
+    for (let attempt = 0; attempt < 60; attempt += 1) {
+      try {
+        const response = await fetch(`http://127.0.0.1:${port}/api/health`);
+        if (response.ok) break;
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      if (attempt === 59) throw new Error(`API did not start\nstdout:\n${stdout}\nstderr:\n${stderr}`);
+    }
+
+    const rejected = await fetch(`http://127.0.0.1:${port}/api/health`, {
+      headers: { Origin: "https://evil.example" },
+    });
+    assert(!rejected.headers.has("access-control-allow-origin"), "unsafe bind allowed an unconfigured browser origin");
+
+    const allowed = await fetch(`http://127.0.0.1:${port}/api/health`, {
+      headers: { Origin: allowedOrigin },
+    });
+    assert(allowed.ok, `configured browser origin failed with ${allowed.status}`);
+    assert(allowed.headers.get("access-control-allow-origin") === allowedOrigin, "configured browser origin was not allowed");
+  } finally {
+    await stopProcessTree(child);
+  }
+}
+
 try {
   const tools = runHub("tools/list");
   assert(!tools.tools.includes("import_linear"), "import_linear must not be exposed to normal harness tools");
@@ -562,6 +605,7 @@ try {
   assert(migrationBackfillFailure.stderr.includes("CLAW_TASK_HUB_ALLOW_LINEAR_IMPORT=1"), "standalone Linear backfill failure did not explain the explicit gate");
   await assertApiLinearImportAbsent();
   await assertApiRejectsUnsafeBind();
+  await assertUnsafeBindStillChecksCors();
 
   console.log("Harness smoke passed");
 } finally {

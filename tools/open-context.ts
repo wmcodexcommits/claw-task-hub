@@ -204,6 +204,9 @@ function resolveProject(options: CliOptions, cwd: string, contextKey: string): C
 }
 
 function writeShortcut(cwd: string, shortcutName: string, url: string) {
+  if (shortcutName === "." || shortcutName === ".." || shortcutName !== basename(shortcutName) || shortcutName.includes("\\")) {
+    throw new Error("--shortcut-name must be a filename, not a path");
+  }
   mkdirSync(cwd, { recursive: true });
   const shortcutPath = resolve(cwd, shortcutName);
   writeFileSync(shortcutPath, `[InternetShortcut]\r\nURL=${url}\r\n`, "utf8");

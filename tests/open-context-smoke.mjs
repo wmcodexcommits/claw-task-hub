@@ -24,6 +24,15 @@ function runOpenContext(args) {
   return JSON.parse(result.stdout);
 }
 
+function runOpenContextExpectFailure(args) {
+  return spawnSync(process.execPath, ["--import", "tsx", "tools/open-context.ts", ...args], {
+    cwd: process.cwd(),
+    env,
+    encoding: "utf8",
+    windowsHide: true,
+  });
+}
+
 try {
   const first = runOpenContext([
     "--cwd", workspaceDir,
@@ -54,6 +63,26 @@ try {
   assert(second.ok === true, "second command did not report ok");
   assert(second.project?.id === first.project.id, "resolve-only run returned a different project");
   assert(second.url === first.url, "resolve-only run returned a different URL");
+
+  for (const shortcutName of ["../outside.url", "../../outside.url", "/tmp/outside.url", "..\\outside.url"]) {
+    const rejected = runOpenContextExpectFailure([
+      "--cwd", workspaceDir,
+      "--harness", "codex",
+      "--shortcut-name", shortcutName,
+      "--write-shortcut",
+    ]);
+    assert(rejected.status !== 0, `unsafe shortcut name was accepted: ${shortcutName}`);
+    assert(rejected.stderr.includes("--shortcut-name must be a filename, not a path"), `unsafe shortcut name failed unclearly: ${shortcutName}`);
+  }
+
+  const namedShortcut = runOpenContext([
+    "--cwd", workspaceDir,
+    "--harness", "codex",
+    "--shortcut-name", "Claw.url",
+    "--write-shortcut",
+  ]);
+  assert(namedShortcut.shortcut_path.replace(/\\/g, "/").endsWith("/Claw.url"), `safe shortcut filename was not used: ${namedShortcut.shortcut_path}`);
+  assert(existsSync(namedShortcut.shortcut_path), "safe named shortcut was not written");
 
   console.log("open-context smoke passed");
 } finally {

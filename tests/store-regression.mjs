@@ -341,6 +341,32 @@ try {
   }
   assert(invalidProjectMessage === "Project not found: project-does-not-exist", `invalid project error was not clear: ${invalidProjectMessage}`);
   assert(db.prepare("SELECT COUNT(*) AS count FROM issues").get().count === rowCountBeforeMissingProject, "invalid project_id created an issue");
+  let invalidTeamMessage = "";
+  try {
+    upsertIssue({ title: "Invalid team must fail", status: "Todo", project_id: storeProject.id, team_id: "team-does-not-exist" });
+  } catch (error) {
+    invalidTeamMessage = error instanceof Error ? error.message : String(error);
+  }
+  assert(invalidTeamMessage === "Team not found: team-does-not-exist", `invalid team error was not clear: ${invalidTeamMessage}`);
+  assert(db.prepare("SELECT COUNT(*) AS count FROM issues").get().count === rowCountBeforeMissingProject, "invalid team_id created an issue");
+  let invalidParentMessage = "";
+  try {
+    upsertIssue({ title: "Invalid parent must fail", status: "Todo", project_id: storeProject.id, parent_id: "CTH-DOES-NOT-EXIST" });
+  } catch (error) {
+    invalidParentMessage = error instanceof Error ? error.message : String(error);
+  }
+  assert(invalidParentMessage === "Parent issue not found: CTH-DOES-NOT-EXIST", `invalid parent error was not clear: ${invalidParentMessage}`);
+  assert(db.prepare("SELECT COUNT(*) AS count FROM issues").get().count === rowCountBeforeMissingProject, "invalid parent_id created an issue");
+  const explicitNullReferences = upsertIssue({
+    title: "Explicit null references are preserved",
+    identifier: "CTH-900023",
+    status: "Todo",
+    project_id: storeProject.id,
+    team_id: null,
+    parent_id: null,
+  });
+  assert(explicitNullReferences.team_id === null, "explicit null team_id was replaced");
+  assert(explicitNullReferences.parent_id === null, "explicit null parent_id was replaced");
   const deliberateUnassigned = upsertIssue({
     title: "Deliberate unassigned inbox issue",
     identifier: "CTH-900022",
@@ -557,6 +583,31 @@ try {
   assert(arrayFilteredIds.has(started.identifier), "listIssues array status_type missed started issue");
   assert(arrayFilteredIds.has(blocked.identifier), "listIssues array status_type missed blocked issue");
   assert(!arrayFilteredIds.has(done.identifier), "listIssues array status_type included completed issue unexpectedly");
+
+  const blockerSemanticsProject = upsertProject({
+    id: "project_blocker_semantics",
+    name: "Blocker Semantics Regression",
+  });
+  const urgentTodo = upsertIssue({
+    title: "Urgent issue is not blocked",
+    identifier: "CTH-900030",
+    status: "Todo",
+    priority: 1,
+    project_id: blockerSemanticsProject.id,
+    updated_at: "2026-03-01T00:00:00.000Z",
+  });
+  const blockedMedium = upsertIssue({
+    title: "Blocked issue at medium priority",
+    identifier: "CTH-900031",
+    status: "Blocked",
+    priority: 3,
+    project_id: blockerSemanticsProject.id,
+    updated_at: "2026-03-02T00:00:00.000Z",
+  });
+  const blockerSemanticsDetail = getProject(blockerSemanticsProject.id);
+  assert(blockerSemanticsDetail.counts.blockers === 1, `project blocker count used priority instead of status: ${blockerSemanticsDetail.counts.blockers}`);
+  assert(blockerSemanticsDetail.activity.find((event) => event.id === blockedMedium.id)?.verb === "blocker", "blocked issue activity was not classified as blocker");
+  assert(blockerSemanticsDetail.activity.find((event) => event.id === urgentTodo.id)?.verb !== "blocker", "urgent Todo activity was incorrectly classified as blocker");
 
   const filterProject = upsertProject({
     id: "project_filter_regression",
