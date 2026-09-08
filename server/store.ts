@@ -26,6 +26,16 @@ const normalizedIssueStatusTypeSql = `
     ELSE i.status_type
   END
 `;
+const effectiveIssueStatusTypeSql = `
+  CASE
+    WHEN (${normalizedIssueStatusTypeSql}) IN ('completed', 'canceled') THEN (${normalizedIssueStatusTypeSql})
+    WHEN EXISTS (
+      SELECT 1 FROM issue_dependencies dependency
+      WHERE dependency.issue_id = i.id AND dependency.status = 'open'
+    ) THEN 'blocked'
+    ELSE (${normalizedIssueStatusTypeSql})
+  END
+`;
 const acceptanceCommentSql = (column: string) => `
   (
     lower(trim(${column})) LIKE 'acceptance%'
@@ -61,6 +71,103 @@ export type IssueInput = {
   updated_at?: string;
 };
 
+export type ProjectInput = {
+  id?: string;
+  external_id?: string;
+  name?: string;
+  summary?: string | null;
+  description?: string | null;
+  status?: string;
+  priority?: number;
+  lead?: string | null;
+  target_date?: string | null;
+  source?: string;
+  archived_at?: string | null;
+  created_at?: string;
+  updated_at?: string;
+};
+
+// A field save_issue does not understand must not look like a write that worked.
+//
+// save_issue was called with {id: "...", state: "Done"} and returned the full issue
+// object with no error. The column is `status`; `state` is not a field, so the row was
+// never touched — and the response still carried "status": "Todo", which reads as success
+// to anyone checking that the call did not throw. A caller believed it had closed a ticket
+// that was still open.
+const ISSUE_INPUT_FIELDS = [
+  "id", "external_id", "identifier", "issue_id", "title", "description", "status",
+  "status_type", "priority", "project_id", "allow_no_project", "team_id", "parent_id",
+  "assignee", "labels", "source", "url", "archived_at", "completed_at", "created_at",
+  "updated_at",
+] as const satisfies readonly (keyof IssueInput)[];
+
+// Adding a field to IssueInput without listing it above is a BUILD error, not a field
+// that silently stops being accepted. The list cannot drift from the type.
+type UnlistedIssueField = Exclude<keyof IssueInput, (typeof ISSUE_INPUT_FIELDS)[number]>;
+const _issueFieldsAreExhaustive: UnlistedIssueField extends never ? true : never = true;
+void _issueFieldsAreExhaustive;
+
+// get_issue returns these; they are computed at read time and cannot be written. Rejecting
+// them by NAME beats a generic "unknown field", because the caller is round-tripping a read
+// and needs to be told the field is derived rather than misspelled.
+const ISSUE_DERIVED_FIELDS = new Set([
+  "project_name", "team_name", "comments", "dependencies", "blocking", "blocker_count",
+  "blocking_count", "active_claims", "active_claim_count", "active_claim_agent",
+  "active_claim_harness", "last_acceptance_comment",
+]);
+
+function nearestIssueField(name: string) {
+  const lower = name.toLowerCase();
+  let best: string | undefined;
+  let bestDistance = Infinity;
+  for (const candidate of ISSUE_INPUT_FIELDS) {
+    const distance = editDistance(lower, candidate);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      best = candidate;
+    }
+  }
+  // Only suggest a genuinely close name. "state" -> "status" is worth saying; a suggestion
+  // for an unrelated word is noise that sends the caller down the wrong path.
+  return best && bestDistance <= Math.max(2, Math.floor(lower.length / 2)) ? best : undefined;
+}
+
+function editDistance(a: string, b: string) {
+  let previous = Array.from({ length: b.length + 1 }, (_unused, index) => index);
+  for (let i = 1; i <= a.length; i += 1) {
+    const current = [i];
+    for (let j = 1; j <= b.length; j += 1) {
+      current[j] = Math.min(
+        previous[j] + 1,
+        current[j - 1] + 1,
+        previous[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1),
+      );
+    }
+    previous = current;
+  }
+  return previous[b.length];
+}
+
+export function assertKnownIssueFields(input: unknown) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return;
+  const known = new Set<string>(ISSUE_INPUT_FIELDS);
+  const rejected: string[] = [];
+  for (const key of Object.keys(input as Record<string, unknown>)) {
+    if (known.has(key)) continue;
+    if (ISSUE_DERIVED_FIELDS.has(key)) {
+      rejected.push(`${key} (read-only; it is computed by get_issue and cannot be written)`);
+      continue;
+    }
+    const suggestion = nearestIssueField(key);
+    rejected.push(suggestion ? `${key} (did you mean ${suggestion}?)` : key);
+  }
+  if (rejected.length === 0) return;
+  throw new Error(
+    `save_issue does not accept ${rejected.length === 1 ? "this field" : "these fields"}: ` +
+      `${rejected.join(", ")}. Nothing was written. Accepted fields: ${ISSUE_INPUT_FIELDS.join(", ")}.`,
+  );
+}
+
 type FilterValue = string | string[] | null | undefined;
 type ListIssueFilters = {
   project?: string;
@@ -70,9 +177,31 @@ type ListIssueFilters = {
   status?: FilterValue;
   status_type?: FilterValue;
   include_done?: boolean | string | number | null;
+  blocked?: boolean | string | number | null;
   query?: string;
   limit?: number;
   offset?: number;
+};
+type ProjectUpdateInput = {
+  id?: string;
+  external_id?: string;
+  project_id: string;
+  body: string;
+  health?: string;
+  author?: string | null;
+  source?: string;
+  created_at?: string;
+  updated_at?: string;
+};
+type IssueDependencyInput = {
+  id?: string;
+  external_id?: string;
+  issue_id: string;
+  blocker_issue_id: string;
+  reason?: string | null;
+  source?: string;
+  created_at?: string;
+  updated_at?: string;
 };
 export type IssueDisplayLimit = 50 | 100 | 200 | "all";
 export type IssueGroup = {
@@ -189,27 +318,81 @@ export function upsertTeam(input: { id?: string; external_id?: string; name: str
 export function listProjects() {
   ensureIssueIdentifiers();
   return db.prepare(`
-    SELECT p.*, COUNT(i.id) AS issue_count
+    SELECT
+      p.*,
+      COUNT(i.id) AS issue_count,
+      SUM(CASE WHEN ${effectiveIssueStatusTypeSql} = 'completed' THEN 1 ELSE 0 END) AS done_count,
+      SUM(CASE WHEN ${effectiveIssueStatusTypeSql} IN ('started', 'blocked', 'paused') THEN 1 ELSE 0 END) AS active_count,
+      SUM(CASE WHEN ${effectiveIssueStatusTypeSql} = 'blocked' THEN 1 ELSE 0 END) AS blocker_count,
+      (
+        SELECT u.health
+        FROM project_updates u
+        WHERE u.project_id = p.id
+        ORDER BY u.created_at DESC, u.id DESC
+        LIMIT 1
+      ) AS health,
+      (
+        SELECT u.body
+        FROM project_updates u
+        WHERE u.project_id = p.id
+        ORDER BY u.created_at DESC, u.id DESC
+        LIMIT 1
+      ) AS latest_update_body,
+      (
+        SELECT u.created_at
+        FROM project_updates u
+        WHERE u.project_id = p.id
+        ORDER BY u.created_at DESC, u.id DESC
+        LIMIT 1
+      ) AS latest_update_at
     FROM projects p
     LEFT JOIN issues i ON i.project_id = p.id AND i.archived_at IS NULL
     WHERE p.archived_at IS NULL
     GROUP BY p.id
-    ORDER BY p.updated_at DESC
+    ORDER BY COALESCE(latest_update_at, p.updated_at) DESC
   `).all();
 }
 
 export function getProject(id: string, options: { issues_per_status?: unknown } = {}) {
   ensureIssueIdentifiers();
-  const project = db.prepare("SELECT * FROM projects WHERE id = @id OR external_id = @id").get({ id }) as Record<string, unknown> | undefined;
+  const project = db.prepare(`
+    SELECT
+      p.*,
+      (
+        SELECT u.health
+        FROM project_updates u
+        WHERE u.project_id = p.id
+        ORDER BY u.created_at DESC, u.id DESC
+        LIMIT 1
+      ) AS health,
+      (
+        SELECT u.body
+        FROM project_updates u
+        WHERE u.project_id = p.id
+        ORDER BY u.created_at DESC, u.id DESC
+        LIMIT 1
+      ) AS latest_update_body,
+      (
+        SELECT u.created_at
+        FROM project_updates u
+        WHERE u.project_id = p.id
+        ORDER BY u.created_at DESC, u.id DESC
+        LIMIT 1
+      ) AS latest_update_at
+    FROM projects p
+    WHERE p.id = @id OR p.external_id = @id
+    ORDER BY CASE WHEN p.id = @id THEN 0 ELSE 1 END
+    LIMIT 1
+  `).get({ id }) as Record<string, unknown> | undefined;
   if (!project) return null;
   const issueDisplayLimit = parseIssueDisplayLimit(options.issues_per_status, 50);
   const issueGroups = listIssueGroups({ project: String(project.id) }, issueDisplayLimit);
   const issues = listIssues({ project: String(project.id), limit: 250 });
   const statusCounts = db.prepare(`
-    SELECT status, ${normalizedStatusTypeSql} AS status_type, COUNT(*) AS count
-    FROM issues
-    WHERE project_id = @project_id AND archived_at IS NULL
-    GROUP BY status, ${normalizedStatusTypeSql}
+    SELECT i.status, ${effectiveIssueStatusTypeSql} AS status_type, COUNT(*) AS count
+    FROM issues i
+    WHERE i.project_id = @project_id AND i.archived_at IS NULL
+    GROUP BY i.status, ${effectiveIssueStatusTypeSql}
     ORDER BY count DESC
   `).all({ project_id: project.id });
   const priorityCounts = db.prepare(`
@@ -222,12 +405,12 @@ export function getProject(id: string, options: { issues_per_status?: unknown } 
   const counts = db.prepare(`
     SELECT
       COUNT(*) AS total,
-      SUM(CASE WHEN ${normalizedStatusTypeSql} = 'completed' THEN 1 ELSE 0 END) AS done,
-      SUM(CASE WHEN ${normalizedStatusTypeSql} = 'started' THEN 1 ELSE 0 END) AS started,
-      SUM(CASE WHEN ${normalizedStatusTypeSql} IN ('backlog','unstarted','blocked','paused') THEN 1 ELSE 0 END) AS open,
-      SUM(CASE WHEN priority = 1 AND ${normalizedStatusTypeSql} != 'completed' THEN 1 ELSE 0 END) AS blockers
-    FROM issues
-    WHERE project_id = @project_id AND archived_at IS NULL
+      SUM(CASE WHEN ${effectiveIssueStatusTypeSql} = 'completed' THEN 1 ELSE 0 END) AS done,
+      SUM(CASE WHEN ${effectiveIssueStatusTypeSql} = 'started' THEN 1 ELSE 0 END) AS started,
+      SUM(CASE WHEN ${effectiveIssueStatusTypeSql} IN ('backlog','unstarted','blocked','paused') THEN 1 ELSE 0 END) AS open,
+      SUM(CASE WHEN ${effectiveIssueStatusTypeSql} = 'blocked' THEN 1 ELSE 0 END) AS blockers
+    FROM issues i
+    WHERE i.project_id = @project_id AND i.archived_at IS NULL
   `).get({ project_id: project.id });
   const issueEvents = db.prepare(`
     SELECT
@@ -235,14 +418,14 @@ export function getProject(id: string, options: { issues_per_status?: unknown } 
       i.identifier,
       i.title,
       i.status,
-      ${normalizedStatusTypeSql} AS status_type,
+      ${effectiveIssueStatusTypeSql} AS status_type,
       i.priority,
       i.updated_at,
       'issue' AS type,
       CASE
-        WHEN ${normalizedStatusTypeSql} = 'completed' THEN 'completed'
-        WHEN ${normalizedStatusTypeSql} = 'started' THEN 'started'
-        WHEN i.priority = 1 THEN 'blocker'
+        WHEN ${effectiveIssueStatusTypeSql} = 'completed' THEN 'completed'
+        WHEN ${effectiveIssueStatusTypeSql} = 'started' THEN 'started'
+        WHEN ${effectiveIssueStatusTypeSql} = 'blocked' THEN 'blocker'
         ELSE 'updated'
       END AS verb
     FROM issues i
@@ -269,39 +452,153 @@ export function getProject(id: string, options: { issues_per_status?: unknown } 
     ORDER BY c.updated_at DESC
     LIMIT 20
   `).all({ project_id: project.id });
-  const activity = [...issueEvents, ...commentEvents]
+  const dependencyEvents = db.prepare(`
+    SELECT
+      d.id,
+      i.identifier,
+      i.title,
+      i.status,
+      CASE WHEN d.status = 'open' THEN 'blocked' ELSE ${effectiveIssueStatusTypeSql} END AS status_type,
+      i.priority,
+      d.updated_at,
+      'dependency' AS type,
+      CASE WHEN d.status = 'open' THEN 'blocked' ELSE 'unblocked' END AS verb,
+      NULL AS author,
+      d.reason AS body,
+      blocker.identifier AS blocker_identifier,
+      blocker.title AS blocker_title
+    FROM issue_dependencies d
+    JOIN issues i ON i.id = d.issue_id
+    JOIN issues blocker ON blocker.id = d.blocker_issue_id
+    WHERE i.project_id = @project_id AND i.archived_at IS NULL
+    ORDER BY d.updated_at DESC
+    LIMIT 20
+  `).all({ project_id: project.id });
+  const projectUpdateEvents = db.prepare(`
+    SELECT
+      u.id,
+      NULL AS identifier,
+      p.name AS title,
+      p.status,
+      CASE
+        WHEN u.health = 'complete' THEN 'completed'
+        WHEN u.health IN ('at_risk', 'off_track') THEN 'blocked'
+        ELSE 'started'
+      END AS status_type,
+      p.priority,
+      u.updated_at,
+      'project_update' AS type,
+      'project_updated' AS verb,
+      u.author,
+      u.body,
+      u.health
+    FROM project_updates u
+    JOIN projects p ON p.id = u.project_id
+    WHERE u.project_id = @project_id
+    ORDER BY u.updated_at DESC
+    LIMIT 20
+  `).all({ project_id: project.id });
+  const projectUpdates = listProjectUpdates({ project_id: String(project.id), limit: 50 });
+  const activity = [...issueEvents, ...commentEvents, ...dependencyEvents, ...projectUpdateEvents]
     .sort((a, b) => String((b as { updated_at: string }).updated_at).localeCompare(String((a as { updated_at: string }).updated_at)))
     .slice(0, 50);
-  return { project, counts, statusCounts, priorityCounts, issues, issueGroups, issueDisplayLimit, activity };
+  return { project, counts, statusCounts, priorityCounts, issues, issueGroups, issueDisplayLimit, projectUpdates, activity };
 }
 
-export function upsertProject(input: {
-  id?: string; external_id?: string; name: string; summary?: string; description?: string; status?: string; priority?: number; lead?: string; source?: string; archived_at?: string | null; created_at?: string; updated_at?: string;
-}) {
+export function upsertProject(input: ProjectInput) {
   const at = nowIso();
+  const internalId = nonEmptyString(input.id);
+  const externalId = nonEmptyString(input.external_id);
+  const existing = internalId || externalId
+    ? db.prepare(`
+        SELECT * FROM projects
+        WHERE (@id IS NOT NULL AND id = @id)
+           OR (@external_id IS NOT NULL AND external_id = @external_id)
+        ORDER BY CASE WHEN id = @id THEN 0 ELSE 1 END
+        LIMIT 1
+      `).get({ id: internalId ?? null, external_id: externalId ?? null }) as Record<string, unknown> | undefined
+    : undefined;
+  if (!existing && !nonEmptyString(input.name)) throw new Error("name is required when creating a project");
   const row = {
-    id: input.id ?? input.external_id ?? makeId("project"),
-    external_id: input.external_id ?? null,
-    name: input.name,
-    summary: input.summary ?? null,
-    description: input.description ?? null,
-    status: input.status ?? "Backlog",
-    priority: input.priority ?? 3,
-    lead: input.lead ?? null,
-    source: input.source ?? "local",
-    archived_at: input.archived_at ?? null,
+    id: stringValue(existing?.id) ?? input.id ?? input.external_id ?? makeId("project"),
+    external_id: hasOwn(input, "external_id") ? input.external_id ?? null : stringValue(existing?.external_id),
+    name: input.name ?? stringValue(existing?.name) ?? "Untitled project",
+    summary: hasOwn(input, "summary") ? input.summary ?? null : stringValue(existing?.summary),
+    description: hasOwn(input, "description") ? input.description ?? null : stringValue(existing?.description),
+    status: input.status ?? stringValue(existing?.status) ?? "Backlog",
+    priority: input.priority ?? numberValue(existing?.priority) ?? 3,
+    lead: hasOwn(input, "lead") ? input.lead ?? null : stringValue(existing?.lead),
+    target_date: hasOwn(input, "target_date") ? nonEmptyString(input.target_date) ?? null : stringValue(existing?.target_date),
+    source: input.source ?? stringValue(existing?.source) ?? "local",
+    archived_at: hasOwn(input, "archived_at") ? input.archived_at ?? null : stringValue(existing?.archived_at),
+    created_at: input.created_at ?? stringValue(existing?.created_at) ?? at,
+    updated_at: input.updated_at ?? at,
+  };
+  db.prepare(`
+    INSERT INTO projects (id, external_id, name, summary, description, status, priority, lead, target_date, source, archived_at, created_at, updated_at)
+    VALUES (@id, @external_id, @name, @summary, @description, @status, @priority, @lead, @target_date, @source, @archived_at, @created_at, @updated_at)
+    ON CONFLICT(external_id) DO UPDATE SET
+      name=excluded.name, summary=excluded.summary, description=excluded.description, status=excluded.status,
+      priority=excluded.priority, lead=excluded.lead, target_date=excluded.target_date,
+      source=excluded.source, archived_at=excluded.archived_at, updated_at=excluded.updated_at
+    ON CONFLICT(id) DO UPDATE SET
+      external_id=excluded.external_id, name=excluded.name, summary=excluded.summary, description=excluded.description,
+      status=excluded.status, priority=excluded.priority, lead=excluded.lead, target_date=excluded.target_date,
+      source=excluded.source, archived_at=excluded.archived_at,
+      updated_at=excluded.updated_at
+  `).run(row);
+  if (row.external_id) return db.prepare("SELECT * FROM projects WHERE external_id = @external_id").get(row);
+  return db.prepare("SELECT * FROM projects WHERE id = @id").get(row);
+}
+
+export function listProjectUpdates(input: { project_id: string; limit?: number | string | null }) {
+  const projectId = resolveProjectId(input.project_id);
+  if (!projectId) throw new Error(`Project not found: ${input.project_id}`);
+  return db.prepare(`
+    SELECT u.*, p.name AS project_name
+    FROM project_updates u
+    JOIN projects p ON p.id = u.project_id
+    WHERE u.project_id = @project_id
+    ORDER BY u.created_at DESC
+    LIMIT @limit
+  `).all({ project_id: projectId, limit: boundedNumber(input.limit, 20, 1, 100) });
+}
+
+export function saveProjectUpdate(input: ProjectUpdateInput) {
+  const projectId = resolveProjectId(input.project_id);
+  if (!projectId) throw new Error(`Project not found: ${input.project_id}`);
+  const body = boundedRequiredString(input.body, "body", 10000);
+  const health = normalizeProjectHealth(input.health);
+  const at = nowIso();
+  const externalId = nonEmptyString(input.external_id);
+  const row = {
+    id: input.id ?? externalId ?? makeId("project_update"),
+    external_id: externalId,
+    project_id: projectId,
+    body,
+    health,
+    author: nonEmptyString(input.author) ?? "Agent",
+    source: nonEmptyString(input.source) ?? "local",
     created_at: input.created_at ?? at,
     updated_at: input.updated_at ?? at,
   };
   db.prepare(`
-    INSERT INTO projects (id, external_id, name, summary, description, status, priority, lead, source, archived_at, created_at, updated_at)
-    VALUES (@id, @external_id, @name, @summary, @description, @status, @priority, @lead, @source, @archived_at, @created_at, @updated_at)
+    INSERT INTO project_updates (id, external_id, project_id, body, health, author, source, created_at, updated_at)
+    VALUES (@id, @external_id, @project_id, @body, @health, @author, @source, @created_at, @updated_at)
     ON CONFLICT(external_id) DO UPDATE SET
-      name=excluded.name, summary=excluded.summary, description=excluded.description, status=excluded.status,
-      priority=excluded.priority, lead=excluded.lead, archived_at=excluded.archived_at, updated_at=excluded.updated_at
+      project_id=excluded.project_id, body=excluded.body, health=excluded.health,
+      author=excluded.author, source=excluded.source, updated_at=excluded.updated_at
+    ON CONFLICT(id) DO UPDATE SET
+      external_id=excluded.external_id, project_id=excluded.project_id, body=excluded.body,
+      health=excluded.health, author=excluded.author, source=excluded.source, updated_at=excluded.updated_at
   `).run(row);
-  if (row.external_id) return db.prepare("SELECT * FROM projects WHERE external_id = @external_id").get(row);
-  return db.prepare("SELECT * FROM projects WHERE id = @id").get(row);
+  return db.prepare(`
+    SELECT u.*, p.name AS project_name
+    FROM project_updates u JOIN projects p ON p.id = u.project_id
+    WHERE u.id = @id OR (@external_id IS NOT NULL AND u.external_id = @external_id)
+    ORDER BY CASE WHEN u.id = @id THEN 0 ELSE 1 END
+    LIMIT 1
+  `).get({ id: row.id, external_id: externalId });
 }
 
 export function upsertContextBinding(input: ContextBindingInput) {
@@ -577,7 +874,15 @@ function listIssuesInternal(filters: ListIssueFilters, maxLimit: number) {
           AND ${acceptanceCommentSql("c.body")}
         ORDER BY c.created_at DESC
         LIMIT 1
-      ) AS last_acceptance_at
+      ) AS last_acceptance_at,
+      (
+        SELECT COUNT(*) FROM issue_dependencies d
+        WHERE d.issue_id = i.id AND d.status = 'open'
+      ) AS blocker_count,
+      (
+        SELECT COUNT(*) FROM issue_dependencies d
+        WHERE d.blocker_issue_id = i.id AND d.status = 'open'
+      ) AS blocking_count
     FROM issues i
     LEFT JOIN projects p ON p.id = i.project_id
     LEFT JOIN teams t ON t.id = i.team_id
@@ -618,17 +923,20 @@ function issueQueryParts(filters: ListIssueFilters) {
     const statusTypes = unique(statusValues.map((value) => inferStatusType(value) ?? knownStatusType(value)).filter(isString));
     const rawStatuses = statusValues.filter((value) => !inferStatusType(value) && !knownStatusType(value));
     const clauses: string[] = [];
-    if (statusTypes.length) clauses.push(inClause(normalizedIssueStatusTypeSql, "status_type", statusTypes, params));
+    if (statusTypes.length) clauses.push(inClause(effectiveIssueStatusTypeSql, "status_type", statusTypes, params));
     if (rawStatuses.length) clauses.push(inClause("i.status", "status", rawStatuses, params));
     where.push(`(${clauses.join(" OR ")})`);
   }
   const statusTypeValues = filterValues(filters.status_type);
   if (statusTypeValues.length) {
     const normalized = unique(statusTypeValues.map((value) => inferStatusType(value) ?? knownStatusType(value) ?? value));
-    where.push(inClause(normalizedIssueStatusTypeSql, "status_type_filter", normalized, params));
+    where.push(inClause(effectiveIssueStatusTypeSql, "status_type_filter", normalized, params));
   }
   if (!booleanValue(filters.include_done, true)) {
-    where.push(`${normalizedIssueStatusTypeSql} NOT IN ('completed', 'canceled')`);
+    where.push(`${effectiveIssueStatusTypeSql} NOT IN ('completed', 'canceled')`);
+  }
+  if (booleanValue(filters.blocked, false)) {
+    where.push(`${effectiveIssueStatusTypeSql} = 'blocked'`);
   }
   let orderBy = "i.updated_at DESC";
   if (query) {
@@ -675,7 +983,9 @@ function escapeLike(value: string) {
 export function getIssue(id: string) {
   ensureIssueIdentifiers();
   const issue = db.prepare(`
-    SELECT i.*, p.name AS project_name, t.name AS team_name
+    SELECT i.*, p.name AS project_name, t.name AS team_name,
+      (SELECT COUNT(*) FROM issue_dependencies d WHERE d.issue_id=i.id AND d.status='open') AS blocker_count,
+      (SELECT COUNT(*) FROM issue_dependencies d WHERE d.blocker_issue_id=i.id AND d.status='open') AS blocking_count
     FROM issues i
     LEFT JOIN projects p ON p.id = i.project_id
     LEFT JOIN teams t ON t.id = i.team_id
@@ -693,6 +1003,8 @@ export function getIssue(id: string) {
     active_claim_agent: activeClaims[0]?.agent_name ?? null,
     active_claim_harness: activeClaims[0]?.harness ?? null,
     last_acceptance_comment: latestAcceptanceComment(issueId),
+    dependencies: listIssueDependencies({ issue_id: issueId, include_resolved: true }),
+    blocking: listBlockingIssues({ issue_id: issueId, include_resolved: true }),
   };
 }
 
@@ -714,11 +1026,12 @@ export function listTruncatedLinearIssues(limit = 500) {
 }
 
 export function upsertIssue(input: IssueInput) {
+  assertKnownIssueFields(input);
   const retryAutomaticIdentifier = shouldRetryAutomaticIdentifier(input);
   const maxAttempts = retryAutomaticIdentifier ? 3 : 1;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
-      const issueKey = upsertIssueTransaction.immediate(input);
+      const issueKey = db.transaction((transactionInput: IssueInput) => upsertIssueLocked(transactionInput)).immediate(input);
       const issue = getIssue(issueKey);
       if (!issue) throw new Error(`Saved issue not found: ${issueKey}`);
       return issue;
@@ -729,8 +1042,6 @@ export function upsertIssue(input: IssueInput) {
   }
   throw new Error("save_issue failed after retrying automatic identifier allocation");
 }
-
-const upsertIssueTransaction = db.transaction((input: IssueInput) => upsertIssueLocked(input));
 
 function upsertIssueLocked(input: IssueInput) {
   const at = nowIso();
@@ -750,8 +1061,15 @@ function upsertIssueLocked(input: IssueInput) {
     : statusType === "completed"
       ? stringValue(existing?.completed_at) ?? at
       : null;
+  // A caller-supplied `id` that is really a visible identifier (CTH-nnn) must
+  // never become a row's primary key. When a save intended as an update fell
+  // through to a create, this adopted "CTH-015" as the new row's id — so a row
+  // whose IDENTIFIER was CTH-730 had ROW ID "CTH-015", and every later lookup
+  // for CTH-015 resolved to the wrong issue, permanently and self-reinforcingly.
+  // Identifiers are allocated by resolveIssueIdentifier; they are not addresses.
+  const requestedId = isShortIssueIdentifier(input.id) ? undefined : input.id;
   const row = {
-    id: stringValue(existing?.id) ?? input.id ?? input.external_id ?? makeId("issue"),
+    id: stringValue(existing?.id) ?? requestedId ?? input.external_id ?? makeId("issue"),
     external_id: hasOwn(input, "external_id") ? input.external_id ?? null : stringValue(existing?.external_id),
     identifier: resolveIssueIdentifier(input, existing),
     title: input.title ?? stringValue(existing?.title) ?? "Untitled issue",
@@ -760,8 +1078,8 @@ function upsertIssueLocked(input: IssueInput) {
     status_type: statusType,
     priority: input.priority ?? numberValue(existing?.priority) ?? 3,
     project_id: resolveIssueProjectId(input, existing),
-    team_id: hasOwn(input, "team_id") ? resolveTeamId(input.team_id) : stringValue(existing?.team_id) ?? defaultTeamId(),
-    parent_id: hasOwn(input, "parent_id") ? resolveParentId(input.parent_id) : stringValue(existing?.parent_id),
+    team_id: hasOwn(input, "team_id") ? resolveIssueTeamId(input.team_id) : stringValue(existing?.team_id) ?? defaultTeamId(),
+    parent_id: hasOwn(input, "parent_id") ? resolveIssueParentId(input.parent_id) : stringValue(existing?.parent_id),
     assignee: hasOwn(input, "assignee") ? input.assignee ?? null : stringValue(existing?.assignee),
     labels: json(hasOwn(input, "labels") ? normalizeLabels(input.labels) : normalizeLabels(existing?.labels)),
     source: input.source ?? stringValue(existing?.source) ?? "local",
@@ -816,6 +1134,93 @@ export function saveComment(input: { id?: string; external_id?: string; issue_id
   return db.prepare("SELECT * FROM comments WHERE id = @id").get(row);
 }
 
+export function listIssueDependencies(input: { issue_id: string; include_resolved?: boolean | string | number | null; limit?: number | string | null }) {
+  const issueId = resolveParentId(input.issue_id);
+  if (!issueId) throw new Error(`Issue not found: ${input.issue_id}`);
+  const includeResolved = booleanValue(input.include_resolved, false);
+  return db.prepare(`
+    SELECT d.*, issue.identifier AS issue_identifier, issue.title AS issue_title,
+      blocker.identifier AS blocker_identifier, blocker.title AS blocker_title
+    FROM issue_dependencies d
+    JOIN issues issue ON issue.id = d.issue_id
+    JOIN issues blocker ON blocker.id = d.blocker_issue_id
+    WHERE d.issue_id = @issue_id
+      AND (@include_resolved = 1 OR d.status = 'open')
+    ORDER BY CASE d.status WHEN 'open' THEN 0 ELSE 1 END, d.updated_at DESC
+    LIMIT @limit
+  `).all({ issue_id: issueId, include_resolved: includeResolved ? 1 : 0, limit: boundedNumber(input.limit, 50, 1, 250) });
+}
+
+export function listBlockingIssues(input: { issue_id: string; include_resolved?: boolean | string | number | null; limit?: number | string | null }) {
+  const issueId = resolveParentId(input.issue_id);
+  if (!issueId) throw new Error(`Issue not found: ${input.issue_id}`);
+  const includeResolved = booleanValue(input.include_resolved, false);
+  return db.prepare(`
+    SELECT d.*, issue.identifier AS issue_identifier, issue.title AS issue_title,
+      blocker.identifier AS blocker_identifier, blocker.title AS blocker_title
+    FROM issue_dependencies d
+    JOIN issues issue ON issue.id = d.issue_id
+    JOIN issues blocker ON blocker.id = d.blocker_issue_id
+    WHERE d.blocker_issue_id = @issue_id
+      AND (@include_resolved = 1 OR d.status = 'open')
+    ORDER BY CASE d.status WHEN 'open' THEN 0 ELSE 1 END, d.updated_at DESC
+    LIMIT @limit
+  `).all({ issue_id: issueId, include_resolved: includeResolved ? 1 : 0, limit: boundedNumber(input.limit, 50, 1, 250) });
+}
+
+export function saveIssueDependency(input: IssueDependencyInput) {
+  const issueId = resolveParentId(input.issue_id);
+  if (!issueId) throw new Error(`Issue not found: ${input.issue_id}`);
+  const blockerIssueId = resolveParentId(input.blocker_issue_id);
+  if (!blockerIssueId) throw new Error(`Issue not found: ${input.blocker_issue_id}`);
+  if (issueId === blockerIssueId) throw new Error("An issue cannot block itself");
+  const blocker = getClaimableIssue(blockerIssueId);
+  const blockerStatus = inferStatusType(stringValue(blocker.status) ?? undefined) ?? knownStatusType(stringValue(blocker.status_type) ?? undefined);
+  if (blockerStatus === "completed" || blockerStatus === "canceled") {
+    throw new Error(`Completed or canceled issue ${issueLabel(blocker)} cannot be added as an open blocker`);
+  }
+  if (dependencyWouldCycle(issueId, blockerIssueId)) {
+    throw new Error("Adding this blocker would create a dependency cycle");
+  }
+  const reason = optionalBoundedString(input.reason, "reason", 2000);
+  const at = nowIso();
+  const externalId = nonEmptyString(input.external_id);
+  const row = {
+    id: input.id ?? externalId ?? makeId("dependency"),
+    external_id: externalId,
+    issue_id: issueId,
+    blocker_issue_id: blockerIssueId,
+    reason,
+    status: "open",
+    resolved_at: null,
+    source: nonEmptyString(input.source) ?? "local",
+    created_at: input.created_at ?? at,
+    updated_at: input.updated_at ?? at,
+  };
+  db.prepare(`
+    INSERT INTO issue_dependencies (id, external_id, issue_id, blocker_issue_id, reason, status, resolved_at, source, created_at, updated_at)
+    VALUES (@id, @external_id, @issue_id, @blocker_issue_id, @reason, @status, @resolved_at, @source, @created_at, @updated_at)
+    ON CONFLICT(external_id) DO UPDATE SET
+      issue_id=excluded.issue_id, blocker_issue_id=excluded.blocker_issue_id, reason=excluded.reason,
+      status='open', resolved_at=NULL, source=excluded.source, updated_at=excluded.updated_at
+    ON CONFLICT(issue_id, blocker_issue_id) DO UPDATE SET
+      reason=excluded.reason, status='open', resolved_at=NULL, source=excluded.source, updated_at=excluded.updated_at
+    ON CONFLICT(id) DO UPDATE SET
+      external_id=excluded.external_id, issue_id=excluded.issue_id, blocker_issue_id=excluded.blocker_issue_id,
+      reason=excluded.reason, status='open', resolved_at=NULL, source=excluded.source, updated_at=excluded.updated_at
+  `).run(row);
+  return getIssueDependency(row.id, issueId, blockerIssueId);
+}
+
+export function resolveIssueDependency(input: { dependency_id?: string; issue_id?: string; blocker_issue_id?: string }) {
+  const dependency = resolveIssueDependencyRow(input);
+  if (!dependency) throw new Error("Issue dependency not found");
+  if (dependency.status === "resolved") return { resolved: false, dependency };
+  const at = nowIso();
+  db.prepare("UPDATE issue_dependencies SET status='resolved', resolved_at=@at, updated_at=@at WHERE id=@id").run({ id: dependency.id, at });
+  return { resolved: true, dependency: getIssueDependency(String(dependency.id)) };
+}
+
 export function startAgentSession(input: AgentSessionInput) {
   if (!nonEmptyString(input.agent_name)) throw new Error("agent_name is required");
   const at = nowIso();
@@ -863,6 +1268,9 @@ export function endAgentSession(input: { session_id: string; release_claims?: bo
   const at = nowIso();
   const releaseClaims = booleanValue(input.release_claims, true);
   const tx = db.transaction(() => {
+    const claimedIssueIds = releaseClaims
+      ? db.prepare("SELECT DISTINCT issue_id FROM issue_claims WHERE session_id=@session_id AND released_at IS NULL AND status='active'").all({ session_id: input.session_id }) as { issue_id: string }[]
+      : [];
     db.prepare(`
       UPDATE agent_sessions
       SET status='ended', ended_at=@ended_at, last_heartbeat_at=@ended_at, expires_at=@ended_at
@@ -874,6 +1282,7 @@ export function endAgentSession(input: { session_id: string; release_claims?: bo
         SET status='released', released_at=@released_at
         WHERE session_id=@session_id AND released_at IS NULL
       `).run({ session_id: input.session_id, released_at: at });
+      for (const claim of claimedIssueIds) settleIssueAfterClaimRelease(claim.issue_id, false, at);
     }
   });
   tx();
@@ -898,6 +1307,9 @@ export function claimIssue(input: ClaimIssueInput) {
   if (!issueId) throw new Error(`Issue not found: ${input.issue_id}`);
   const issue = getClaimableIssue(issueId);
   assertIssueOpenForAgentWrite(issue, input.allow_closed, "claim");
+  if (!booleanValue(input.force, false) && issueIsBlocked(issueId, issue)) {
+    throw new Error(`Issue ${issueLabel(issue)} is blocked; resolve its dependencies or explicit Blocked status before claiming it`);
+  }
   const session = getActiveAgentSession(input.session_id, at);
   if (!session) throw new Error(`Active agent session not found: ${input.session_id}`);
   heartbeatAgentSession({ session_id: input.session_id, ttl_minutes: input.ttl_minutes });
@@ -913,6 +1325,7 @@ export function claimIssue(input: ClaimIssueInput) {
       SET status='active', note=@note, heartbeat_at=@heartbeat_at, expires_at=@expires_at
       WHERE id=@id
     `).run({ id: sameSessionActive.id, note: input.note ?? sameSessionActive.note ?? null, heartbeat_at: at, expires_at: expiresAt });
+    markIssueInProgress(issueId, at);
     return { claim: getIssueClaim(sameSessionActive.id), idempotent: true, forced: false, expired_released: expiredReleased };
   }
   let forced = false;
@@ -940,6 +1353,7 @@ export function claimIssue(input: ClaimIssueInput) {
     INSERT INTO issue_claims (id, issue_id, session_id, agent_name, status, note, claimed_at, heartbeat_at, expires_at, released_at, force)
     VALUES (@id, @issue_id, @session_id, @agent_name, @status, @note, @claimed_at, @heartbeat_at, @expires_at, @released_at, @force)
   `).run(row);
+  markIssueInProgress(issueId, at);
   return { claim: getIssueClaim(row.id), idempotent: false, forced, expired_released: expiredReleased };
 }
 
@@ -967,6 +1381,7 @@ export function releaseIssueClaim(input: ReleaseIssueClaimInput) {
     const status = input.status === "completed" ? "completed" : "released";
     db.prepare("UPDATE issue_claims SET status=@status, released_at=@released_at WHERE id=@id").run({ id: refreshedClaim.id, status, released_at: at });
     const supersededActiveDuplicates = supersedeOtherActiveIssueClaims(issueId, refreshedClaim.id, at);
+    settleIssueAfterClaimRelease(issueId, status === "completed", at);
     return { released: true, claim: getIssueClaim(refreshedClaim.id), superseded_active_duplicates: supersededActiveDuplicates };
   }
   if (!input.session_id) throw new Error("release_issue_claim requires session_id when claim_id is not provided");
@@ -981,6 +1396,7 @@ export function releaseIssueClaim(input: ReleaseIssueClaimInput) {
   const status = input.status === "completed" ? "completed" : "released";
   db.prepare("UPDATE issue_claims SET status=@status, released_at=@released_at WHERE id=@id").run({ id: claim.id, status, released_at: at });
   const supersededActiveDuplicates = supersedeOtherActiveIssueClaims(issueId, claim.id, at);
+  settleIssueAfterClaimRelease(issueId, status === "completed", at);
   return { released: true, claim: getIssueClaim(claim.id), superseded_active_duplicates: supersededActiveDuplicates };
 }
 
@@ -1115,7 +1531,9 @@ function hydrateIssue(row: unknown) {
   const item = row as Record<string, unknown>;
   const status = typeof item.status === "string" ? item.status : undefined;
   const statusType = typeof item.status_type === "string" ? item.status_type : undefined;
-  return { ...item, status_type: inferStatusType(status) ?? statusType, labels: normalizeLabels(item.labels) };
+  const normalized = inferStatusType(status) ?? statusType;
+  const effective = !["completed", "canceled"].includes(normalized ?? "") && Number(item.blocker_count ?? 0) > 0 ? "blocked" : normalized;
+  return { ...item, status_type: effective, labels: normalizeLabels(item.labels) };
 }
 
 function hydrateAgentSession(row: unknown) {
@@ -1179,6 +1597,41 @@ function activeIssueClaims(issueId: string, at = nowIso()) {
       AND s.expires_at > @at
     ORDER BY c.heartbeat_at DESC, c.claimed_at DESC
   `).all({ issue_id: issueId, at }) as { id: string; session_id: string; agent_name: string; harness?: string | null; note: string | null; expires_at: string }[];
+}
+
+function issueIsBlocked(issueId: string, issue?: Record<string, unknown>) {
+  const stored = issue ?? getClaimableIssue(issueId);
+  const statusType = inferStatusType(stringValue(stored.status) ?? undefined) ?? knownStatusType(stringValue(stored.status_type) ?? undefined);
+  if (statusType === "blocked") return true;
+  const dependency = db.prepare("SELECT 1 FROM issue_dependencies WHERE issue_id=@issue_id AND status='open' LIMIT 1").get({ issue_id: issueId });
+  return Boolean(dependency);
+}
+
+function markIssueInProgress(issueId: string, at = nowIso()) {
+  db.prepare(`
+    UPDATE issues
+    SET status='In Progress', status_type='started', completed_at=NULL, updated_at=@at
+    WHERE id=@issue_id
+      AND ${normalizedStatusTypeSql} IN ('backlog', 'unstarted', 'paused')
+  `).run({ issue_id: issueId, at });
+}
+
+function settleIssueAfterClaimRelease(issueId: string, completed: boolean, at = nowIso()) {
+  if (completed) {
+    db.prepare(`
+      UPDATE issues
+      SET status='Done', status_type='completed', completed_at=coalesce(completed_at, @at), updated_at=@at
+      WHERE id=@issue_id
+    `).run({ issue_id: issueId, at });
+    return;
+  }
+  const active = activeIssueClaims(issueId, at);
+  if (active.length) return;
+  db.prepare(`
+    UPDATE issues
+    SET status='Todo', status_type='unstarted', completed_at=NULL, updated_at=@at
+    WHERE id=@issue_id AND ${normalizedStatusTypeSql} = 'started'
+  `).run({ issue_id: issueId, at });
 }
 
 function latestAcceptanceComment(issueId: string) {
@@ -1369,6 +1822,28 @@ function nonEmptyString(value: unknown) {
   return typeof value === "string" && value.trim() ? value : null;
 }
 
+function boundedRequiredString(value: unknown, field: string, maxLength: number) {
+  const normalized = nonEmptyString(value);
+  if (!normalized) throw new Error(`${field} is required`);
+  if (normalized.length > maxLength) throw new Error(`${field} is too long (maximum ${maxLength} characters)`);
+  return normalized;
+}
+
+function optionalBoundedString(value: unknown, field: string, maxLength: number) {
+  const normalized = nonEmptyString(value);
+  if (!normalized) return null;
+  if (normalized.length > maxLength) throw new Error(`${field} is too long (maximum ${maxLength} characters)`);
+  return normalized;
+}
+
+function normalizeProjectHealth(value: unknown) {
+  const normalized = lowerString(value)?.replace(/[ -]+/g, "_") ?? "on_track";
+  if (!["on_track", "at_risk", "off_track", "complete"].includes(normalized)) {
+    throw new Error("health must be on_track, at_risk, off_track, or complete");
+  }
+  return normalized;
+}
+
 function resolveIssueForUpsert(input: IssueInput) {
   if (hasOwn(input, "issue_id")) {
     const issueId = nonEmptyString(input.issue_id);
@@ -1378,8 +1853,34 @@ function resolveIssueForUpsert(input: IssueInput) {
     assertCompatibleIssueLocators(input, existing);
     return existing;
   }
-  const lookupId = input.external_id ?? input.id ?? input.identifier;
-  return lookupId ? getIssueRowByLocator(lookupId) : undefined;
+  // An explicitly supplied `id` decides whether this is a create or an update.
+  // Other locators may CONFIRM that decision; they must never retarget it.
+  //
+  // This was `external_id ?? id ?? identifier`, which made external_id outrank
+  // id. Calling save_issue with {id: "CTH-015", external_id: "..."} to ADD an
+  // external_id to an existing issue looked up the external_id, did not find
+  // it, and CREATED a second issue — silently, returning a plausible one. It
+  // compounded because the new row adopted the caller's id as its primary key,
+  // so a row whose identifier was CTH-730 had row id "CTH-015" and every later
+  // lookup for CTH-015 resolved to the wrong issue.
+  //
+  // Resolving by ANY locator is not the fix either: a caller naming a NEW id
+  // alongside an identifier that already exists is asking for a row that cannot
+  // be created, and must hit the unique constraint rather than quietly updating
+  // whatever the identifier happened to match (tests/store-regression.mjs:417).
+  if (hasOwn(input, "id")) {
+    const id = nonEmptyString(input.id);
+    const existing = id ? getIssueRowByLocator(id) : undefined;
+    // A supplied id that does not resolve means "create". Say so plainly rather
+    // than letting another locator take over.
+    if (existing) assertCompatibleIssueLocators(input, existing);
+    return existing;
+  }
+
+  const lookupId = input.external_id ?? input.identifier;
+  const existing = lookupId ? getIssueRowByLocator(lookupId) : undefined;
+  if (existing) assertCompatibleIssueLocators(input, existing);
+  return existing;
 }
 
 function assertCompatibleIssueLocators(input: IssueInput, existing: Record<string, unknown>) {
@@ -1396,6 +1897,44 @@ function assertCompatibleIssueLocators(input: IssueInput, existing: Record<strin
 
 function getIssueRowByLocator(value: string) {
   return db.prepare("SELECT * FROM issues WHERE id = @id OR external_id = @id OR identifier = @id").get({ id: value }) as Record<string, unknown> | undefined;
+}
+
+function getIssueDependency(id: string, issueId?: string, blockerIssueId?: string) {
+  return db.prepare(`
+    SELECT d.*, issue.identifier AS issue_identifier, issue.title AS issue_title,
+      blocker.identifier AS blocker_identifier, blocker.title AS blocker_title
+    FROM issue_dependencies d
+    JOIN issues issue ON issue.id = d.issue_id
+    JOIN issues blocker ON blocker.id = d.blocker_issue_id
+    WHERE d.id = @id
+      OR (@issue_id IS NOT NULL AND @blocker_issue_id IS NOT NULL
+        AND d.issue_id = @issue_id AND d.blocker_issue_id = @blocker_issue_id)
+    LIMIT 1
+  `).get({ id, issue_id: issueId ?? null, blocker_issue_id: blockerIssueId ?? null }) as Record<string, unknown> | undefined;
+}
+
+function resolveIssueDependencyRow(input: { dependency_id?: string; issue_id?: string; blocker_issue_id?: string }) {
+  const dependencyId = nonEmptyString(input.dependency_id);
+  if (dependencyId) return getIssueDependency(dependencyId);
+  const issueId = resolveParentId(input.issue_id);
+  const blockerIssueId = resolveParentId(input.blocker_issue_id);
+  if (!issueId || !blockerIssueId) return undefined;
+  return getIssueDependency("", issueId, blockerIssueId);
+}
+
+function dependencyWouldCycle(issueId: string, blockerIssueId: string) {
+  const row = db.prepare(`
+    WITH RECURSIVE blocker_chain(issue_id) AS (
+      SELECT @blocker_issue_id
+      UNION
+      SELECT dependency.blocker_issue_id
+      FROM issue_dependencies dependency
+      JOIN blocker_chain chain ON dependency.issue_id = chain.issue_id
+      WHERE dependency.status = 'open'
+    )
+    SELECT 1 AS cycle FROM blocker_chain WHERE issue_id = @issue_id LIMIT 1
+  `).get({ issue_id: issueId, blocker_issue_id: blockerIssueId });
+  return Boolean(row);
 }
 
 function issueLabel(issue: Record<string, unknown>) {
@@ -1436,6 +1975,13 @@ function resolveTeamId(value: string | null | undefined) {
   return team?.id ?? null;
 }
 
+function resolveIssueTeamId(value: string | null | undefined) {
+  if (value == null) return null;
+  const teamId = resolveTeamId(value);
+  if (!teamId) throw new Error(`Team not found: ${value}`);
+  return teamId;
+}
+
 function defaultTeamId() {
   return String((ensureDefaultTeam() as { id: string }).id);
 }
@@ -1443,4 +1989,11 @@ function defaultTeamId() {
 function resolveParentId(value: string | null | undefined) {
   const issue = value ? db.prepare("SELECT id FROM issues WHERE id = @id OR external_id = @id OR identifier = @id").get({ id: value }) as { id: string } | undefined : undefined;
   return issue?.id ?? null;
+}
+
+function resolveIssueParentId(value: string | null | undefined) {
+  if (value == null) return null;
+  const parentId = resolveParentId(value);
+  if (!parentId) throw new Error(`Parent issue not found: ${value}`);
+  return parentId;
 }

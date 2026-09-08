@@ -236,6 +236,7 @@ export async function importLinear(limitPages = 1000) {
           status: project.status?.name ?? project.status?.type ?? "Backlog",
           priority: project.priority?.value ?? 3,
           lead: project.lead?.name,
+          target_date: project.targetDate,
           source: "linear",
           created_at: project.createdAt,
           updated_at: project.updatedAt,
@@ -310,4 +311,3 @@ export async function backfillLinearDescriptions(limit = 500) {
     session.close();
   }
 }
-

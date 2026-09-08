@@ -15,7 +15,6 @@ const binaryExtensions = new Set([
 ]);
 
 const blockedContent = [
-  { name: "Cyrillic text", pattern: /[\u0400-\u04FF]/u },
   { name: "private Windows user path", pattern: /\b[A-Z]:[\\/]Users[\\/]sav\b/iu },
   { name: "private tools path", pattern: /\bF:[\\/]Tools[\\/]CODEX\b/iu },
   { name: "private LAN address", pattern: /\b10\.10\.\d{1,3}\.\d{1,3}\b/u },

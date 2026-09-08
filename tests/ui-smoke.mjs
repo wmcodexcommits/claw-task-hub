@@ -1,5 +1,5 @@
 import { chromium } from "playwright";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -20,6 +20,7 @@ const browser = await chromium.launch({ headless: true });
 const context = await browser.newContext({ viewport: { width: 1280, height: 960 }, acceptDownloads: true });
 const page = await context.newPage();
 const pageDiagnostics = [];
+const requestedPaths = [];
 
 page.on("console", (message) => {
   if (["error", "warning"].includes(message.type())) {
@@ -28,6 +29,9 @@ page.on("console", (message) => {
 });
 page.on("pageerror", (error) => {
   pageDiagnostics.push(`pageerror: ${error.message}`);
+});
+page.on("request", (request) => {
+  requestedPaths.push(new URL(request.url()).pathname);
 });
 
 function assert(condition, message) {
@@ -179,19 +183,53 @@ async function assertNoDuplicateVisibleIssueCodes(scopeLabel) {
 async function countRowsInGroup(label) {
   return page.locator(".issue-group").evaluateAll((groups, groupLabel) => {
     const group = groups.find((node) => node.querySelector(".group-head strong")?.textContent?.trim() === groupLabel);
-    return group?.querySelectorAll(".linear-issue-row").length ?? 0;
+    return Number(group?.getAttribute("data-returned") ?? 0);
   }, label);
 }
 
-async function assertSelectOptionsAreDark(selectLocator, label) {
-  const styles = await selectLocator.evaluate((select) => {
-    const option = select.querySelector("option");
-    const target = option ?? select;
-    const computed = getComputedStyle(target);
-    return { color: computed.color, backgroundColor: computed.backgroundColor };
-  });
-  assert(styles.color !== "rgb(154, 154, 154)", `${label} option text is still muted gray`);
-  assert(styles.backgroundColor !== "rgb(255, 255, 255)", `${label} option background is still white`);
+async function chooseInlineOption(ariaLabel, optionLabel) {
+  const trigger = page.getByRole("button", { name: ariaLabel, exact: true });
+  await trigger.click();
+  const menu = page.getByRole("listbox", { name: `${ariaLabel} options`, exact: true });
+  await menu.waitFor({ state: "visible" });
+  const [triggerBox, menuBox] = await Promise.all([trigger.boundingBox(), menu.boundingBox()]);
+  assert(triggerBox && menuBox, `${ariaLabel} dropdown geometry is unavailable`);
+  assert(Math.abs(triggerBox.width - menuBox.width) <= 1, `${ariaLabel} list width ${menuBox.width} does not match its ${triggerBox.width}px trigger`);
+  await menu.getByRole("option", { name: optionLabel, exact: true }).click();
+}
+
+async function assertInlineSelectsAreConsistent(container, label) {
+  await page.mouse.move(0, 0);
+  await page.waitForTimeout(150);
+  const styles = await container.locator(".inline-control").evaluateAll((controls) => controls.map((control) => {
+    const select = control.querySelector(".inline-select-trigger");
+    const controlStyle = getComputedStyle(control);
+    const selectStyle = select ? getComputedStyle(select) : null;
+    const selectedValue = select?.querySelector("strong");
+    const controlRect = control.getBoundingClientRect();
+    const selectRect = select?.getBoundingClientRect();
+    return {
+      height: controlStyle.height,
+      radius: controlStyle.borderRadius,
+      background: controlStyle.backgroundColor,
+      selectBackground: selectStyle?.backgroundColor,
+      selectColor: selectStyle?.color,
+      controlWidth: controlRect.width,
+      selectWidth: selectRect?.width ?? 0,
+      cursor: selectStyle?.cursor,
+      disabled: select instanceof HTMLButtonElement ? select.disabled : false,
+      valueClipped: selectedValue ? selectedValue.scrollWidth > selectedValue.clientWidth : true,
+    };
+  }));
+  assert(styles.length > 0, `${label} has no inline dropdown controls`);
+  for (const key of ["height", "radius", "background", "selectBackground", "selectColor"]) {
+    assert(new Set(styles.map((style) => style[key])).size === 1, `${label} dropdowns do not share ${key}: ${JSON.stringify(styles)}`);
+  }
+  for (const style of styles) {
+    assert(Math.abs(style.controlWidth - style.selectWidth) <= 1, `${label} dropdown trigger does not fill its control width: ${JSON.stringify(style)}`);
+    assert(style.disabled ? style.cursor !== "pointer" : style.cursor === "pointer", `${label} dropdown does not signal its clickability: ${JSON.stringify(style)}`);
+    assert(!style.valueClipped, `${label} dropdown abbreviates its selected value despite using a fixed reusable width: ${JSON.stringify(style)}`);
+  }
 }
 
 async function waitForAppShell() {
@@ -212,6 +250,14 @@ async function waitForAppShell() {
 
 try {
 runNpm(["run", "-s", "seed"]);
+runHub("save_project", {
+  id: "project_claw_task_hub_mvp",
+  status: "In Progress",
+  priority: 2,
+  lead: "UI Smoke",
+  target_date: "2026-10-31",
+  source: "local",
+});
 seedBulkTodoIssues(70);
 runHub("save_issue", {
   id: "LOCAL-3",
@@ -249,6 +295,56 @@ runHub("save_issue", {
   labels: ["ui-smoke"],
   source: "local",
 });
+runHub("save_issue", {
+  id: "LOCAL-6",
+  external_id: "LOCAL-6",
+  identifier: "LOCAL-6",
+  title: "Combined filter target",
+  description: "Matches priority, assignee, and label filters together.",
+  project_id: "project_claw_task_hub_mvp",
+  status: "In Progress",
+  priority: 1,
+  assignee: "Filter Agent",
+  labels: ["filter-target", "ui-smoke"],
+  source: "local",
+});
+runHub("save_issue", {
+  id: "LOCAL-7",
+  external_id: "LOCAL-7",
+  identifier: "LOCAL-7",
+  title: "Priority-only filter decoy",
+  description: "Matches P1 but not the requested assignee.",
+  project_id: "project_claw_task_hub_mvp",
+  status: "Todo",
+  priority: 1,
+  labels: ["filter-decoy", "ui-smoke"],
+  source: "local",
+});
+runHub("save_issue", {
+  id: "LOCAL-8",
+  external_id: "LOCAL-8",
+  identifier: "LOCAL-8",
+  title: "Assignee-only filter decoy",
+  description: "Matches the assignee and label but not P1.",
+  project_id: "project_claw_task_hub_mvp",
+  status: "Paused",
+  priority: 2,
+  assignee: "Filter Agent",
+  labels: ["filter-target", "ui-smoke"],
+  source: "local",
+});
+runHub("save_issue", {
+  id: "LOCAL-9",
+  external_id: "LOCAL-9",
+  identifier: "LOCAL-9",
+  title: "Persistent blocked filter target",
+  description: "Remains blocked after the dependency-backed issue is resolved.",
+  project_id: "project_claw_task_hub_mvp",
+  status: "Blocked",
+  priority: 3,
+  labels: ["blocked-filter", "ui-smoke"],
+  source: "local",
+});
 runHub("save_comment", {
   issue_id: "LOCAL-1",
   body: "UI smoke seeded activity comment.",
@@ -274,11 +370,23 @@ await waitForAppShell();
 await page.getByRole("button", { name: "Issues", exact: true }).waitFor({ state: "visible", timeout: 15000 });
 assert((await page.getByRole("button", { name: "Issues", exact: true }).getAttribute("class"))?.includes("active"), "Direct project issues URL did not activate the Issues tab");
 assert(await page.locator(".searchbar input").getAttribute("placeholder") === "Search Claw Task Hub MVP", "Direct project issues URL did not load the project issue view");
+assert(await page.getByRole("textbox", { name: "Search Claw Task Hub MVP" }).isVisible(), "Issue search does not have an accessible name");
+await page.getByRole("button", { name: "New issue", exact: true }).click();
+const initialIssueDialog = page.getByRole("dialog", { name: "New issue" });
+assert(await initialIssueDialog.getByRole("textbox", { name: "Issue title" }).isVisible(), "Issue title field does not have an accessible name");
+assert(await initialIssueDialog.getByRole("button", { name: "New issue priority P3" }).isVisible(), "Issue priority picker does not have an accessible name");
+assert(await initialIssueDialog.getByRole("textbox", { name: "Issue description" }).isVisible(), "Issue description field does not have an accessible name");
+await initialIssueDialog.getByRole("button", { name: "Close new issue" }).click();
 
 await page.goto(`http://127.0.0.1:${webPort}/contexts/${encodeURIComponent("ui-smoke:project")}/activity`, { waitUntil: "domcontentloaded" });
 await waitForAppShell();
-await page.getByText("Write a project update...").waitFor({ state: "visible", timeout: 15000 });
+const projectUpdateBody = `UI smoke project update ${Date.now()}`;
+await page.getByLabel("Project update").waitFor({ state: "visible", timeout: 15000 });
 assert((await page.getByRole("button", { name: "Activity", exact: true }).getAttribute("class"))?.includes("active"), "Context URL did not activate the requested Activity tab");
+await page.getByLabel("Project health").selectOption("at_risk");
+await page.getByLabel("Project update").fill(projectUpdateBody);
+await page.getByRole("button", { name: "Post update", exact: true }).click();
+await page.getByText(projectUpdateBody, { exact: false }).waitFor({ state: "visible", timeout: 10000 });
 
 await page.goto(`http://127.0.0.1:${webPort}/issues/LOCAL-3`, { waitUntil: "domcontentloaded" });
 await waitForAppShell();
@@ -292,6 +400,95 @@ await page.screenshot({ path: "test-results/linearish-projects.png", fullPage: t
 assert(await page.getByText("Projects", { exact: true }).first().isVisible(), "Projects heading is missing");
 const publicProjectRow = page.locator(".project-row").filter({ hasText: "Claw Task Hub MVP" }).first();
 assert(await publicProjectRow.isVisible(), "Project table row is missing");
+const projectHeaderName = page.locator(".project-head .project-name > span:last-child");
+const publicProjectName = publicProjectRow.locator(".project-name > span:last-child");
+const [normalHeaderBox, normalProjectNameBox] = await Promise.all([projectHeaderName.boundingBox(), publicProjectName.boundingBox()]);
+assert(normalHeaderBox && normalProjectNameBox && Math.abs(normalHeaderBox.x - normalProjectNameBox.x) <= 1, "Project Name header is not aligned with the project-title column");
+await page.setViewportSize({ width: 1920, height: 1080 });
+const [maxHeaderBox, maxProjectNameBox] = await Promise.all([projectHeaderName.boundingBox(), publicProjectName.boundingBox()]);
+assert(maxHeaderBox && maxProjectNameBox && Math.abs(maxHeaderBox.x - maxProjectNameBox.x) <= 1, "Project Name header becomes misaligned in a maximized viewport");
+assert(Math.abs(maxProjectNameBox.x - normalProjectNameBox.x) <= 1, "Project-title left inset changes when the browser is maximized");
+await page.screenshot({ path: "test-results/linearish-projects-maximized.png", fullPage: true });
+await page.setViewportSize({ width: 1280, height: 960 });
+assert(await publicProjectRow.getByText("At risk", { exact: true }).isVisible(), "Project row does not use the latest configured health update");
+assert(await publicProjectRow.getByText("High", { exact: true }).isVisible(), "Project row does not show the configured priority label");
+assert(await publicProjectRow.locator(".project-lead", { hasText: "UI Smoke" }).isVisible(), "Project row does not show the configured lead");
+assert(await publicProjectRow.getByText("Oct 31, 2026", { exact: true }).isVisible(), "Project row does not show the configured target date");
+assert(await publicProjectRow.getByText("In Progress", { exact: true }).isVisible(), "Project row does not show the configured status");
+assert(await page.locator(".view-tabs .stack-icon").count() === 0, "Duplicate database icon is still present beside the project views");
+assert(await page.getByRole("button", { name: /favorite/i }).count() === 0, "Unimplemented favorite button is still present");
+assert((await page.locator(".address").textContent())?.trim() === "Claw Task Hub", "Top chrome does not identify Claw Task Hub");
+assert((await page.locator(".window-tab span").textContent())?.trim() === "ui-smoke", "Top chrome does not show the active database name without the implied SQLite extension");
+const databaseReadPaths = new Set(["/api/snapshot", "/api/refresh", "/api/projects", "/api/issues"]);
+const dataReadsBeforeHealthPoll = requestedPaths.filter((path) => databaseReadPaths.has(path)).length;
+const healthRequest = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/health" && response.ok());
+await healthRequest;
+assert((await page.getByRole("status", { name: "Server healthy" }).getAttribute("class"))?.includes("healthy"), "Health polling did not show a successful check");
+assert(requestedPaths.filter((path) => databaseReadPaths.has(path)).length === dataReadsBeforeHealthPoll, "Health polling triggered a database data fetch");
+await page.getByRole("button", { name: "Manage databases", exact: true }).click();
+const explicitRefreshRequest = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/refresh" && response.request().method() === "POST" && response.ok());
+await page.getByRole("menuitem", { name: "Refresh data", exact: true }).click();
+await explicitRefreshRequest;
+await page.getByRole("button", { name: "Manage databases", exact: true }).click();
+const darkModeToggle = page.getByRole("menuitemcheckbox", { name: /Dark mode/ });
+assert(await darkModeToggle.getAttribute("aria-checked") === "true", "Dark theme is not the default appearance");
+await darkModeToggle.click();
+assert(await page.locator("html").getAttribute("data-theme") === "light", "Dark mode control did not activate the light theme");
+const lightStatusStyles = await publicProjectRow.locator(".status-pill").evaluate((pill) => {
+  const style = getComputedStyle(pill);
+  return { background: style.backgroundColor, color: style.color };
+});
+assert(lightStatusStyles.background !== "rgb(23, 23, 23)", `Light-mode status pill retained a dark background: ${lightStatusStyles.background}`);
+assert(lightStatusStyles.background !== lightStatusStyles.color, "Light-mode status pill has no text contrast");
+await darkModeToggle.click();
+assert(await page.locator("html").getAttribute("data-theme") === "dark", "Dark mode control did not restore the existing dark theme");
+await page.getByRole("button", { name: "Manage databases", exact: true }).click();
+const allIssuesRequest = page.waitForResponse((response) => {
+  const url = new URL(response.url());
+  return url.pathname === "/api/snapshot" && url.searchParams.get("include_issues") === "true" && response.ok();
+});
+await page.getByRole("button", { name: "All issues", exact: true }).click();
+await allIssuesRequest;
+await page.getByLabel("Search All issues").waitFor({ state: "visible" });
+assert(await page.getByRole("button", { name: "Filter projects", exact: true }).count() === 0, "Project filters were duplicated on the issue view");
+await page.getByRole("button", { name: "All projects", exact: true }).click();
+await publicProjectRow.waitFor({ state: "visible" });
+
+await page.getByRole("button", { name: "Filter projects", exact: true }).click();
+await page.getByLabel("Search projects").fill("Claw Task Hub");
+await chooseInlineOption("Filter projects by health", "At risk");
+assert(await publicProjectRow.isVisible(), "Project filters hid a matching configured project");
+await chooseInlineOption("Filter projects by health", "Off track");
+await page.getByText("No projects match the current filters.", { exact: true }).waitFor({ state: "visible" });
+await page.getByRole("button", { name: /Clear/i }).click();
+await publicProjectRow.waitFor({ state: "visible" });
+await page.getByRole("button", { name: "Configure project view", exact: true }).click();
+await chooseInlineOption("Sort projects", "Issue count");
+assert((await page.getByRole("button", { name: "Sort projects", exact: true }).getAttribute("data-value")) === "issues", "Project view configuration did not apply issue-count sorting");
+await assertInlineSelectsAreConsistent(page.locator(".project-view-config"), "Project filter and sort controls");
+
+await page.getByRole("button", { name: "New project", exact: true }).click();
+const newProjectDialog = page.getByRole("dialog", { name: "New project" });
+await newProjectDialog.waitFor({ state: "visible" });
+assert(await page.getByLabel("Project lead").isVisible(), "New project form does not expose lead configuration");
+assert(await page.getByLabel("Project target date").isVisible(), "New project form does not expose target-date configuration");
+await page.getByLabel("Project name").fill("UI Configured Project");
+await page.getByLabel("Project summary").fill("Created through the configured project form.");
+await page.getByLabel("Project status").selectOption("Planned");
+await page.getByLabel("Project priority").selectOption("4");
+await page.getByLabel("Project lead").fill("UI Owner");
+await page.getByLabel("Project target date").fill("2027-01-15");
+await newProjectDialog.getByRole("button", { name: "Create project", exact: true }).click();
+await page.locator(".project-hero h1", { hasText: "UI Configured Project" }).waitFor({ state: "visible", timeout: 10000 });
+assert(await page.getByText("Jan 15, 2027", { exact: true }).isVisible(), "New project target date did not reach the overview");
+await page.getByRole("button", { name: "Issues", exact: true }).click();
+const irrelevantRowsControl = page.getByRole("button", { name: "Issues per status", exact: true });
+assert(await irrelevantRowsControl.isDisabled(), "Rows/group remains clickable when every status group has 50 or fewer issues");
+await page.getByRole("button", { name: "Projects", exact: true }).click();
+const configuredProjectRow = page.locator(".project-row").filter({ hasText: "UI Configured Project" }).first();
+await configuredProjectRow.waitFor({ state: "visible", timeout: 10000 });
+assert(await configuredProjectRow.locator(".project-lead", { hasText: "UI Owner" }).isVisible(), "New project lead did not reach the project list");
+assert(await configuredProjectRow.getByText("Jan 15, 2027", { exact: true }).isVisible(), "New project target date did not reach the project list");
 
 await publicProjectRow.scrollIntoViewIfNeeded();
 await publicProjectRow.click();
@@ -319,7 +516,8 @@ assert(
 await page.screenshot({ path: "test-results/linearish-project-overview.png", fullPage: true });
 
 await page.getByRole("button", { name: "Activity", exact: true }).click();
-assert(await page.getByText("Write a project update...").isVisible(), "Activity update composer is missing");
+assert(await page.getByLabel("Project update").isVisible(), "Activity update composer is missing");
+assert(await page.getByText(projectUpdateBody, { exact: false }).isVisible(), "Posted project update is missing from the activity timeline");
 assert(await page.locator(".timeline-row").first().isVisible(), "Activity timeline is missing");
 await page.screenshot({ path: "test-results/linearish-project-activity.png", fullPage: true });
 
@@ -334,36 +532,79 @@ assert(
 );
 const issueRowCount = await page.locator(".linear-issue-row").count();
 assert(issueRowCount > 0, "issue rows are missing");
+const returnedIssueCount = await page.locator(".issue-group").evaluateAll((groups) => groups.reduce((sum, group) => sum + Number(group.getAttribute("data-returned") ?? 0), 0));
+assert(issueRowCount < returnedIssueCount, `Issue list is not virtualized: mounted ${issueRowCount} of ${returnedIssueCount} returned rows`);
+const firstIssueGroup = page.locator(".issue-group").first();
+const firstGroupRows = await firstIssueGroup.locator(".linear-issue-row").count();
+const collapseGroupButton = firstIssueGroup.getByRole("button", { name: /^Collapse / });
+await collapseGroupButton.click();
+assert(await firstIssueGroup.locator(".linear-issue-row").count() === 0, "Status-group collapse did not hide its issue rows");
+const expandGroupButton = firstIssueGroup.getByRole("button", { name: /^Expand / });
+assert(await expandGroupButton.getAttribute("aria-expanded") === "false", "Collapsed status group did not expose aria-expanded=false");
+await expandGroupButton.click();
+assert(await firstIssueGroup.locator(".linear-issue-row").count() === firstGroupRows, "Status-group expand did not restore its issue rows");
 await assertNoDuplicateVisibleIssueCodes("seed project");
-const limitSelect = page.getByLabel("Issues per status");
+const limitSelect = page.getByRole("button", { name: "Issues per status", exact: true });
 assert(await limitSelect.isVisible(), "Per-status issue limit selector is missing");
-assert((await limitSelect.inputValue()) === "50", "Per-status issue limit did not default to 50");
-await assertSelectOptionsAreDark(limitSelect, "Per-status limit");
-await assertSelectOptionsAreDark(page.locator(".linear-create select[name='priority']"), "Priority");
+assert((await limitSelect.getAttribute("data-value")) === "50", "Per-status issue limit did not default to 50");
+assert(await limitSelect.isEnabled(), "Per-status issue limit was disabled even though Todo has more than 50 issues");
+await assertInlineSelectsAreConsistent(page.locator(".issues-screen"), "Issue filters");
 await page.getByRole("button", { name: "Todo", exact: true }).click();
 const todoRowsAt50 = await countRowsInGroup("Todo");
 assert(todoRowsAt50 === 50, `Todo group did not show exactly 50 rows at the default per-status limit: ${todoRowsAt50}`);
+const todoGroup = page.locator(".issue-group").filter({ has: page.locator(".group-head strong", { hasText: /^Todo$/ }) }).first();
+assert((await todoGroup.locator(".group-head em").textContent())?.includes("/"), "Status-only filter discarded the group total");
 const projectLimitRequest = page.waitForResponse((response) => {
   const url = new URL(response.url());
   return url.pathname === "/api/projects/project_claw_task_hub_mvp" && url.searchParams.get("issues_per_status") === "100" && response.ok();
 });
-await limitSelect.selectOption("100");
+await chooseInlineOption("Issues per status", "100");
 await projectLimitRequest;
 await page.waitForFunction(() => {
   const group = [...document.querySelectorAll(".issue-group")]
     .find((node) => node.querySelector(".group-head strong")?.textContent?.trim() === "Todo");
-  return (group?.querySelectorAll(".linear-issue-row").length ?? 0) > 50;
+  return Number(group?.getAttribute("data-returned") ?? 0) > 50;
 });
 const todoRowsAt100 = await countRowsInGroup("Todo");
 assert(todoRowsAt100 > todoRowsAt50, `Todo group did not expand after selecting 100 per status: ${todoRowsAt100}`);
+await assertInlineSelectsAreConsistent(page.locator(".issues-screen"), "Issue filters after changing Rows/group");
 await page.getByRole("button", { name: "All statuses", exact: true }).click();
 const allGroupLabelsAfterLimitChange = (await page.locator(".group-head strong").allTextContents()).map((label) => label.trim());
 assert(allGroupLabelsAfterLimitChange.includes("Canceled"), "Canceled issues are not shown as a status group");
+const priorityFilter = page.getByRole("button", { name: "Filter issues by priority", exact: true });
+const assigneeFilter = page.getByRole("button", { name: "Filter issues by assignee", exact: true });
+const labelFilter = page.getByRole("button", { name: "Filter issues by label", exact: true });
+assert(await priorityFilter.isVisible(), "Priority filter is missing");
+assert(await assigneeFilter.isVisible(), "Assignee filter is missing");
+assert(await labelFilter.isVisible(), "Label filter is missing");
+await chooseInlineOption("Filter issues by priority", "P1");
+let filteredRows = await page.locator(".linear-issue-row").allTextContents();
+assert(filteredRows.some((row) => row.includes("Combined filter target")), "P1 filter omitted the matching issue");
+assert(filteredRows.some((row) => row.includes("Priority-only filter decoy")), "P1 filter omitted another P1 issue");
+assert(!filteredRows.some((row) => row.includes("Assignee-only filter decoy")), "P1 filter included a P2 issue");
+await chooseInlineOption("Filter issues by assignee", "Filter Agent");
+await chooseInlineOption("Filter issues by label", "filter-target");
+filteredRows = await page.locator(".linear-issue-row").allTextContents();
+assert(filteredRows.length === 1 && filteredRows[0].includes("Combined filter target"), `combined filters returned the wrong rows: ${filteredRows.join(" | ")}`);
+await page.locator(".issue-detail h2", { hasText: "Combined filter target" }).waitFor({ state: "visible", timeout: 10000 });
+await page.waitForFunction(() => {
+  const params = new URL(window.location.href).searchParams;
+  return params.get("priority") === "1" && params.get("assignee") === "Filter Agent" && params.get("label") === "filter-target";
+});
+assert(await page.getByText("1 shown", { exact: true }).isVisible(), "Filtered result count is wrong");
+await page.getByRole("button", { name: "Clear filters", exact: true }).click();
+assert((await priorityFilter.getAttribute("data-value")) === "all", "Clear filters did not reset priority");
+assert((await assigneeFilter.getAttribute("data-value")) === "all", "Clear filters did not reset assignee");
+assert((await labelFilter.getAttribute("data-value")) === "all", "Clear filters did not reset label");
 const createdTitle = `UI smoke routed issue ${Date.now()}`;
-await page.locator(".linear-create input[name='title']").fill(createdTitle);
-await page.locator(".linear-create input[name='description']").fill("Created from a project page to verify issue routing.");
-await page.locator(".linear-create button").click();
-await page.getByText(createdTitle, { exact: true }).waitFor({ state: "visible", timeout: 10000 });
+await page.getByRole("button", { name: "New issue", exact: true }).click();
+const newIssueDialog = page.getByRole("dialog", { name: "New issue" });
+await newIssueDialog.getByRole("button", { name: "New issue priority P3" }).click();
+await newIssueDialog.getByRole("menuitemradio", { name: "P1 Urgent" }).click();
+assert(await newIssueDialog.getByRole("button", { name: "New issue priority P1" }).isVisible(), "New-issue priority pill did not retain P1");
+await newIssueDialog.getByLabel("Issue title").fill(createdTitle);
+await newIssueDialog.getByLabel("Issue description").fill("Created from a project page to verify issue routing.");
+await newIssueDialog.getByRole("button", { name: "Create issue", exact: true }).click();
 const routedIssues = runHub("list_issues", {
   project_id: "project_claw_task_hub_mvp",
   query: createdTitle,
@@ -371,6 +612,10 @@ const routedIssues = runHub("list_issues", {
 });
 assert(routedIssues.issues.length === 1, `Project-page issue create did not create exactly one routed issue: ${routedIssues.issues.length}`);
 assert(routedIssues.issues[0].project_id === "project_claw_task_hub_mvp", `Project-page issue was routed to the wrong project: ${routedIssues.issues[0].project_id}`);
+assert(routedIssues.issues[0].priority === 1, `New-issue priority pill did not persist P1: ${routedIssues.issues[0].priority}`);
+await page.getByRole("button", { name: "New issue", exact: true }).click();
+assert(await page.getByRole("dialog", { name: "New issue" }).getByRole("button", { name: "New issue priority P3" }).isVisible(), "New-issue priority did not reset to P3 after creation");
+await page.getByRole("dialog", { name: "New issue" }).getByRole("button", { name: "Close new issue" }).click();
 const scopedSearchRequest = page.waitForRequest((request) => {
   const url = new URL(request.url());
   return url.pathname === "/api/issues" &&
@@ -379,7 +624,16 @@ const scopedSearchRequest = page.waitForRequest((request) => {
 });
 await page.locator(".searchbar input").fill(createdTitle);
 await scopedSearchRequest;
-await page.locator(".linear-issue-row").filter({ hasText: createdTitle }).first().waitFor({ state: "visible", timeout: 10000 });
+const createdRow = page.locator(".linear-issue-row").filter({ hasText: createdTitle }).first();
+await createdRow.waitFor({ state: "visible", timeout: 10000 });
+await createdRow.dblclick();
+await page.locator(".issue-dialog").waitFor({ state: "visible", timeout: 10000 });
+const createdDialog = page.locator(".issue-dialog");
+await createdDialog.getByLabel("Blocking issue").fill("LOCAL-4");
+await createdDialog.getByLabel("Blocker reason").fill("UI smoke prerequisite");
+await createdDialog.getByRole("button", { name: "Add blocker", exact: true }).click();
+await createdDialog.locator(".dependency.open", { hasText: "LOCAL-4" }).waitFor({ state: "visible", timeout: 10000 });
+await page.locator(".dialog-close").click();
 await page.locator(".searchbar input").fill("");
 await page.locator(".group-head").first().waitFor({ state: "visible", timeout: 10000 });
 const firstIssueCode = (await page.locator(".linear-issue-row .issue-id").first().textContent())?.trim() ?? "";
@@ -392,7 +646,22 @@ await page.locator(".dialog-close").click();
 await page.getByRole("button", { name: /Blockers/i }).click();
 const blockerClass = await page.getByRole("button", { name: /Blockers/i }).getAttribute("class");
 assert(blockerClass?.includes("active"), "Blockers filter did not become active");
+const blockedRow = page.locator(".linear-issue-row").filter({ hasText: createdTitle }).first();
+await blockedRow.waitFor({ state: "visible", timeout: 10000 });
+await blockedRow.dblclick();
+await page.locator(".issue-dialog .dependency.open", { hasText: "LOCAL-4" }).waitFor({ state: "visible", timeout: 10000 });
+await page.locator(".issue-dialog").getByRole("button", { name: "Resolve", exact: true }).click();
+await page.locator(".issue-dialog .dependency.open", { hasText: "LOCAL-4" }).waitFor({ state: "detached", timeout: 10000 });
+await page.locator(".dialog-close").click();
+await page.locator(".linear-issue-row", { hasText: "Persistent blocked filter target" }).waitFor({ state: "visible", timeout: 10000 });
+const remainingBlockerRows = await page.locator(".linear-issue-row").allTextContents();
+assert(remainingBlockerRows.length === 1 && remainingBlockerRows[0].includes("Persistent blocked filter target"), `Blockers filter retained non-blocked rows: ${remainingBlockerRows.join(" | ")}`);
+await page.locator(".issue-detail h2", { hasText: "Persistent blocked filter target" }).waitFor({ state: "visible", timeout: 10000 });
+await page.setViewportSize({ width: 960, height: 900 });
+const advancedFiltersBox = await page.locator(".issue-advanced-filters").boundingBox();
+assert(advancedFiltersBox && advancedFiltersBox.x >= 0 && advancedFiltersBox.x + advancedFiltersBox.width <= 960, "Advanced issue filters overflow the 960px viewport");
 await page.screenshot({ path: "test-results/linearish-project-issues.png", fullPage: true });
+await page.setViewportSize({ width: 1280, height: 960 });
 
 await page.getByRole("button", { name: "Paused", exact: true }).click();
 const pausedButtonClass = await page.getByRole("button", { name: "Paused", exact: true }).getAttribute("class");
@@ -432,6 +701,27 @@ assert(
   todoFilterLabels.every((label) => label === "Todo"),
   `Todo filter shows non-Todo groups: ${todoFilterLabels.join(", ")}`,
 );
+
+const newDatabaseName = `UI smoke database ${Date.now()}`;
+const createDatabaseRequest = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/databases" && response.request().method() === "POST" && response.status() === 201);
+await page.getByRole("button", { name: "Manage databases", exact: true }).click();
+await page.getByRole("menuitem", { name: "Create database", exact: true }).click();
+const databaseDialog = page.getByRole("dialog", { name: "New database" });
+await databaseDialog.getByLabel("Database name").fill(newDatabaseName);
+const selectedDatabasePath = join(tempDir, `selected-${Date.now()}.sqlite`);
+assert(await databaseDialog.getByRole("button", { name: "Browse…", exact: true }).isVisible(), "Database dialog does not expose the native filesystem picker");
+await databaseDialog.getByLabel("Database location").fill(selectedDatabasePath);
+await databaseDialog.getByRole("button", { name: "Create database", exact: true }).click();
+const createDatabaseResponse = await createDatabaseRequest;
+const createdCatalogue = await createDatabaseResponse.json();
+assert(createdCatalogue.active.id.endsWith(".sqlite"), "New database API did not return an active SQLite database");
+assert(createdCatalogue.active.path === selectedDatabasePath, "New database was not created at the selected filesystem path");
+assert(existsSync(selectedDatabasePath), "Selected SQLite database path was not created on disk");
+await page.getByText("No projects yet.", { exact: true }).waitFor({ state: "visible", timeout: 10000 });
+assert((await page.locator(".window-tab span").textContent())?.trim() === createdCatalogue.active.name, "New database did not expose its logical name in the top chrome");
+await page.getByRole("button", { name: "Manage databases", exact: true }).click();
+assert(await page.getByRole("menu", { name: "Databases" }).isVisible(), "Database manager did not open");
+assert(await page.getByRole("menuitemradio", { name: new RegExp(`${createdCatalogue.active.fileName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}.*active`, "i") }).isVisible(), "Database manager does not identify the active database by exact filename");
 
 await browser.close();
 console.log("UI smoke passed");

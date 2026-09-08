@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
-import { existsSync, mkdirSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -11,14 +12,204 @@ const legacyDbPath = join(dataDir, "codex-task-hub.sqlite");
 const clawDbPath = join(dataDir, "claw-task-hub.sqlite");
 type SqliteDatabase = InstanceType<typeof Database>;
 
+export type ManagedDatabase = {
+  id: string;
+  name: string;
+  fileName: string;
+  path: string;
+  active: boolean;
+};
+
 export function resolveDbPath(env: NodeJS.ProcessEnv = process.env, legacyExists = existsSync(legacyDbPath)) {
-  const defaultDbPath = legacyExists ? legacyDbPath : clawDbPath;
-  return env.CLAW_TASK_HUB_DB ?? env.CODEX_TASK_HUB_DB ?? defaultDbPath;
+  const explicit = env.CLAW_TASK_HUB_DB ?? env.CODEX_TASK_HUB_DB;
+  if (explicit) return explicit;
+
+  // Falling back is correct on a first run, and dangerous for an agent. The
+  // repo-local default is NOT necessarily the database anyone is looking at:
+  // a deployment that runs from .stack, or any other explicit path, leaves this
+  // file present, writable and empty of the work in progress. Writing here
+  // SUCCEEDS — same schema, same tool surface, plausible responses — and shows
+  // up nowhere. A project and eleven issues were created in it before anyone
+  // noticed.
+  //
+  // A caller that knows it must not guess sets CLAW_TASK_HUB_REQUIRE_DB=1 and
+  // gets an error instead of a silent second database.
+  if (isTruthyEnv(env.CLAW_TASK_HUB_REQUIRE_DB)) {
+    throw new Error(
+      "CLAW_TASK_HUB_REQUIRE_DB is set but no database was named. Set " +
+      "CLAW_TASK_HUB_DB to the database this process should use. Refusing to " +
+      "fall back to the repository default, which may not be the database in " +
+      "use: " + (legacyExists ? legacyDbPath : clawDbPath));
+  }
+  return legacyExists ? legacyDbPath : clawDbPath;
 }
 
-export const dbPath = resolveDbPath();
+function isTruthyEnv(value: string | undefined) {
+  if (!value) return false;
+  const normalized = value.trim().toLowerCase();
+  return normalized !== "" && normalized !== "0" && normalized !== "false";
+}
+
+const configuredDbPath = resolveDbPath();
+const databaseDir = dirname(configuredDbPath);
+const activeDatabasePointer = join(databaseDir, ".claw-task-hub-active-db");
+const databaseRegistryPath = join(databaseDir, ".claw-task-hub-databases.json");
+
+export let dbPath = resolveInitialDbPath();
 mkdirSync(dirname(dbPath), { recursive: true });
-export const db = new Database(dbPath);
+export let db = new Database(dbPath);
+
+export function listManagedDatabases(): { active: ManagedDatabase; databases: ManagedDatabase[] } {
+  const databasePaths = new Set(
+    readdirSync(databaseDir, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && extname(entry.name).toLowerCase() === ".sqlite")
+      .map((entry) => resolve(databaseDir, entry.name)),
+  );
+  for (const registeredPath of readDatabaseRegistry()) {
+    if (existsSync(registeredPath)) databasePaths.add(registeredPath);
+  }
+  databasePaths.add(resolve(dbPath));
+  const activePath = resolve(dbPath);
+  const databases = [...databasePaths]
+    .map((path) => ({
+      id: databaseId(path),
+      name: databaseDisplayName(basename(path)),
+      fileName: basename(path),
+      path,
+      active: path === activePath,
+    }))
+    .sort((left, right) => Number(right.active) - Number(left.active) || left.name.localeCompare(right.name));
+  const active = databases.find((entry) => entry.active);
+  if (!active) throw new Error("Active database is missing from the database catalogue");
+  return { active, databases };
+}
+
+export function createManagedDatabase(name: string, requestedPath?: string) {
+  const nextPath = resolveNewDatabasePath(name, requestedPath);
+  if (existsSync(nextPath)) throw new Error(`Database already exists: ${nextPath}`);
+  const nextDatabase = new Database(nextPath);
+  try {
+    initializeDatabase(nextDatabase);
+    activateOpenDatabase(nextDatabase, nextPath);
+  } catch (error) {
+    nextDatabase.close();
+    rmSync(nextPath, { force: true });
+    rmSync(`${nextPath}-wal`, { force: true });
+    rmSync(`${nextPath}-shm`, { force: true });
+    throw error;
+  }
+  return listManagedDatabases();
+}
+
+export function activateManagedDatabase(id: string) {
+  const registered = listManagedDatabases().databases.find((database) => database.id === id);
+  if (!registered) throw new Error(`Database not found: ${id}`);
+  const nextPath = registered.path;
+  if (resolve(nextPath) === resolve(dbPath)) return listManagedDatabases();
+  const nextDatabase = new Database(nextPath);
+  try {
+    initializeDatabase(nextDatabase);
+    activateOpenDatabase(nextDatabase, nextPath);
+  } catch (error) {
+    nextDatabase.close();
+    throw error;
+  }
+  return listManagedDatabases();
+}
+
+function resolveInitialDbPath() {
+  mkdirSync(databaseDir, { recursive: true });
+  if (!existsSync(activeDatabasePointer)) return configuredDbPath;
+  try {
+    const selectedId = readFileSync(activeDatabasePointer, "utf8").trim();
+    const selectedPath = isAbsolute(selectedId) ? resolve(selectedId) : managedDatabasePath(selectedId);
+    return existsSync(selectedPath) ? selectedPath : configuredDbPath;
+  } catch {
+    return configuredDbPath;
+  }
+}
+
+export function databaseIdFromName(name: string) {
+  const slug = name
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80);
+  if (!slug) throw new Error("Database name must contain a letter or number");
+  return `${slug}.sqlite`;
+}
+
+function databaseDisplayName(id: string) {
+  return id.replace(/\.sqlite$/i, "");
+}
+
+function databaseId(path: string) {
+  if (dirname(resolve(path)) === resolve(databaseDir)) return basename(path);
+  return `external-${createHash("sha256").update(resolve(path)).digest("hex").slice(0, 16)}`;
+}
+
+function resolveNewDatabasePath(name: string, requestedPath?: string) {
+  if (!requestedPath?.trim()) return managedDatabasePath(databaseIdFromName(name));
+  if (!isAbsolute(requestedPath)) throw new Error("Database location must be an absolute filesystem path");
+  const requested = resolve(requestedPath);
+  const extension = extname(requested).toLowerCase();
+  if (extension && extension !== ".sqlite") throw new Error("Database location must end in .sqlite");
+  const nextPath = extension ? requested : `${requested}.sqlite`;
+  if (!existsSync(dirname(nextPath))) throw new Error(`Database directory does not exist: ${dirname(nextPath)}`);
+  return nextPath;
+}
+
+function readDatabaseRegistry(): string[] {
+  if (!existsSync(databaseRegistryPath)) return [];
+  try {
+    const value = JSON.parse(readFileSync(databaseRegistryPath, "utf8"));
+    if (!Array.isArray(value)) return [];
+    return value
+      .filter((path): path is string => typeof path === "string" && isAbsolute(path) && extname(path).toLowerCase() === ".sqlite")
+      .map((path) => resolve(path));
+  } catch {
+    return [];
+  }
+}
+
+function registerDatabasePath(path: string) {
+  const paths = [...new Set([...readDatabaseRegistry(), resolve(path)])].sort();
+  const temporaryRegistry = `${databaseRegistryPath}.${process.pid}.tmp`;
+  writeFileSync(temporaryRegistry, `${JSON.stringify(paths, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  renameSync(temporaryRegistry, databaseRegistryPath);
+}
+
+function managedDatabasePath(id: string) {
+  if (basename(id) !== id || !/^[a-z0-9][a-z0-9._-]*\.sqlite$/i.test(id)) {
+    throw new Error("Invalid database identifier");
+  }
+  return join(databaseDir, id);
+}
+
+function activateOpenDatabase(nextDatabase: SqliteDatabase, nextPath: string) {
+  const temporaryPointer = `${activeDatabasePointer}.${process.pid}.tmp`;
+  registerDatabasePath(nextPath);
+  writeFileSync(temporaryPointer, `${resolve(nextPath)}\n`, { encoding: "utf8", mode: 0o600 });
+  renameSync(temporaryPointer, activeDatabasePointer);
+  const previousDatabase = db;
+  db = nextDatabase;
+  dbPath = nextPath;
+  previousDatabase.close();
+}
+
+// Say which database this process is using, always, on stderr so it cannot be
+// confused with tool output. The wrong-database incident cost an hour and would
+// have been one line to spot.
+if (!isTruthyEnv(process.env.CLAW_TASK_HUB_QUIET_DB)) {
+  const source = process.env.CLAW_TASK_HUB_DB
+    ? "CLAW_TASK_HUB_DB"
+    : process.env.CODEX_TASK_HUB_DB
+      ? "CODEX_TASK_HUB_DB"
+      : "repository default (no CLAW_TASK_HUB_DB set)";
+  process.stderr.write(`claw-task-hub: database ${dbPath} [${source}]\n`);
+}
 
 export function initializeDatabase(database: SqliteDatabase) {
   configureDatabase(database);
@@ -54,6 +245,7 @@ CREATE TABLE IF NOT EXISTS projects (
   status TEXT NOT NULL DEFAULT 'Backlog',
   priority INTEGER NOT NULL DEFAULT 3,
   lead TEXT,
+  target_date TEXT,
   source TEXT NOT NULL DEFAULT 'local',
   archived_at TEXT,
   created_at TEXT NOT NULL,
@@ -165,6 +357,33 @@ CREATE TABLE IF NOT EXISTS context_bindings (
   updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS project_updates (
+  id TEXT PRIMARY KEY,
+  external_id TEXT UNIQUE,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  body TEXT NOT NULL CHECK(length(body) <= 10000),
+  health TEXT NOT NULL DEFAULT 'on_track' CHECK(health IN ('on_track', 'at_risk', 'off_track', 'complete')),
+  author TEXT,
+  source TEXT NOT NULL DEFAULT 'local',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS issue_dependencies (
+  id TEXT PRIMARY KEY,
+  external_id TEXT UNIQUE,
+  issue_id TEXT NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
+  blocker_issue_id TEXT NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
+  reason TEXT CHECK(reason IS NULL OR length(reason) <= 2000),
+  status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open', 'resolved')),
+  resolved_at TEXT,
+  source TEXT NOT NULL DEFAULT 'local',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(issue_id, blocker_issue_id),
+  CHECK(issue_id <> blocker_issue_id)
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS issue_fts USING fts5(
   title,
   description,
@@ -195,6 +414,9 @@ CREATE INDEX IF NOT EXISTS idx_issue_claims_issue_active ON issue_claims(issue_i
 CREATE INDEX IF NOT EXISTS idx_issue_claims_session ON issue_claims(session_id, released_at);
 CREATE INDEX IF NOT EXISTS idx_context_bindings_project ON context_bindings(project_id);
 CREATE INDEX IF NOT EXISTS idx_context_bindings_lookup ON context_bindings(harness, repo_remote, branch, cwd, thread_id);
+CREATE INDEX IF NOT EXISTS idx_project_updates_project_created ON project_updates(project_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_issue_dependencies_issue_status ON issue_dependencies(issue_id, status);
+CREATE INDEX IF NOT EXISTS idx_issue_dependencies_blocker_status ON issue_dependencies(blocker_issue_id, status);
 `);
 }
 
@@ -241,6 +463,52 @@ const migrations: {
         CREATE INDEX IF NOT EXISTS idx_context_bindings_project ON context_bindings(project_id);
         CREATE INDEX IF NOT EXISTS idx_context_bindings_lookup ON context_bindings(harness, repo_remote, branch, cwd, thread_id);
       `);
+    },
+  },
+  {
+    id: "0004_project_updates_and_issue_dependencies",
+    description: "Add first-class project updates and explicit issue blockers",
+    up: (database) => {
+      database.exec(`
+        CREATE TABLE IF NOT EXISTS project_updates (
+          id TEXT PRIMARY KEY,
+          external_id TEXT UNIQUE,
+          project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+          body TEXT NOT NULL CHECK(length(body) <= 10000),
+          health TEXT NOT NULL DEFAULT 'on_track' CHECK(health IN ('on_track', 'at_risk', 'off_track', 'complete')),
+          author TEXT,
+          source TEXT NOT NULL DEFAULT 'local',
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS issue_dependencies (
+          id TEXT PRIMARY KEY,
+          external_id TEXT UNIQUE,
+          issue_id TEXT NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
+          blocker_issue_id TEXT NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
+          reason TEXT CHECK(reason IS NULL OR length(reason) <= 2000),
+          status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open', 'resolved')),
+          resolved_at TEXT,
+          source TEXT NOT NULL DEFAULT 'local',
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(issue_id, blocker_issue_id),
+          CHECK(issue_id <> blocker_issue_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_project_updates_project_created ON project_updates(project_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_issue_dependencies_issue_status ON issue_dependencies(issue_id, status);
+        CREATE INDEX IF NOT EXISTS idx_issue_dependencies_blocker_status ON issue_dependencies(blocker_issue_id, status);
+      `);
+    },
+  },
+  {
+    id: "0005_project_target_date",
+    description: "Store configured project target dates",
+    up: (database) => {
+      const columns = database.prepare("PRAGMA table_info(projects)").all() as { name: string }[];
+      if (!columns.some((column) => column.name === "target_date")) {
+        database.exec("ALTER TABLE projects ADD COLUMN target_date TEXT");
+      }
     },
   },
 ];

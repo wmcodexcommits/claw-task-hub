@@ -5,22 +5,29 @@ import {
   endAgentSession,
   getContextBinding,
   getIssue,
+  getProject,
   heartbeatAgentSession,
   listAgentSessions,
   listContextBindings,
   listIssueClaims,
+  listIssueDependencies,
   listIssues,
+  listProjectUpdates,
   listProjects,
   listTeams,
   releaseIssueClaim,
   repairIssueInvariants,
   resolveContextProject,
+  resolveIssueDependency,
   saveComment,
+  saveIssueDependency,
+  saveProjectUpdate,
   startAgentSession,
   upsertContextBinding,
   upsertIssue,
   upsertProject,
 } from "./store.js";
+import { dataSnapshot } from "./data-snapshot.js";
 
 let stdin = Buffer.alloc(0);
 
@@ -45,13 +52,42 @@ const tools = [
   tool("dashboard", "Return local Claw Task Hub dashboard counts."),
   tool("list_teams", "List local teams."),
   tool("list_projects", "List local projects."),
-  tool("save_project", "Create or update a local project.", {
+  tool("refresh_data", "Explicitly read a fresh UI data snapshot from the active local database. This does not poll or mutate data.", {
+    issues_per_status: { oneOf: [{ type: "number", enum: [50, 100, 200] }, { type: "string", enum: ["50", "100", "200", "all"] }] },
+    include_issues: { type: "boolean" },
+  }),
+  tool("get_project", "Get one project with status counts, blockers, updates, and activity.", {
+    id: { type: "string" },
+    issues_per_status: { anyOf: [{ type: "number" }, { type: "string" }] },
+  }, ["id"]),
+  tool("save_project", "Create or update a local project. Updates should pass id or external_id; creation requires name.", {
+    id: { type: "string" },
+    external_id: { type: "string" },
     name: { type: "string" },
     summary: { type: "string" },
     description: { type: "string" },
     status: { type: "string" },
     priority: { type: "number" },
-  }, ["name"]),
+    lead: { anyOf: [{ type: "string" }, { type: "null" }] },
+    target_date: { anyOf: [{ type: "string", format: "date" }, { type: "null" }] },
+    source: { type: "string" },
+    archived_at: { anyOf: [{ type: "string" }, { type: "null" }] },
+    created_at: { type: "string" },
+    updated_at: { type: "string" },
+  }),
+  tool("list_project_updates", "List first-class status updates for one project.", {
+    project_id: { type: "string" },
+    limit: { type: "number" },
+  }, ["project_id"]),
+  tool("save_project_update", "Post or idempotently update a project status update.", {
+    id: { type: "string" },
+    external_id: { type: "string" },
+    project_id: { type: "string" },
+    body: { type: "string", maxLength: 10000 },
+    health: { type: "string", enum: ["on_track", "at_risk", "off_track", "complete"] },
+    author: { type: "string" },
+    source: { type: "string" },
+  }, ["project_id", "body"]),
   tool("list_issues", "List local issues with optional filters.", {
     project: { type: "string" },
     project_id: { type: "string" },
@@ -60,6 +96,7 @@ const tools = [
     status: { anyOf: [{ type: "string" }, { type: "array", items: { type: "string" } }] },
     status_type: { anyOf: [{ type: "string" }, { type: "array", items: { type: "string" } }] },
     include_done: { type: "boolean" },
+    blocked: { type: "boolean" },
     query: { type: "string" },
     limit: { type: "number" },
     offset: { type: "number" },
@@ -91,6 +128,24 @@ const tools = [
     source: { type: "string" },
     allow_closed: { type: "boolean" },
   }, ["issue_id", "body"]),
+  tool("list_issue_dependencies", "List explicit blockers for an issue.", {
+    issue_id: { type: "string" },
+    include_resolved: { type: "boolean" },
+    limit: { type: "number" },
+  }, ["issue_id"]),
+  tool("save_issue_dependency", "Record that issue_id is blocked by blocker_issue_id. Self-dependencies and cycles are rejected.", {
+    id: { type: "string" },
+    external_id: { type: "string" },
+    issue_id: { type: "string" },
+    blocker_issue_id: { type: "string" },
+    reason: { type: "string", maxLength: 2000 },
+    source: { type: "string" },
+  }, ["issue_id", "blocker_issue_id"]),
+  tool("resolve_issue_dependency", "Resolve one blocker relation by dependency_id or the issue/blocker pair.", {
+    dependency_id: { type: "string" },
+    issue_id: { type: "string" },
+    blocker_issue_id: { type: "string" },
+  }),
   tool("start_agent_session", "Start or renew an agent work session for claim coordination.", {
     id: { type: "string" },
     agent_name: { type: "string" },
@@ -193,11 +248,18 @@ async function callTool(name: string, args: Record<string, unknown>) {
   if (name === "dashboard") return dashboard();
   if (name === "list_teams") return { teams: listTeams() };
   if (name === "list_projects") return { projects: listProjects() };
-  if (name === "save_project") return { project: upsertProject(args as { name: string }) };
+  if (name === "refresh_data") return dataSnapshot(args);
+  if (name === "get_project") return { project: getProject(String(args.id), { issues_per_status: args.issues_per_status }) };
+  if (name === "save_project") return { project: upsertProject(args) };
+  if (name === "list_project_updates") return { updates: listProjectUpdates(args as { project_id: string }) };
+  if (name === "save_project_update") return { update: saveProjectUpdate(args as { project_id: string; body: string }) };
   if (name === "list_issues") return { issues: listIssues(args) };
   if (name === "get_issue") return { issue: getIssue(String(args.id)) };
   if (name === "save_issue") return { issue: upsertIssue(args as { title: string }) };
   if (name === "save_comment") return { comment: saveComment(args as { issue_id: string; body: string; author?: string }) };
+  if (name === "list_issue_dependencies") return { dependencies: listIssueDependencies(args as { issue_id: string }) };
+  if (name === "save_issue_dependency") return { dependency: saveIssueDependency(args as { issue_id: string; blocker_issue_id: string }) };
+  if (name === "resolve_issue_dependency") return resolveIssueDependency(args);
   if (name === "start_agent_session") return { session: startAgentSession(args as { agent_name: string }) };
   if (name === "heartbeat_agent_session") return { session: heartbeatAgentSession(args as { session_id: string }) };
   if (name === "end_agent_session") return endAgentSession(args as { session_id: string });

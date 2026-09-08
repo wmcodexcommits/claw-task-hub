@@ -14,6 +14,7 @@ function indexExists(database, name) {
 const tempDir = mkdtempSync(join(tmpdir(), "claw-task-hub-store-"));
 process.env.CLAW_TASK_HUB_DB = join(tempDir, "test.sqlite");
 let storeDb;
+let storeRegressionFailed = false;
 
 try {
   const {
@@ -28,12 +29,18 @@ try {
     listAgentSessions,
     listContextBindings,
     listIssueClaims,
+    listIssueDependencies,
     listIssueGroups,
     listIssues,
+    listProjects,
+    listProjectUpdates,
     releaseIssueClaim,
     repairIssueInvariants,
     resolveContextProject,
+    resolveIssueDependency,
     saveComment,
+    saveIssueDependency,
+    saveProjectUpdate,
     startAgentSession,
     upsertContextBinding,
     upsertIssue,
@@ -55,12 +62,40 @@ try {
     resolveDbPath({}, false).endsWith("claw-task-hub.sqlite"),
     "Fresh installs should default to claw-task-hub.sqlite",
   );
+
+  // CLAW_TASK_HUB_REQUIRE_DB: a caller that must not guess gets an error rather
+  // than a silent second database. Falling back is right on a first run and
+  // wrong for an agent, and the repo-local default is not necessarily the
+  // database anyone is looking at — a project and eleven issues were written
+  // there before it was noticed.
+  let requiredDbError = "";
+  try {
+    resolveDbPath({ CLAW_TASK_HUB_REQUIRE_DB: "1" }, false);
+  } catch (error) {
+    requiredDbError = error instanceof Error ? error.message : String(error);
+  }
+  assert(
+    requiredDbError.includes("CLAW_TASK_HUB_REQUIRE_DB"),
+    `CLAW_TASK_HUB_REQUIRE_DB did not refuse the fallback: ${requiredDbError || "no error"}`,
+  );
+  assert(
+    resolveDbPath({ CLAW_TASK_HUB_REQUIRE_DB: "1", CLAW_TASK_HUB_DB: join(tempDir, "explicit.sqlite") }, false)
+      === join(tempDir, "explicit.sqlite"),
+    "CLAW_TASK_HUB_REQUIRE_DB must still honor an explicitly named database",
+  );
+  assert(
+    resolveDbPath({ CLAW_TASK_HUB_REQUIRE_DB: "0" }, false).endsWith("claw-task-hub.sqlite"),
+    "CLAW_TASK_HUB_REQUIRE_DB=0 must not refuse the fallback",
+  );
   const migrationColumns = db.prepare("PRAGMA table_info(schema_migrations)").all().map((row) => row.name);
   assert(migrationColumns.includes("name"), "schema_migrations does not expose the migration name column");
   const appliedMigrations = db.prepare("SELECT id FROM schema_migrations ORDER BY id").all().map((row) => row.id);
   assert(appliedMigrations.includes("0001_baseline_schema"), "default DB did not record the baseline schema migration");
   assert(appliedMigrations.includes("0002_comments_issue_created_index"), "default DB did not record the comments index migration");
   assert(appliedMigrations.includes("0003_context_bindings"), "default DB did not record the context bindings migration");
+  assert(appliedMigrations.includes("0004_project_updates_and_issue_dependencies"), "default DB did not record project update/dependency migration");
+  assert(appliedMigrations.includes("0005_project_target_date"), "default DB did not record the project target date migration");
+  assert(db.prepare("PRAGMA table_info(projects)").all().some((column) => column.name === "target_date"), "default DB does not expose the project target_date column");
   assert(indexExists(db, "idx_comments_issue_created"), "default DB did not create the comments issue/date index");
   assert(indexExists(db, "idx_context_bindings_lookup"), "default DB did not create the context binding lookup index");
   assert(runMigrations().applied.length === 0, "default DB migrations are not idempotent");
@@ -71,7 +106,9 @@ try {
     assert(freshMigration.applied.includes("0001_baseline_schema"), "fresh DB did not apply the baseline migration");
     assert(freshMigration.applied.includes("0002_comments_issue_created_index"), "fresh DB did not apply the comments index migration");
     assert(freshMigration.applied.includes("0003_context_bindings"), "fresh DB did not apply the context bindings migration");
-    assert(freshMigrationDb.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get().count === 3, "fresh DB stored the wrong migration count");
+    assert(freshMigration.applied.includes("0004_project_updates_and_issue_dependencies"), "fresh DB did not apply project update/dependency migration");
+    assert(freshMigration.applied.includes("0005_project_target_date"), "fresh DB did not apply the project target date migration");
+    assert(freshMigrationDb.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get().count === 5, "fresh DB stored the wrong migration count");
     assert(indexExists(freshMigrationDb, "idx_comments_issue_created"), "fresh DB did not create the comments issue/date index");
     assert(indexExists(freshMigrationDb, "idx_context_bindings_lookup"), "fresh DB did not create the context binding lookup index");
     assert(runMigrations(freshMigrationDb).applied.length === 0, "fresh DB migration rerun was not a no-op");
@@ -93,8 +130,10 @@ try {
     const legacyMigration = initializeDatabase(legacyMigrationDb);
     assert(legacyMigration.applied.includes("0002_comments_issue_created_index"), "legacy migration table did not accept the comments index migration");
     assert(legacyMigration.applied.includes("0003_context_bindings"), "legacy migration table did not accept the context bindings migration");
+    assert(legacyMigration.applied.includes("0004_project_updates_and_issue_dependencies"), "legacy migration table did not accept project update/dependency migration");
+    assert(legacyMigration.applied.includes("0005_project_target_date"), "legacy migration table did not accept the project target date migration");
     const legacyRows = legacyMigrationDb.prepare("SELECT id, name, description FROM schema_migrations ORDER BY id").all();
-    assert(legacyRows.length === 3, `legacy migration table stored wrong row count: ${legacyRows.length}`);
+    assert(legacyRows.length === 5, `legacy migration table stored wrong row count: ${legacyRows.length}`);
     assert(legacyRows.every((row) => row.name && row.description), "legacy migration table has incomplete name/description values");
     assert(indexExists(legacyMigrationDb, "idx_comments_issue_created"), "legacy DB did not create the comments issue/date index");
     assert(indexExists(legacyMigrationDb, "idx_context_bindings_lookup"), "legacy DB did not create the context binding lookup index");
@@ -109,6 +148,8 @@ try {
     assert(existingMigration.applied.includes("0001_baseline_schema"), "existing DB did not record the baseline migration");
     assert(existingMigration.applied.includes("0002_comments_issue_created_index"), "existing DB did not apply the comments index migration");
     assert(existingMigration.applied.includes("0003_context_bindings"), "existing DB did not apply the context bindings migration");
+    assert(existingMigration.applied.includes("0004_project_updates_and_issue_dependencies"), "existing DB did not apply project update/dependency migration");
+    assert(existingMigration.applied.includes("0005_project_target_date"), "existing DB did not apply the project target date migration");
     assert(indexExists(existingMigrationDb, "idx_comments_issue_created"), "existing DB did not create the comments issue/date index");
     assert(indexExists(existingMigrationDb, "idx_context_bindings_lookup"), "existing DB did not create the context binding lookup index");
     const marker = existingMigrationDb.prepare("SELECT id FROM preserved_marker").get();
@@ -132,6 +173,8 @@ try {
     assert(ftsRepairMigration.applied.includes("0001_baseline_schema"), "baseline migration did not rerun on a pre-metadata DB");
     assert(ftsRepairMigration.applied.includes("0002_comments_issue_created_index"), "comments index migration did not rerun on a pre-metadata DB");
     assert(ftsRepairMigration.applied.includes("0003_context_bindings"), "context bindings migration did not rerun on a pre-metadata DB");
+    assert(ftsRepairMigration.applied.includes("0004_project_updates_and_issue_dependencies"), "project update/dependency migration did not rerun on a pre-metadata DB");
+    assert(ftsRepairMigration.applied.includes("0005_project_target_date"), "project target date migration did not rerun on a pre-metadata DB");
     assert(existingMigrationDb.prepare("SELECT COUNT(*) AS count FROM issues WHERE id = 'premigration_fts_issue'").get().count === 1, "baseline migration did not preserve an existing issue");
     assert(existingMigrationDb.prepare("SELECT COUNT(*) AS count FROM comments WHERE id = 'premigration_comment'").get().count === 1, "baseline migration did not preserve an existing comment");
     assert(existingMigrationDb.prepare("SELECT COUNT(*) AS count FROM issue_fts WHERE issue_fts MATCH 'Premigration'").get().count === 1, "baseline migration did not rebuild FTS for pre-existing issues");
@@ -162,12 +205,79 @@ try {
   assert(firstNullExternalProject.id === "project_null_external_first", "first null-external-id project returned the wrong row");
   assert(secondNullExternalProject.id === "project_null_external_second", "second null-external-id project returned the wrong row");
   assert(secondNullExternalProject.name === "Second Null External Project", "second null-external-id project returned the wrong name");
+  const assignedExternalProject = upsertProject({
+    id: "project_null_external_first",
+    external_id: "project-first-external",
+    summary: "Assigned through an internal-id partial update.",
+  });
+  assert(assignedExternalProject.id === firstNullExternalProject.id, "save_project internal id update created a duplicate while assigning external_id");
+  assert(assignedExternalProject.external_id === "project-first-external", "save_project internal id update did not assign external_id");
+  assert(assignedExternalProject.name === firstNullExternalProject.name, "save_project internal id update discarded the existing name");
 
   const storeProject = upsertProject({
     id: "project_store_regression",
     external_id: "store-regression-project",
     name: "Store Regression Project",
+    status: "In Progress",
+    priority: 2,
+    lead: "Regression Agent",
+    target_date: "2026-12-15",
+    source: "test",
   });
+  assert(storeProject.target_date === "2026-12-15", "project target date did not persist");
+  const partiallyUpdatedStoreProject = upsertProject({ external_id: "store-regression-project", summary: "Configured project summary" });
+  assert(partiallyUpdatedStoreProject.target_date === "2026-12-15", "partial project update discarded the target date");
+  assert(partiallyUpdatedStoreProject.lead === "Regression Agent", "partial project update discarded the lead");
+  assert(partiallyUpdatedStoreProject.source === "test", "partial project update discarded the source");
+  const projectUpdate = saveProjectUpdate({
+    id: "project_update_store_regression",
+    external_id: "store-regression-update",
+    project_id: storeProject.id,
+    body: "Status is segmented and blocker tracking is explicit.",
+    health: "on_track",
+    author: "Regression Agent",
+  });
+  assert(projectUpdate.project_id === storeProject.id, "project update was routed to the wrong project");
+  const updatedProjectUpdate = saveProjectUpdate({
+    external_id: "store-regression-update",
+    project_id: storeProject.id,
+    body: "Status and blocker tracking remain explicit.",
+    health: "at_risk",
+  });
+  assert(updatedProjectUpdate.id === projectUpdate.id, "idempotent project update created a duplicate");
+  assert(listProjectUpdates({ project_id: storeProject.id }).length === 1, "project update listing returned the wrong rows");
+  const listedProject = listProjects().find((project) => project.id === storeProject.id);
+  assert(listedProject?.health === "at_risk", "project listing did not expose latest configured health");
+  assert(listedProject?.latest_update_body === "Status and blocker tracking remain explicit.", "project listing did not expose the latest project update");
+  assert(listedProject?.target_date === "2026-12-15", "project listing did not expose the target date");
+
+  const dependencyTarget = upsertIssue({ title: "Dependency target", identifier: "CTH-900030", status: "Todo", project_id: storeProject.id });
+  const dependencyBlocker = upsertIssue({ title: "Dependency blocker", identifier: "CTH-900031", status: "Todo", project_id: storeProject.id });
+  const dependency = saveIssueDependency({
+    external_id: "store-regression-dependency",
+    issue_id: dependencyTarget.identifier,
+    blocker_issue_id: dependencyBlocker.identifier,
+    reason: "The prerequisite must land first.",
+  });
+  assert(dependency.issue_id === dependencyTarget.id, "dependency target did not resolve by visible identifier");
+  assert(dependency.blocker_issue_id === dependencyBlocker.id, "dependency blocker did not resolve by visible identifier");
+  assert(getIssue(dependencyTarget.identifier)?.status_type === "blocked", "open dependency did not make the target effectively blocked");
+  assert(listIssueDependencies({ issue_id: dependencyTarget.identifier }).length === 1, "dependency listing missed the open blocker");
+  assert(listIssues({ project_id: storeProject.id, blocked: true }).some((issue) => issue.id === dependencyTarget.id), "blocked filter missed dependency-blocked issue");
+  assert(getProject(storeProject.id)?.counts.blockers === 1, "project blocker count did not use explicit dependencies");
+  let dependencyCycleMessage = "";
+  try {
+    saveIssueDependency({ issue_id: dependencyBlocker.identifier, blocker_issue_id: dependencyTarget.identifier });
+  } catch (error) {
+    dependencyCycleMessage = error instanceof Error ? error.message : String(error);
+  }
+  assert(dependencyCycleMessage.includes("cycle"), `dependency cycle was not rejected clearly: ${dependencyCycleMessage}`);
+  const resolvedDependency = resolveIssueDependency({ dependency_id: dependency.id });
+  assert(resolvedDependency.resolved === true, "dependency resolve did not report a state transition");
+  assert(getIssue(dependencyTarget.identifier)?.status_type === "unstarted", "resolving the final dependency did not restore Todo state");
+  assert(getProject(storeProject.id)?.projectUpdates.length === 1, "project detail did not include first-class updates");
+  assert(getProject(storeProject.id)?.activity.some((event) => event.type === "project_update"), "project activity did not include project updates");
+
   const contextBinding = upsertContextBinding({
     context_key: "codex:C:/work/claw-task-hub",
     project_id: storeProject.id,
@@ -231,6 +341,32 @@ try {
   }
   assert(invalidProjectMessage === "Project not found: project-does-not-exist", `invalid project error was not clear: ${invalidProjectMessage}`);
   assert(db.prepare("SELECT COUNT(*) AS count FROM issues").get().count === rowCountBeforeMissingProject, "invalid project_id created an issue");
+  let invalidTeamMessage = "";
+  try {
+    upsertIssue({ title: "Invalid team must fail", status: "Todo", project_id: storeProject.id, team_id: "team-does-not-exist" });
+  } catch (error) {
+    invalidTeamMessage = error instanceof Error ? error.message : String(error);
+  }
+  assert(invalidTeamMessage === "Team not found: team-does-not-exist", `invalid team error was not clear: ${invalidTeamMessage}`);
+  assert(db.prepare("SELECT COUNT(*) AS count FROM issues").get().count === rowCountBeforeMissingProject, "invalid team_id created an issue");
+  let invalidParentMessage = "";
+  try {
+    upsertIssue({ title: "Invalid parent must fail", status: "Todo", project_id: storeProject.id, parent_id: "CTH-DOES-NOT-EXIST" });
+  } catch (error) {
+    invalidParentMessage = error instanceof Error ? error.message : String(error);
+  }
+  assert(invalidParentMessage === "Parent issue not found: CTH-DOES-NOT-EXIST", `invalid parent error was not clear: ${invalidParentMessage}`);
+  assert(db.prepare("SELECT COUNT(*) AS count FROM issues").get().count === rowCountBeforeMissingProject, "invalid parent_id created an issue");
+  const explicitNullReferences = upsertIssue({
+    title: "Explicit null references are preserved",
+    identifier: "CTH-900023",
+    status: "Todo",
+    project_id: storeProject.id,
+    team_id: null,
+    parent_id: null,
+  });
+  assert(explicitNullReferences.team_id === null, "explicit null team_id was replaced");
+  assert(explicitNullReferences.parent_id === null, "explicit null parent_id was replaced");
   const deliberateUnassigned = upsertIssue({
     title: "Deliberate unassigned inbox issue",
     identifier: "CTH-900022",
@@ -330,6 +466,46 @@ try {
   }
   assert(conflictingLocatorMessage.includes("Conflicting issue locator identifier"), `conflicting locator did not fail clearly: ${conflictingLocatorMessage}`);
 
+  // An input save_issue does not understand must not look like a write that worked.
+  // {id, state: "Done"} used to return the full issue object, unchanged and status "Todo".
+  const unknownFieldSubject = upsertIssue({
+    title: "Unknown field must not read as a successful write",
+    identifier: "CTH-900012",
+    status: "Todo",
+    status_type: "unstarted",
+    project_id: storeProject.id,
+  });
+
+  let misspelledFieldMessage = "";
+  try {
+    upsertIssue({ id: unknownFieldSubject.id, state: "Done" });
+  } catch (error) {
+    misspelledFieldMessage = error instanceof Error ? error.message : String(error);
+  }
+  assert(misspelledFieldMessage.includes("does not accept"), `save_issue accepted the unknown field 'state': ${misspelledFieldMessage}`);
+  assert(misspelledFieldMessage.includes("did you mean status?"), `save_issue did not suggest the intended field: ${misspelledFieldMessage}`);
+  assert(misspelledFieldMessage.includes("Nothing was written"), `save_issue did not say the write was refused: ${misspelledFieldMessage}`);
+
+  // The refusal must be a REFUSAL, not a partial write. Everything else in the same call
+  // is discarded too, or the guard would just be a differently-shaped silent corruption.
+  const afterRejection = getIssue(unknownFieldSubject.id);
+  assert(afterRejection.status === "Todo", `rejected save_issue still changed the row: ${afterRejection.status}`);
+
+  let derivedFieldMessage = "";
+  try {
+    upsertIssue({ id: unknownFieldSubject.id, status: "Done", project_name: "anything" });
+  } catch (error) {
+    derivedFieldMessage = error instanceof Error ? error.message : String(error);
+  }
+  assert(derivedFieldMessage.includes("project_name"), `save_issue accepted a derived read-only field: ${derivedFieldMessage}`);
+  assert(derivedFieldMessage.includes("read-only"), `save_issue did not explain that project_name is derived: ${derivedFieldMessage}`);
+  assert(getIssue(unknownFieldSubject.id).status === "Todo", "a call rejected for a derived field still wrote the other fields");
+
+  // The guard must not narrow what save_issue accepts: every declared field still writes.
+  const acceptedAfterGuard = upsertIssue({ id: unknownFieldSubject.id, status: "Done", assignee: "Agent", labels: ["guarded"] });
+  assert(acceptedAfterGuard.status === "Done", `guard blocked a legitimate status write: ${acceptedAfterGuard.status}`);
+  assert(acceptedAfterGuard.assignee === "Agent", "guard blocked a legitimate assignee write");
+
   upsertIssue({
     title: "Explicit identifier owner",
     identifier: "CTH-999998",
@@ -407,6 +583,31 @@ try {
   assert(arrayFilteredIds.has(started.identifier), "listIssues array status_type missed started issue");
   assert(arrayFilteredIds.has(blocked.identifier), "listIssues array status_type missed blocked issue");
   assert(!arrayFilteredIds.has(done.identifier), "listIssues array status_type included completed issue unexpectedly");
+
+  const blockerSemanticsProject = upsertProject({
+    id: "project_blocker_semantics",
+    name: "Blocker Semantics Regression",
+  });
+  const urgentTodo = upsertIssue({
+    title: "Urgent issue is not blocked",
+    identifier: "CTH-900030",
+    status: "Todo",
+    priority: 1,
+    project_id: blockerSemanticsProject.id,
+    updated_at: "2026-03-01T00:00:00.000Z",
+  });
+  const blockedMedium = upsertIssue({
+    title: "Blocked issue at medium priority",
+    identifier: "CTH-900031",
+    status: "Blocked",
+    priority: 3,
+    project_id: blockerSemanticsProject.id,
+    updated_at: "2026-03-02T00:00:00.000Z",
+  });
+  const blockerSemanticsDetail = getProject(blockerSemanticsProject.id);
+  assert(blockerSemanticsDetail.counts.blockers === 1, `project blocker count used priority instead of status: ${blockerSemanticsDetail.counts.blockers}`);
+  assert(blockerSemanticsDetail.activity.find((event) => event.id === blockedMedium.id)?.verb === "blocker", "blocked issue activity was not classified as blocker");
+  assert(blockerSemanticsDetail.activity.find((event) => event.id === urgentTodo.id)?.verb !== "blocker", "urgent Todo activity was incorrectly classified as blocker");
 
   const filterProject = upsertProject({
     id: "project_filter_regression",
@@ -547,6 +748,7 @@ try {
   const firstClaim = claimIssue({ issue_id: "CTH-900006", session_id: "session-agent-a", note: "first pass", ttl_minutes: 30 });
   assert(firstClaim.claim.issue_id === claimTarget.id, "claimIssue did not resolve visible issue identifier");
   assert(firstClaim.idempotent === false, "first claim should not be idempotent");
+  assert(getIssue(claimTarget.identifier)?.status_type === "started", "claiming Todo work did not move it to In Progress");
   const renewedClaim = claimIssue({ issue_id: "CTH-900006", session_id: "session-agent-a", note: "renewed", ttl_minutes: 30 });
   assert(renewedClaim.claim.id === firstClaim.claim.id, "claimIssue did not renew the existing claim for the same session");
   assert(renewedClaim.idempotent === true, "same-session claim should be idempotent");
@@ -592,6 +794,7 @@ try {
   const completedClaim = releaseIssueClaim({ issue_id: "CTH-900006", session_id: "session-agent-b", status: "completed" });
   assert(completedClaim.released === true, "releaseIssueClaim did not release active claim");
   assert(completedClaim.claim.status === "completed", "releaseIssueClaim did not store completed status");
+  assert(getIssue(claimTarget.identifier)?.status_type === "completed", "completing a claim did not move the issue to Done");
   const listedAfterRelease = listIssues({ limit: 250 }).find((issue) => issue.identifier === "CTH-900006");
   assert(Number(listedAfterRelease.active_claim_count) === 0, "released claim remained visible in listIssues agent state");
   assert(listIssueClaims({ issue_id: "CTH-900006" }).length === 0, "default listIssueClaims returned a completed claim as active by issue");
@@ -649,6 +852,7 @@ try {
   const forcedClaimIdRelease = releaseIssueClaim({ claim_id: wrongClaimSession.claim.id, session_id: "session-agent-b", force: "true" });
   assert(forcedClaimIdRelease.released === true, "force release by claim_id did not release the active claim");
   assert(listIssueClaims({ issue_id: wrongClaimSessionTarget.identifier }).length === 0, "force release by claim_id left active claims visible");
+  assert(getIssue(wrongClaimSessionTarget.identifier)?.status_type === "unstarted", "unfinished claim release did not return work to Todo");
 
   const staleReleaseTarget = upsertIssue({ title: "Stale newest claim release target", identifier: "CTH-900013", status: "Todo", project_id: storeProject.id });
   db.prepare(`
@@ -761,9 +965,16 @@ try {
   assert(secondRepair.completedAtFixed === 0, "repair is not idempotent for completed_at");
   assert(secondRepair.labelsFixed === 0, "repair is not idempotent for labels");
   assert(secondRepair.issuesChanged === 0, "repair is not idempotent for changed issue count");
+} catch (error) {
+  storeRegressionFailed = true;
+  console.error("Store regression failed:", error);
 } finally {
   storeDb?.close();
   rmSync(tempDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
 }
 
-console.log("Store regression passed");
+if (!storeRegressionFailed) console.log("Store regression passed");
+// The database and test directory are closed above. Exit explicitly because
+// better-sqlite3 on pinned Node 24.20 can otherwise finalize transient
+// Statement cleanup hooks after Node has already destroyed its Environment.
+process.exit(storeRegressionFailed ? 1 : 0);
