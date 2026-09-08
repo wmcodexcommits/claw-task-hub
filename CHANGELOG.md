@@ -14,6 +14,8 @@ All notable changes to Claw Task Hub will be documented in this file.
 - Made temporary SQLite test cleanup Windows-safe by isolating store-regression database handles in a worker process and retrying transient filesystem locks.
 - Made database activation fully release the previous Bun SQLite connection so switched databases can be deleted on Windows.
 - Applied SQLite's busy timeout before WAL negotiation so concurrent CLI startup waits instead of failing with `SQLITE_BUSY_RECOVERY`.
+- Made release smoke teardown terminate and await the complete packaged process tree before retrying transient Windows filesystem locks.
+- Added an append-only compatibility migration for existing issue dependency tables missing the current `source` field.
 
 ## [0.1.0]
 

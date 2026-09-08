@@ -565,6 +565,16 @@ const migrations: {
       }
     },
   },
+  {
+    id: "0006_issue_dependency_source",
+    description: "Bring existing issue dependency tables up to the source contract",
+    up: (database) => {
+      const columns = database.prepare("PRAGMA table_info(issue_dependencies)").all() as { name: string }[];
+      if (!columns.some((column) => column.name === "source")) {
+        database.exec("ALTER TABLE issue_dependencies ADD COLUMN source TEXT NOT NULL DEFAULT 'local'");
+      }
+    },
+  },
 ];
 
 export function runMigrations(database: SqliteDatabase = db) {

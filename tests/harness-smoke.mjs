@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { createServer } from "node:net";
+import { stopProcessTree } from "./process-tree.mjs";
 import { removeTemporaryDirectory } from "./temp-dir.mjs";
 
 function assert(condition, message) {
@@ -140,36 +141,6 @@ function spawnBun(args, extraEnv = {}) {
     });
   }
   return spawn(bun, args, { cwd: process.cwd(), env: childEnv, detached: true });
-}
-
-async function stopProcessTree(child) {
-  if (!child.pid) return;
-  let settled = false;
-  const exited = new Promise((resolve) => {
-    child.once("exit", resolve);
-    child.once("close", resolve);
-  });
-  exited.then(() => {
-    settled = true;
-  });
-  if (process.platform === "win32") {
-    spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore" });
-  } else {
-    try {
-      process.kill(-child.pid, "SIGTERM");
-    } catch {
-      child.kill("SIGTERM");
-    }
-  }
-  await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, 3000))]);
-  if (!settled && process.platform !== "win32") {
-    try {
-      process.kill(-child.pid, "SIGKILL");
-    } catch {
-      child.kill("SIGKILL");
-    }
-    await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, 1000))]);
-  }
 }
 
 function getFreePort() {

@@ -1,6 +1,6 @@
 import { rmSync } from "node:fs";
 
-const retryableRemoveCodes = new Set(["EBUSY", "EMFILE", "ENFILE", "ENOTEMPTY", "EPERM"]);
+const retryableRemoveCodes = new Set(["EACCES", "EBUSY", "EMFILE", "ENFILE", "ENOTEMPTY", "EPERM"]);
 const retryWait = new Int32Array(new SharedArrayBuffer(4));
 
 type RemovePathOptions = {

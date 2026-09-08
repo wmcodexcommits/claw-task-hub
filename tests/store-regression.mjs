@@ -41,20 +41,22 @@ const tempDir = dirname(process.env.CLAW_TASK_HUB_DB);
 let storeDb;
 let storeRegressionFailed = false;
 
-let syntheticCleanupAttempts = 0;
-removeTemporaryDirectory("synthetic-windows-lock", {
-  attempts: 3,
-  retryDelay: 0,
-  remove() {
-    syntheticCleanupAttempts += 1;
-    if (syntheticCleanupAttempts < 3) {
-      const error = new Error("synthetic transient Windows lock");
-      error.code = "EBUSY";
-      throw error;
-    }
-  },
-});
-assert(syntheticCleanupAttempts === 3, "temporary-directory cleanup did not retry a transient EBUSY lock");
+for (const transientCode of ["EBUSY", "EACCES"]) {
+  let syntheticCleanupAttempts = 0;
+  removeTemporaryDirectory("synthetic-windows-lock", {
+    attempts: 3,
+    retryDelay: 0,
+    remove() {
+      syntheticCleanupAttempts += 1;
+      if (syntheticCleanupAttempts < 3) {
+        const error = new Error("synthetic transient Windows lock");
+        error.code = transientCode;
+        throw error;
+      }
+    },
+  });
+  assert(syntheticCleanupAttempts === 3, `temporary-directory cleanup did not retry a transient ${transientCode} lock`);
+}
 
 try {
   const {
@@ -135,6 +137,7 @@ try {
   assert(appliedMigrations.includes("0003_context_bindings"), "default DB did not record the context bindings migration");
   assert(appliedMigrations.includes("0004_project_updates_and_issue_dependencies"), "default DB did not record project update/dependency migration");
   assert(appliedMigrations.includes("0005_project_target_date"), "default DB did not record the project target date migration");
+  assert(appliedMigrations.includes("0006_issue_dependency_source"), "default DB did not record the dependency source compatibility migration");
   assert(db.prepare("PRAGMA table_info(projects)").all().some((column) => column.name === "target_date"), "default DB does not expose the project target_date column");
   assert(indexExists(db, "idx_comments_issue_created"), "default DB did not create the comments issue/date index");
   assert(indexExists(db, "idx_context_bindings_lookup"), "default DB did not create the context binding lookup index");
@@ -148,7 +151,8 @@ try {
     assert(freshMigration.applied.includes("0003_context_bindings"), "fresh DB did not apply the context bindings migration");
     assert(freshMigration.applied.includes("0004_project_updates_and_issue_dependencies"), "fresh DB did not apply project update/dependency migration");
     assert(freshMigration.applied.includes("0005_project_target_date"), "fresh DB did not apply the project target date migration");
-    assert(freshMigrationDb.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get().count === 5, "fresh DB stored the wrong migration count");
+    assert(freshMigration.applied.includes("0006_issue_dependency_source"), "fresh DB did not apply the dependency source compatibility migration");
+    assert(freshMigrationDb.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get().count === 6, "fresh DB stored the wrong migration count");
     assert(indexExists(freshMigrationDb, "idx_comments_issue_created"), "fresh DB did not create the comments issue/date index");
     assert(indexExists(freshMigrationDb, "idx_context_bindings_lookup"), "fresh DB did not create the context binding lookup index");
     assert(runMigrations(freshMigrationDb).applied.length === 0, "fresh DB migration rerun was not a no-op");
@@ -172,8 +176,9 @@ try {
     assert(legacyMigration.applied.includes("0003_context_bindings"), "legacy migration table did not accept the context bindings migration");
     assert(legacyMigration.applied.includes("0004_project_updates_and_issue_dependencies"), "legacy migration table did not accept project update/dependency migration");
     assert(legacyMigration.applied.includes("0005_project_target_date"), "legacy migration table did not accept the project target date migration");
+    assert(legacyMigration.applied.includes("0006_issue_dependency_source"), "legacy migration table did not accept the dependency source compatibility migration");
     const legacyRows = legacyMigrationDb.prepare("SELECT id, name, description FROM schema_migrations ORDER BY id").all();
-    assert(legacyRows.length === 5, `legacy migration table stored wrong row count: ${legacyRows.length}`);
+    assert(legacyRows.length === 6, `legacy migration table stored wrong row count: ${legacyRows.length}`);
     assert(legacyRows.every((row) => row.name && row.description), "legacy migration table has incomplete name/description values");
     assert(indexExists(legacyMigrationDb, "idx_comments_issue_created"), "legacy DB did not create the comments issue/date index");
     assert(indexExists(legacyMigrationDb, "idx_context_bindings_lookup"), "legacy DB did not create the context binding lookup index");
@@ -190,6 +195,7 @@ try {
     assert(existingMigration.applied.includes("0003_context_bindings"), "existing DB did not apply the context bindings migration");
     assert(existingMigration.applied.includes("0004_project_updates_and_issue_dependencies"), "existing DB did not apply project update/dependency migration");
     assert(existingMigration.applied.includes("0005_project_target_date"), "existing DB did not apply the project target date migration");
+    assert(existingMigration.applied.includes("0006_issue_dependency_source"), "existing DB did not apply the dependency source compatibility migration");
     assert(indexExists(existingMigrationDb, "idx_comments_issue_created"), "existing DB did not create the comments issue/date index");
     assert(indexExists(existingMigrationDb, "idx_context_bindings_lookup"), "existing DB did not create the context binding lookup index");
     const marker = existingMigrationDb.prepare("SELECT id FROM preserved_marker").get();
@@ -215,11 +221,52 @@ try {
     assert(ftsRepairMigration.applied.includes("0003_context_bindings"), "context bindings migration did not rerun on a pre-metadata DB");
     assert(ftsRepairMigration.applied.includes("0004_project_updates_and_issue_dependencies"), "project update/dependency migration did not rerun on a pre-metadata DB");
     assert(ftsRepairMigration.applied.includes("0005_project_target_date"), "project target date migration did not rerun on a pre-metadata DB");
+    assert(ftsRepairMigration.applied.includes("0006_issue_dependency_source"), "dependency source compatibility migration did not rerun on a pre-metadata DB");
     assert(existingMigrationDb.prepare("SELECT COUNT(*) AS count FROM issues WHERE id = 'premigration_fts_issue'").get().count === 1, "baseline migration did not preserve an existing issue");
     assert(existingMigrationDb.prepare("SELECT COUNT(*) AS count FROM comments WHERE id = 'premigration_comment'").get().count === 1, "baseline migration did not preserve an existing comment");
     assert(existingMigrationDb.prepare("SELECT COUNT(*) AS count FROM issue_fts WHERE issue_fts MATCH 'Premigration'").get().count === 1, "baseline migration did not rebuild FTS for pre-existing issues");
   } finally {
     existingMigrationDb.close();
+  }
+
+  const dependencySourceMigrationDb = new Database(join(tempDir, "dependency-source-migration.sqlite"), { strict: true });
+  try {
+    dependencySourceMigrationDb.exec(`
+      CREATE TABLE schema_migrations (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        applied_at TEXT NOT NULL
+      );
+      INSERT INTO schema_migrations (id, name, applied_at) VALUES
+        ('0001_baseline_schema', 'baseline', '2026-01-01T00:00:00.000Z'),
+        ('0002_comments_issue_created_index', 'comments index', '2026-01-01T00:00:00.000Z'),
+        ('0003_context_bindings', 'context bindings', '2026-01-01T00:00:00.000Z'),
+        ('0004_project_updates_and_issue_dependencies', 'dependencies', '2026-01-01T00:00:00.000Z'),
+        ('0005_project_target_date', 'project target date', '2026-01-01T00:00:00.000Z');
+      CREATE TABLE issue_dependencies (
+        id TEXT PRIMARY KEY,
+        external_id TEXT UNIQUE,
+        issue_id TEXT NOT NULL,
+        blocker_issue_id TEXT NOT NULL,
+        reason TEXT,
+        status TEXT NOT NULL DEFAULT 'open',
+        resolved_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(issue_id, blocker_issue_id)
+      );
+    `);
+    const compatibilityMigration = initializeDatabase(dependencySourceMigrationDb);
+    assert(compatibilityMigration.applied.length === 1 && compatibilityMigration.applied[0] === "0006_issue_dependency_source", "existing dependency table did not receive only the compatibility migration");
+    assert(dependencySourceMigrationDb.prepare("PRAGMA table_info(issue_dependencies)").all().some((column) => column.name === "source"), "compatibility migration did not add issue_dependencies.source");
+    dependencySourceMigrationDb.prepare(`
+      INSERT INTO issue_dependencies (id, issue_id, blocker_issue_id, created_at, updated_at)
+      VALUES ('legacy-dependency', 'issue-a', 'issue-b', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')
+    `).run();
+    assert(dependencySourceMigrationDb.prepare("SELECT source FROM issue_dependencies WHERE id='legacy-dependency'").get().source === "local", "compatibility migration did not backfill the dependency source default");
+    assert(runMigrations(dependencySourceMigrationDb).applied.length === 0, "dependency source compatibility migration was not idempotent");
+  } finally {
+    dependencySourceMigrationDb.close();
   }
   ensureDefaultTeam();
   const firstNullExternalTeam = upsertTeam({
