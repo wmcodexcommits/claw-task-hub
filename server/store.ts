@@ -87,6 +87,19 @@ export type ProjectInput = {
   updated_at?: string;
 };
 
+export type DeleteProjectInput = {
+  id: string;
+  confirm?: boolean;
+  delete_issues?: boolean;
+  force?: boolean;
+};
+
+export type DeleteIssueInput = {
+  id: string;
+  confirm?: boolean;
+  force?: boolean;
+};
+
 // A field save_issue does not understand must not look like a write that worked.
 //
 // save_issue was called with {id: "...", state: "Done"} and returned the full issue
@@ -549,6 +562,45 @@ export function upsertProject(input: ProjectInput) {
   `).run(row);
   if (row.external_id) return db.prepare("SELECT * FROM projects WHERE external_id = @external_id").get(row);
   return db.prepare("SELECT * FROM projects WHERE id = @id").get(row);
+}
+
+export function updateProject(id: string, input: Omit<ProjectInput, "id">) {
+  const projectId = resolveProjectId(id);
+  if (!projectId) throw new Error(`Project not found: ${id}`);
+  return upsertProject({ ...input, id: projectId });
+}
+
+export function deleteProject(input: DeleteProjectInput) {
+  if (input.confirm !== true) throw new Error("delete_project requires confirm=true. Nothing was deleted.");
+  const projectId = resolveProjectId(input.id);
+  if (!projectId) throw new Error(`Project not found: ${input.id}`);
+  const project = db.prepare("SELECT id, external_id, name FROM projects WHERE id=@id").get({ id: projectId }) as {
+    id: string;
+    external_id: string | null;
+    name: string;
+  };
+  const issueCount = Number((db.prepare("SELECT COUNT(*) AS count FROM issues WHERE project_id=@project_id").get({ project_id: projectId }) as { count: number }).count);
+  if (issueCount > 0 && input.delete_issues !== true) {
+    throw new Error(`Project ${project.name} has ${issueCount} issue(s). Pass delete_issues=true to delete them; nothing was deleted.`);
+  }
+  const activeClaimCount = Number((db.prepare(`
+    SELECT COUNT(*) AS count
+    FROM issue_claims c
+    JOIN agent_sessions s ON s.id=c.session_id
+    JOIN issues i ON i.id=c.issue_id
+    WHERE i.project_id=@project_id
+      AND c.released_at IS NULL AND c.status='active' AND c.expires_at>@now
+      AND s.status='active' AND s.expires_at>@now
+  `).get({ project_id: projectId, now: nowIso() }) as { count: number }).count);
+  if (activeClaimCount > 0 && input.force !== true) {
+    throw new Error(`Project ${project.name} has ${activeClaimCount} active issue claim(s). Pass force=true with delete_issues=true to delete them; nothing was deleted.`);
+  }
+  const transaction = db.transaction(() => {
+    if (input.delete_issues === true) db.prepare("DELETE FROM issues WHERE project_id=@project_id").run({ project_id: projectId });
+    db.prepare("DELETE FROM projects WHERE id=@id").run({ id: projectId });
+  });
+  transaction.immediate();
+  return { deleted: true, project, deleted_issues: input.delete_issues === true ? issueCount : 0 };
 }
 
 export function listProjectUpdates(input: { project_id: string; limit?: number | string | null }) {
@@ -1041,6 +1093,37 @@ export function upsertIssue(input: IssueInput) {
     }
   }
   throw new Error("save_issue failed after retrying automatic identifier allocation");
+}
+
+export function updateIssue(id: string, input: Omit<IssueInput, "id" | "issue_id">) {
+  const issueId = resolveParentId(id);
+  if (!issueId) throw new Error(`Issue not found: ${id}`);
+  return upsertIssue({ ...input, id: issueId });
+}
+
+export function deleteIssue(input: DeleteIssueInput) {
+  if (input.confirm !== true) throw new Error("delete_issue requires confirm=true. Nothing was deleted.");
+  const issueId = resolveParentId(input.id);
+  if (!issueId) throw new Error(`Issue not found: ${input.id}`);
+  const issue = db.prepare("SELECT id, external_id, identifier, title FROM issues WHERE id=@id").get({ id: issueId }) as {
+    id: string;
+    external_id: string | null;
+    identifier: string | null;
+    title: string;
+  };
+  const activeClaimCount = Number((db.prepare(`
+    SELECT COUNT(*) AS count
+    FROM issue_claims c
+    JOIN agent_sessions s ON s.id=c.session_id
+    WHERE c.issue_id=@issue_id
+      AND c.released_at IS NULL AND c.status='active' AND c.expires_at>@now
+      AND s.status='active' AND s.expires_at>@now
+  `).get({ issue_id: issueId, now: nowIso() }) as { count: number }).count);
+  if (activeClaimCount > 0 && input.force !== true) {
+    throw new Error(`Issue ${issue.identifier ?? issue.id} has ${activeClaimCount} active claim(s). Pass force=true to delete it; nothing was deleted.`);
+  }
+  db.prepare("DELETE FROM issues WHERE id=@id").run({ id: issueId });
+  return { deleted: true, issue };
 }
 
 function upsertIssueLocked(input: IssueInput) {

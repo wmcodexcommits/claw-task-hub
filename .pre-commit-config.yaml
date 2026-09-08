@@ -1,0 +1,10 @@
+repos:
+  - repo: local
+    hooks:
+      - id: verification-gate
+        name: Verification Gate
+        entry: bun run verify
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit, pre-push]

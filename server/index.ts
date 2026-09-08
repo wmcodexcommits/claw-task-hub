@@ -1,13 +1,16 @@
 import cors from "cors";
 import express from "express";
 import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
-import { activateManagedDatabase, createManagedDatabase, databaseIdFromName, dbPath, deleteManagedDatabase, listManagedDatabases } from "./db.js";
+import { activateManagedDatabase, createManagedDatabase, databaseIdFromName, dbPath, deleteManagedDatabase, getManagedDatabase, listManagedDatabases } from "./db.js";
 import { dataSnapshot } from "./data-snapshot.js";
 import {
   dashboard,
+  deleteIssue,
+  deleteProject,
   deleteContextBinding,
   ensureDefaultTeam,
   getContextBinding,
@@ -27,10 +30,13 @@ import {
   saveComment,
   saveIssueDependency,
   saveProjectUpdate,
+  updateIssue,
+  updateProject,
   upsertContextBinding,
   upsertIssue,
   upsertProject,
 } from "./store.js";
+import { APP_VERSION } from "./version.js";
 
 ensureDefaultTeam();
 
@@ -77,11 +83,90 @@ app.use(cors({
 }));
 app.use(express.json({ limit: "5mb" }));
 
+const refreshClients = new Set<express.Response>();
+
+function broadcastRefresh() {
+  for (const client of refreshClients) client.write("event: data-refresh\ndata: {}\n\n");
+}
+
+app.get("/api/events", (req, res) => {
+  res.set({
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    "Content-Type": "text/event-stream",
+  });
+  res.flushHeaders();
+  res.write("event: connected\ndata: {}\n\n");
+  refreshClients.add(res);
+  req.on("close", () => refreshClients.delete(res));
+});
+
+app.post("/api/events/refresh", (_req, res) => {
+  broadcastRefresh();
+  res.status(204).end();
+});
+
+app.use("/api", (req, res, next) => {
+  const signalsMutation = ["POST", "PUT", "PATCH", "DELETE"].includes(req.method) && !["/refresh", "/events/refresh"].includes(req.path);
+  if (signalsMutation) {
+    res.once("finish", () => {
+      if (res.statusCode < 400) broadcastRefresh();
+    });
+  }
+  next();
+});
+
+const projectInputSchema = z.object({
+  id: z.string().optional(),
+  external_id: z.string().optional(),
+  name: z.string().min(1).optional(),
+  summary: z.string().nullable().optional(),
+  description: z.string().nullable().optional(),
+  status: z.string().optional(),
+  priority: z.number().int().min(0).max(4).optional(),
+  lead: z.string().nullable().optional(),
+  target_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullable().optional(),
+  source: z.string().optional(),
+  archived_at: z.string().nullable().optional(),
+  created_at: z.string().optional(),
+  updated_at: z.string().optional(),
+});
+
+const issueInputSchema = z.object({
+  id: z.string().optional(),
+  external_id: z.string().optional(),
+  identifier: z.string().optional(),
+  issue_id: z.string().optional(),
+  title: z.string().min(1).optional(),
+  description: z.string().optional(),
+  status: z.string().optional(),
+  status_type: z.string().optional(),
+  priority: z.number().int().min(0).max(4).optional(),
+  project_id: z.string().nullable().optional(),
+  allow_no_project: z.boolean().optional(),
+  team_id: z.string().nullable().optional(),
+  parent_id: z.string().nullable().optional(),
+  assignee: z.string().nullable().optional(),
+  labels: z.array(z.string()).optional(),
+  source: z.string().optional(),
+  url: z.string().nullable().optional(),
+  archived_at: z.string().nullable().optional(),
+  completed_at: z.string().nullable().optional(),
+  created_at: z.string().optional(),
+  updated_at: z.string().optional(),
+// Unknown keys must reach upsertIssue's precise field guard instead of being stripped.
+}).passthrough();
+
 app.get("/api/health", (_req, res) => {
-  res.json({ ok: true, dbPath, mode: "local", host });
+  res.json({ ok: true, dbPath, mode: "local", host, version: APP_VERSION });
 });
 
 app.get("/api/databases", (_req, res) => res.json(listManagedDatabases()));
+app.get("/api/databases/:id", (req, res) => {
+  const database = getManagedDatabase(req.params.id);
+  if (!database) return res.status(404).json({ error: "Database not found" });
+  res.json({ database });
+});
 app.post("/api/filesystem/database-path", async (req, res) => {
   const schema = z.object({ name: z.string().trim().min(1).max(80).optional() });
   if (databasePickerActive) return res.status(409).json({ error: "A database location picker is already open" });
@@ -125,9 +210,21 @@ app.post("/api/databases/:id/activate", (req, res) => {
     res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
   }
 });
-app.delete("/api/databases/:id", (req, res) => {
+app.patch("/api/databases/:id", (req, res) => {
+  const schema = z.object({ active: z.literal(true) });
   try {
-    res.json(deleteManagedDatabase(req.params.id));
+    schema.parse(req.body);
+    res.json(activateManagedDatabase(req.params.id));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    res.status(message.startsWith("Database not found:") ? 404 : 400).json({ error: message });
+  }
+});
+app.delete("/api/databases/:id", (req, res) => {
+  const schema = z.object({ confirm: z.literal(true) });
+  try {
+    const value = schema.parse(req.body);
+    res.json(deleteManagedDatabase(req.params.id, value.confirm));
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const status = message.startsWith("Database not found:") ? 404 : message.startsWith("The active database") ? 409 : 400;
@@ -202,26 +299,37 @@ app.get("/api/projects/:id", (req, res) => {
 });
 
 app.post("/api/projects", (req, res) => {
-  const schema = z.object({
-    id: z.string().optional(),
-    external_id: z.string().optional(),
-    name: z.string().min(1).optional(),
-    summary: z.string().optional(),
-    description: z.string().optional(),
-    status: z.string().optional(),
-    priority: z.number().int().min(0).max(4).optional(),
-    lead: z.string().nullable().optional(),
-    target_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullable().optional(),
-    source: z.string().optional(),
-    archived_at: z.string().nullable().optional(),
-    created_at: z.string().optional(),
-    updated_at: z.string().optional(),
-  }).superRefine((value, ctx) => {
+  const schema = projectInputSchema.superRefine((value, ctx) => {
     if (!value.id && !value.external_id && !value.name) {
       ctx.addIssue({ code: "custom", path: ["name"], message: "name is required when creating a project" });
     }
   });
-  res.json({ project: upsertProject(schema.parse(req.body)) });
+  try {
+    res.status(201).json({ project: upsertProject(schema.parse(req.body)) });
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.patch("/api/projects/:id", (req, res) => {
+  try {
+    const value = projectInputSchema.parse(req.body);
+    delete value.id;
+    res.json({ project: updateProject(req.params.id, value) });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    res.status(message.startsWith("Project not found:") ? 404 : 400).json({ error: message });
+  }
+});
+
+app.delete("/api/projects/:id", (req, res) => {
+  const schema = z.object({ confirm: z.literal(true), delete_issues: z.boolean().optional(), force: z.boolean().optional() });
+  try {
+    res.json(deleteProject({ id: req.params.id, ...schema.parse(req.body) }));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    res.status(message.startsWith("Project not found:") ? 404 : message.includes("active issue claim") || message.includes("has ") ? 409 : 400).json({ error: message });
+  }
 });
 
 app.get("/api/projects/:id/updates", (req, res) => {
@@ -273,24 +381,7 @@ app.get("/api/issues/:id", (req, res) => {
 });
 
 app.post("/api/issues", (req, res) => {
-  const schema = z.object({
-    id: z.string().optional(),
-    external_id: z.string().optional(),
-    identifier: z.string().optional(),
-    issue_id: z.string().optional(),
-    title: z.string().min(1).optional(),
-    description: z.string().optional(),
-    status: z.string().optional(),
-    status_type: z.string().optional(),
-    priority: z.number().int().min(0).max(4).optional(),
-    project_id: z.string().nullable().optional(),
-    allow_no_project: z.boolean().optional(),
-    team_id: z.string().nullable().optional(),
-    assignee: z.string().nullable().optional(),
-    labels: z.array(z.string()).optional(),
-  // Unknown keys must REACH upsertIssue's guard. Stripping them here is the same silent
-  // discard the guard exists to stop — over HTTP, `state` would vanish before any check.
-  }).passthrough().superRefine((value, ctx) => {
+  const schema = issueInputSchema.superRefine((value, ctx) => {
     if (!value.id && !value.external_id && !value.identifier && !value.issue_id && !value.title) {
       ctx.addIssue({ code: "custom", path: ["title"], message: "title is required when creating an issue" });
     }
@@ -299,6 +390,28 @@ app.post("/api/issues", (req, res) => {
     res.json({ issue: upsertIssue(schema.parse(req.body)) });
   } catch (error) {
     res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.patch("/api/issues/:id", (req, res) => {
+  try {
+    const value = issueInputSchema.parse(req.body);
+    delete value.id;
+    delete value.issue_id;
+    res.json({ issue: updateIssue(req.params.id, value) });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    res.status(message.startsWith("Issue not found:") ? 404 : 400).json({ error: message });
+  }
+});
+
+app.delete("/api/issues/:id", (req, res) => {
+  const schema = z.object({ confirm: z.literal(true), force: z.boolean().optional() });
+  try {
+    res.json(deleteIssue({ id: req.params.id, ...schema.parse(req.body) }));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    res.status(message.startsWith("Issue not found:") ? 404 : message.includes("active claim") ? 409 : 400).json({ error: message });
   }
 });
 
@@ -341,6 +454,14 @@ app.post("/api/issue-dependencies/:id/resolve", (req, res) => {
   }
 });
 
+if (process.env.CLAW_TASK_HUB_SERVE_UI === "1") {
+  const distDirectory = fileURLToPath(new URL("../dist/", import.meta.url));
+  const indexFile = fileURLToPath(new URL("../dist/index.html", import.meta.url));
+  if (!existsSync(indexFile)) throw new Error(`Built UI is missing: ${indexFile}`);
+  app.use(express.static(distDirectory));
+  app.get(/^(?!\/api(?:\/|$)).*/, (_req, res) => res.sendFile(indexFile));
+}
+
 // express fires this callback even when the bind FAILED (verified: on
 // EADDRINUSE it runs with server.listening === false), so an unguarded log
 // here announces a success that did not happen, one line before the error.
@@ -349,10 +470,11 @@ const server = app.listen(port, host, () => {
   console.log(`Claw Task Hub API listening on http://${host}:${port}`);
 });
 
+
 // A launcher that loses the port must SAY SO.
 //
 // app.listen had no error handler, so EADDRINUSE surfaced as an uncaught
-// exception and was easily lost under concurrently. A manual `npm run dev`
+// exception and was easily lost under concurrently. A manual `bun run dev`
 // started while the systemd service held 4781 died without a visible error,
 // and the already-running service went on answering with six-hour-old code
 // while the files on disk were edited three times. Nothing in the UI or the

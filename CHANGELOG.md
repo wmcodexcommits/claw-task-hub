@@ -4,6 +4,16 @@ All notable changes to Claw Task Hub will be documented in this file.
 
 ## Unreleased
 
+## [0.2.0]
+
+- Made Bun 1.3.14 the single package-manager and runtime contract, including native `bun:sqlite` storage.
+- Added complete project, issue, and managed-database CRUD across HTTP, CLI, and MCP with destructive confirmation guards.
+- Added one canonical contribution gate, repository hooks, bounded pull-request CI, SemVer validation, packaged-runtime smoke tests, and tag-only GitHub Releases.
+- Consolidated shared UI styling, repaired responsive detail layouts, removed misleading and duplicate controls, and added browser regressions for those states.
+- Added explicit mutation notifications so open UIs refresh after successful API, CLI, or MCP writes without database polling.
+
+## [0.1.0]
+
 - Set the package version to `0.1.0` for the first public MVP release.
 - Added MIT license for public release preparation.
 - Kept optional Linear history import outside normal runtime as a standalone opt-in operator tool.

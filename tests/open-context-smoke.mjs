@@ -12,7 +12,7 @@ const workspaceDir = join(tempDir, "Demo Workspace");
 const env = { ...process.env, CLAW_TASK_HUB_DB: join(tempDir, "open-context-smoke.sqlite") };
 
 function runOpenContext(args) {
-  const result = spawnSync(process.execPath, ["--import", "tsx", "tools/open-context.ts", ...args], {
+  const result = spawnSync(process.execPath, ["tools/open-context.ts", ...args], {
     cwd: process.cwd(),
     env,
     encoding: "utf8",
@@ -25,7 +25,7 @@ function runOpenContext(args) {
 }
 
 function runOpenContextExpectFailure(args) {
-  return spawnSync(process.execPath, ["--import", "tsx", "tools/open-context.ts", ...args], {
+  return spawnSync(process.execPath, ["tools/open-context.ts", ...args], {
     cwd: process.cwd(),
     env,
     encoding: "utf8",

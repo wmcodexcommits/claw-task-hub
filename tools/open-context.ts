@@ -36,7 +36,7 @@ const defaultBaseUrl = "http://localhost:5173";
 
 function usage() {
   process.stdout.write(`Usage:
-  npm run open:context -- [options]
+  bun run open:context -- [options]
 
 Options:
   --cwd <path>              Workspace path. Defaults to the current directory.
@@ -56,9 +56,9 @@ Options:
   --help                    Show this help.
 
 Examples:
-  npm run open:context -- --cwd C:/work/my-repo --project-id project_my_repo --write-shortcut --open
-  npm run open:context -- --cwd C:/work/my-repo --project-name "My Repo" --create-project --write-shortcut --open
-  npm run codex:open -- --cwd C:/work/my-repo
+  bun run open:context -- --cwd C:/work/my-repo --project-id project_my_repo --write-shortcut --open
+  bun run open:context -- --cwd C:/work/my-repo --project-name "My Repo" --create-project --write-shortcut --open
+  bun run codex:open -- --cwd C:/work/my-repo
 `);
 }
 

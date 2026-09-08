@@ -1,4 +1,4 @@
-import Database from "better-sqlite3";
+import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
@@ -10,7 +10,20 @@ mkdirSync(dataDir, { recursive: true });
 
 const legacyDbPath = join(dataDir, "codex-task-hub.sqlite");
 const clawDbPath = join(dataDir, "claw-task-hub.sqlite");
-type SqliteDatabase = InstanceType<typeof Database>;
+type SqliteStatement = {
+  all: (...bindings: unknown[]) => unknown[];
+  get: (...bindings: unknown[]) => unknown;
+  run: (...bindings: unknown[]) => { changes: number; lastInsertRowid: number | bigint };
+};
+
+type SqliteDatabase = Omit<Database, "prepare" | "query"> & {
+  prepare: (sql: string) => SqliteStatement;
+  query: (sql: string) => SqliteStatement;
+};
+
+function openDatabase(path: string): SqliteDatabase {
+  return new Database(path, { strict: true }) as unknown as SqliteDatabase;
+}
 
 export type ManagedDatabase = {
   id: string;
@@ -57,7 +70,7 @@ const databaseRegistryPath = join(databaseDir, ".claw-task-hub-databases.json");
 
 export let dbPath = resolveInitialDbPath();
 mkdirSync(dirname(dbPath), { recursive: true });
-export let db = new Database(dbPath);
+export let db = openDatabase(dbPath);
 
 export function listManagedDatabases(): { active: ManagedDatabase; databases: ManagedDatabase[] } {
   const databasePaths = new Set(
@@ -84,10 +97,14 @@ export function listManagedDatabases(): { active: ManagedDatabase; databases: Ma
   return { active, databases };
 }
 
+export function getManagedDatabase(id: string) {
+  return listManagedDatabases().databases.find((database) => database.id === id) ?? null;
+}
+
 export function createManagedDatabase(name: string, requestedPath?: string) {
   const nextPath = resolveNewDatabasePath(name, requestedPath);
   if (existsSync(nextPath)) throw new Error(`Database already exists: ${nextPath}`);
-  const nextDatabase = new Database(nextPath);
+  const nextDatabase = openDatabase(nextPath);
   try {
     initializeDatabase(nextDatabase);
     activateOpenDatabase(nextDatabase, nextPath);
@@ -106,7 +123,7 @@ export function activateManagedDatabase(id: string) {
   if (!registered) throw new Error(`Database not found: ${id}`);
   const nextPath = registered.path;
   if (resolve(nextPath) === resolve(dbPath)) return listManagedDatabases();
-  const nextDatabase = new Database(nextPath);
+  const nextDatabase = openDatabase(nextPath);
   try {
     initializeDatabase(nextDatabase);
     activateOpenDatabase(nextDatabase, nextPath);
@@ -117,7 +134,8 @@ export function activateManagedDatabase(id: string) {
   return listManagedDatabases();
 }
 
-export function deleteManagedDatabase(id: string) {
+export function deleteManagedDatabase(id: string, confirm = false) {
+  if (confirm !== true) throw new Error("delete_database requires confirm=true. Nothing was deleted.");
   const catalogue = listManagedDatabases();
   const target = catalogue.databases.find((database) => database.id === id);
   if (!target) throw new Error(`Database not found: ${id}`);
@@ -241,10 +259,10 @@ export function initializeDatabase(database: SqliteDatabase) {
 }
 
 function configureDatabase(database: SqliteDatabase) {
-  database.pragma("journal_mode = WAL");
-  database.pragma("foreign_keys = ON");
-  database.pragma("synchronous = NORMAL");
-  database.pragma("busy_timeout = 5000");
+  database.exec("PRAGMA journal_mode = WAL");
+  database.exec("PRAGMA foreign_keys = ON");
+  database.exec("PRAGMA synchronous = NORMAL");
+  database.exec("PRAGMA busy_timeout = 5000");
 }
 
 function createSchema(database: SqliteDatabase) {

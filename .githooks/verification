@@ -1,0 +1,13 @@
+#!/usr/bin/env sh
+set -eu
+
+stage=${1:?hook stage is required}
+if command -v pre-commit >/dev/null 2>&1; then
+  dispatcher=pre-commit
+elif [ -x "${XDG_BIN_HOME:-$HOME/.local/bin}/pre-commit" ]; then
+  dispatcher="${XDG_BIN_HOME:-$HOME/.local/bin}/pre-commit"
+else
+  printf '%s\n' 'pre-commit is required. Install it with uv tool install pre-commit or pipx install pre-commit, then retry.' >&2
+  exit 1
+fi
+exec "$dispatcher" run --hook-stage "$stage" --all-files

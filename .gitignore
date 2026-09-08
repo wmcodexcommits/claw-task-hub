@@ -4,7 +4,7 @@ logs
 .codex-tmp-*
 OPEN_CLAW_TASK_HUB.md
 Open Claw Task Hub.url
-npm-debug.log*
+bun-error.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
@@ -13,6 +13,7 @@ lerna-debug.log*
 node_modules
 dist
 dist-ssr
+release
 *.local
 data
 test-results

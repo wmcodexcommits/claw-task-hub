@@ -10,8 +10,7 @@ Normal operation is independent of external ticketing services. Optional history
 
 Prerequisites:
 
-- Node.js 24 or newer
-- npm
+- Bun 1.3.14
 
 ### No-command desktop launch
 
@@ -42,16 +41,16 @@ Agentic harnesses and developers can still install and run Claw Task Hub from a 
 ```powershell
 git clone https://github.com/Catfish-75/claw-task-hub.git
 cd claw-task-hub
-npm ci
-npm run dev
+bun install --frozen-lockfile
+bun run dev
 ```
 
-For a controlled pilot on Linux or macOS, do not background `npm run dev` with plain `nohup`. Some shells and harnesses still terminate the child process when the parent shell exits. Use the supplied detached launcher instead:
+For a controlled pilot on Linux or macOS, do not background `bun run dev` with plain `nohup`. Some shells and harnesses still terminate the child process when the parent shell exits. Use the supplied detached launcher instead:
 
 ```bash
-npm run pilot:start
-npm run pilot:status
-npm run pilot:stop
+bun run pilot:start
+bun run pilot:status
+bun run pilot:stop
 ```
 
 The pilot launcher prefers `setsid`, writes logs under `logs/`, records a PID file, waits for UI/API readiness, and stops the whole process group so the API and Vite server do not become orphaned.
@@ -59,7 +58,7 @@ The pilot launcher prefers `setsid`, writes logs under `logs/`, records a PID fi
 Check the local API from a shell:
 
 ```powershell
-npm run hub -- tools/call dashboard "{}"
+bun run hub -- tools/call dashboard "{}"
 ```
 
 PowerShell note: for any payload that contains human text, Markdown, quotes, or newlines, do not pass raw JSON directly to `tools/call`. Use the `base64:<json>` transport shown below, or use the wrapper:
@@ -83,7 +82,7 @@ The API binds to `127.0.0.1:4781` by default. This is intentional: Claw Task Hub
 List the tool surface:
 
 ```powershell
-npm run hub -- tools/list
+bun run hub -- tools/list
 ```
 
 Create a project:
@@ -91,7 +90,7 @@ Create a project:
 ```powershell
 $json = '{"external_id":"demo-agent-project","name":"Demo Agent Project","summary":"Local task flow for an agent.","status":"In Progress","priority":2,"lead":"Demo Agent","target_date":"2026-12-15","source":"local"}'
 $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
-npm run hub -- tools/call save_project "base64:$b64"
+bun run hub -- tools/call save_project "base64:$b64"
 ```
 
 Create an issue:
@@ -99,7 +98,7 @@ Create an issue:
 ```powershell
 $json = '{"external_id":"demo-agent-issue","title":"Verify local task lifecycle","description":"Create, claim, comment, release, and close one local issue.","project_id":"demo-agent-project","status":"Todo","priority":2,"labels":["demo"],"source":"local"}'
 $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
-npm run hub -- tools/call save_issue "base64:$b64"
+bun run hub -- tools/call save_issue "base64:$b64"
 ```
 
 New issues must include the owning `project_id` from `list_projects`. Claw Task Hub does not infer a default project; this prevents agents from filing work into the wrong project by accident. Use `allow_no_project:true` only for a deliberate unassigned inbox issue.
@@ -109,11 +108,11 @@ Start a session and claim the issue:
 ```powershell
 $json = '{"id":"session-demo-agent","agent_name":"Demo Agent","harness":"CLI","ttl_minutes":60}'
 $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
-npm run hub -- tools/call start_agent_session "base64:$b64"
+bun run hub -- tools/call start_agent_session "base64:$b64"
 
 $json = '{"issue_id":"demo-agent-issue","session_id":"session-demo-agent","note":"Running the first local workflow.","ttl_minutes":60}'
 $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
-npm run hub -- tools/call claim_issue "base64:$b64"
+bun run hub -- tools/call claim_issue "base64:$b64"
 ```
 
 `claim_issue` and `save_comment` are intentionally conservative for agent workflows: `Done`, `Canceled`, and archived issues cannot be claimed or commented on by default. Reopen the issue first; use `allow_closed:true` only for deliberate historical maintenance.
@@ -123,15 +122,15 @@ Add acceptance evidence and close:
 ```powershell
 $json = '{"issue_id":"demo-agent-issue","body":"Accepted: local create, claim, comment, and close workflow was verified.","author":"Demo Agent","source":"local"}'
 $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
-npm run hub -- tools/call save_comment "base64:$b64"
+bun run hub -- tools/call save_comment "base64:$b64"
 
 $json = '{"id":"demo-agent-issue","status":"Done","status_type":"completed"}'
 $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
-npm run hub -- tools/call save_issue "base64:$b64"
+bun run hub -- tools/call save_issue "base64:$b64"
 
 $json = '{"issue_id":"demo-agent-issue","session_id":"session-demo-agent","status":"completed"}'
 $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
-npm run hub -- tools/call release_issue_claim "base64:$b64"
+bun run hub -- tools/call release_issue_claim "base64:$b64"
 ```
 
 The example uses stable demo external IDs so it can be copied more than once without creating duplicate records. In real agent work, use the visible identifier returned by `save_issue`, such as `CTH-272`.
@@ -173,7 +172,7 @@ For active work discovery, call `list_issues` with `include_done:false` so compl
 The MCP server can be started with:
 
 ```powershell
-npm run mcp
+bun run mcp
 ```
 
 ## Project-Bound Links
@@ -192,19 +191,19 @@ For Codex and similar local harnesses, use a context binding instead of opening 
 Create a local project, bind a workspace, write a shortcut, and open the UI:
 
 ```powershell
-npm run open:context -- --harness codex --cwd C:/work/demo-agent-project --project-name "Demo Agent Project" --create-project --write-shortcut --open
+bun run open:context -- --harness codex --cwd C:/work/demo-agent-project --project-name "Demo Agent Project" --create-project --write-shortcut --open
 ```
 
 Bind an existing project and open it:
 
 ```powershell
-npm run open:context -- --harness codex --cwd C:/work/demo-agent-project --project-id demo-agent-project --write-shortcut --open
+bun run open:context -- --harness codex --cwd C:/work/demo-agent-project --project-id demo-agent-project --write-shortcut --open
 ```
 
 Open an already-bound Codex workspace:
 
 ```powershell
-npm run codex:open -- --cwd C:/work/demo-agent-project
+bun run codex:open -- --cwd C:/work/demo-agent-project
 ```
 
 The command prints JSON with `url`, `url_path`, `project`, and `context_key`. With `--write-shortcut`, it writes both `Open Claw Task Hub.url` and `OPEN_CLAW_TASK_HUB.md` into the workspace so a human or agent can open the right project later even when a local-app picker does not list Claw Task Hub.
@@ -214,7 +213,7 @@ Create a binding:
 ```powershell
 $json = '{"context_key":"codex:demo-agent-project","project_id":"demo-agent-project","default_tab":"issues","harness":"codex","cwd":"C:/work/demo-agent-project","repo_remote":"https://github.com/example/demo-agent-project.git","branch":"main"}'
 $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
-npm run hub -- tools/call save_context_binding "base64:$b64"
+bun run hub -- tools/call save_context_binding "base64:$b64"
 ```
 
 Resolve it later:
@@ -222,7 +221,7 @@ Resolve it later:
 ```powershell
 $json = '{"context_key":"codex:demo-agent-project"}'
 $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
-npm run hub -- tools/call resolve_context_project "base64:$b64"
+bun run hub -- tools/call resolve_context_project "base64:$b64"
 ```
 
 The UI accepts stable deep links:
@@ -242,9 +241,9 @@ When Claw is checked out under the mainMCP workspace, reconcile the top-level
 canonical requisition registry into a dedicated local project:
 
 ```bash
-npm run sync:requisitions
-npm run sync:requisitions -- --apply
-npm run sync:requisitions -- --check
+bun run sync:requisitions
+bun run sync:requisitions -- --apply
+bun run sync:requisitions -- --check
 ```
 
 The command is idempotent. It keeps library-owned requirements in their existing
@@ -279,12 +278,12 @@ Do not expose a non-loopback Claw Task Hub API without adding your own authentic
 Run the release-oriented local gate:
 
 ```powershell
-npm run build
-npm run lint
-npm run store-regression
-npm run harness-smoke
-npm run ui-smoke
-npm run public-hygiene
+bun run build
+bun run lint
+bun run store-regression
+bun run harness-smoke
+bun run ui-smoke
+bun run public-hygiene
 ```
 
 `harness-smoke` proves the core agent workflow works without the browser UI or external ticketing services.

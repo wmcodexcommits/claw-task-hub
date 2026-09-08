@@ -1,33 +1,5 @@
-import {
-  claimIssue,
-  dashboard,
-  deleteContextBinding,
-  endAgentSession,
-  getContextBinding,
-  getIssue,
-  getProject,
-  heartbeatAgentSession,
-  listAgentSessions,
-  listContextBindings,
-  listIssueClaims,
-  listIssueDependencies,
-  listIssues,
-  listProjectUpdates,
-  listProjects,
-  listTeams,
-  releaseIssueClaim,
-  repairIssueInvariants,
-  resolveContextProject,
-  resolveIssueDependency,
-  saveComment,
-  saveIssueDependency,
-  saveProjectUpdate,
-  startAgentSession,
-  upsertContextBinding,
-  upsertIssue,
-  upsertProject,
-} from "./store.js";
-import { dataSnapshot } from "./data-snapshot.js";
+import { callHubTool, hubToolNames } from "./tool-dispatch.js";
+import { APP_VERSION } from "./version.js";
 
 let stdin = Buffer.alloc(0);
 
@@ -56,6 +28,25 @@ const tools = [
     issues_per_status: { oneOf: [{ type: "number", enum: [50, 100, 200] }, { type: "string", enum: ["50", "100", "200", "all"] }] },
     include_issues: { type: "boolean" },
   }),
+  tool("list_databases", "List managed SQLite databases and identify the active database."),
+  tool("get_database", "Get one managed SQLite database by id.", {
+    id: { type: "string" },
+  }, ["id"]),
+  tool("create_database", "Create, initialize, register, and activate a local SQLite database.", {
+    name: { type: "string", minLength: 1, maxLength: 80 },
+    path: { type: "string", maxLength: 4096 },
+  }, ["name"]),
+  tool("update_database", "Update mutable database state. The only mutable field is active=true.", {
+    id: { type: "string" },
+    active: { type: "boolean", const: true },
+  }, ["id", "active"]),
+  tool("activate_database", "Compatibility alias for update_database with active=true.", {
+    id: { type: "string" },
+  }, ["id"]),
+  tool("delete_database", "Permanently delete an inactive SQLite database and its sidecars. Requires confirm=true.", {
+    id: { type: "string" },
+    confirm: { type: "boolean", const: true },
+  }, ["id", "confirm"]),
   tool("get_project", "Get one project with status counts, blockers, updates, and activity.", {
     id: { type: "string" },
     issues_per_status: { anyOf: [{ type: "number" }, { type: "string" }] },
@@ -75,6 +66,22 @@ const tools = [
     created_at: { type: "string" },
     updated_at: { type: "string" },
   }),
+  tool("create_project", "Create a local project under an explicit name.", {
+    id: { type: "string" }, external_id: { type: "string" }, name: { type: "string", minLength: 1 },
+    summary: { anyOf: [{ type: "string" }, { type: "null" }] }, description: { anyOf: [{ type: "string" }, { type: "null" }] },
+    status: { type: "string" }, priority: { type: "number" }, lead: { anyOf: [{ type: "string" }, { type: "null" }] },
+    target_date: { anyOf: [{ type: "string", format: "date" }, { type: "null" }] }, source: { type: "string" },
+  }, ["name"]),
+  tool("update_project", "Update an existing project. This never creates a missing project.", {
+    id: { type: "string" }, external_id: { type: "string" }, name: { type: "string", minLength: 1 },
+    summary: { anyOf: [{ type: "string" }, { type: "null" }] }, description: { anyOf: [{ type: "string" }, { type: "null" }] },
+    status: { type: "string" }, priority: { type: "number" }, lead: { anyOf: [{ type: "string" }, { type: "null" }] },
+    target_date: { anyOf: [{ type: "string", format: "date" }, { type: "null" }] }, source: { type: "string" },
+    archived_at: { anyOf: [{ type: "string" }, { type: "null" }] },
+  }, ["id"]),
+  tool("delete_project", "Permanently delete an existing project. Projects with issues require delete_issues=true; active claims additionally require force=true.", {
+    id: { type: "string" }, confirm: { type: "boolean", const: true }, delete_issues: { type: "boolean" }, force: { type: "boolean" },
+  }, ["id", "confirm"]),
   tool("list_project_updates", "List first-class status updates for one project.", {
     project_id: { type: "string" },
     limit: { type: "number" },
@@ -119,6 +126,22 @@ const tools = [
     team_id: { type: "string" },
     labels: { type: "array", items: { type: "string" } },
   }),
+  tool("create_issue", "Create a ticket in an explicit owning project.", {
+    id: { type: "string" }, external_id: { type: "string" }, identifier: { type: "string" }, title: { type: "string", minLength: 1 },
+    description: { type: "string" }, status: { type: "string" }, status_type: { type: "string" }, priority: { type: "number" },
+    project_id: { type: "string" }, team_id: { anyOf: [{ type: "string" }, { type: "null" }] }, parent_id: { anyOf: [{ type: "string" }, { type: "null" }] },
+    assignee: { anyOf: [{ type: "string" }, { type: "null" }] }, labels: { type: "array", items: { type: "string" } }, source: { type: "string" },
+  }, ["title", "project_id"]),
+  tool("update_issue", "Update an existing ticket by internal id, external id, or visible identifier. This never creates a missing issue.", {
+    id: { type: "string" }, external_id: { type: "string" }, identifier: { type: "string" }, title: { type: "string", minLength: 1 },
+    description: { type: "string" }, status: { type: "string" }, status_type: { type: "string" }, priority: { type: "number" },
+    project_id: { anyOf: [{ type: "string" }, { type: "null" }] }, team_id: { anyOf: [{ type: "string" }, { type: "null" }] },
+    parent_id: { anyOf: [{ type: "string" }, { type: "null" }] }, assignee: { anyOf: [{ type: "string" }, { type: "null" }] },
+    labels: { type: "array", items: { type: "string" } }, source: { type: "string" },
+  }, ["id"]),
+  tool("delete_issue", "Permanently delete an existing ticket. Active claims require force=true.", {
+    id: { type: "string" }, confirm: { type: "boolean", const: true }, force: { type: "boolean" },
+  }, ["id", "confirm"]),
   tool("save_comment", "Create a local comment on an open issue. issue_id accepts the internal id, external id, or visible identifier such as CTH-212. Done, Canceled, and archived issues require allow_closed=true for deliberate historical maintenance.", {
     id: { type: "string" },
     external_id: { type: "string" },
@@ -127,6 +150,13 @@ const tools = [
     author: { type: "string" },
     source: { type: "string" },
     allow_closed: { type: "boolean" },
+  }, ["issue_id", "body"]),
+  tool("accept_issue", "Complete an open issue safely: require evidence, save it as an acceptance comment, then move the issue to Done. If evidence validation or persistence fails, the status is not changed.", {
+    issue_id: { type: "string" },
+    body: { type: "string", minLength: 1 },
+    external_id: { type: "string" },
+    author: { type: "string" },
+    source: { type: "string" },
   }, ["issue_id", "body"]),
   tool("list_issue_dependencies", "List explicit blockers for an issue.", {
     issue_id: { type: "string" },
@@ -244,40 +274,9 @@ const tools = [
   }),
 ];
 
-async function callTool(name: string, args: Record<string, unknown>) {
-  if (name === "dashboard") return dashboard();
-  if (name === "list_teams") return { teams: listTeams() };
-  if (name === "list_projects") return { projects: listProjects() };
-  if (name === "refresh_data") return dataSnapshot(args);
-  if (name === "get_project") return { project: getProject(String(args.id), { issues_per_status: args.issues_per_status }) };
-  if (name === "save_project") return { project: upsertProject(args) };
-  if (name === "list_project_updates") return { updates: listProjectUpdates(args as { project_id: string }) };
-  if (name === "save_project_update") return { update: saveProjectUpdate(args as { project_id: string; body: string }) };
-  if (name === "list_issues") return { issues: listIssues(args) };
-  if (name === "get_issue") return { issue: getIssue(String(args.id)) };
-  if (name === "save_issue") return { issue: upsertIssue(args as { title: string }) };
-  if (name === "save_comment") return { comment: saveComment(args as { issue_id: string; body: string; author?: string }) };
-  if (name === "list_issue_dependencies") return { dependencies: listIssueDependencies(args as { issue_id: string }) };
-  if (name === "save_issue_dependency") return { dependency: saveIssueDependency(args as { issue_id: string; blocker_issue_id: string }) };
-  if (name === "resolve_issue_dependency") return resolveIssueDependency(args);
-  if (name === "start_agent_session") return { session: startAgentSession(args as { agent_name: string }) };
-  if (name === "heartbeat_agent_session") return { session: heartbeatAgentSession(args as { session_id: string }) };
-  if (name === "end_agent_session") return endAgentSession(args as { session_id: string });
-  if (name === "list_agent_sessions") return { sessions: listAgentSessions(args) };
-  if (name === "claim_issue") return claimIssue(args as { issue_id: string; session_id: string });
-  if (name === "release_issue_claim") return releaseIssueClaim(args as Parameters<typeof releaseIssueClaim>[0]);
-  if (name === "list_issue_claims") return { claims: listIssueClaims(args) };
-  if (name === "repair_issue_invariants") return repairIssueInvariants();
-  if (name === "save_context_binding" || name === "upsert_context_binding") return { binding: upsertContextBinding(args as { context_key: string; project_id: string }) };
-  if (name === "get_context_binding") {
-    const locator = typeof args.context_key === "string" && args.context_key ? args.context_key : args.id;
-    if (typeof locator !== "string" || !locator) throw new Error("get_context_binding requires id or context_key");
-    return { binding: getContextBinding(locator) };
-  }
-  if (name === "list_context_bindings") return { bindings: listContextBindings(args) };
-  if (name === "resolve_context_project") return resolveContextProject(args);
-  if (name === "delete_context_binding") return deleteContextBinding(args as { id?: string; context_key?: string });
-  throw new Error(`Unknown tool: ${name}`);
+const describedToolNames = new Set(tools.map((entry) => entry.name));
+for (const name of hubToolNames) {
+  if (!describedToolNames.has(name)) throw new Error(`MCP tool schema missing for canonical tool: ${name}`);
 }
 
 async function handle(message: { id?: number; method?: string; params?: Record<string, unknown> }) {
@@ -292,14 +291,14 @@ async function handle(message: { id?: number; method?: string; params?: Record<s
         result: {
           protocolVersion: "2024-11-05",
           capabilities: { tools: {} },
-          serverInfo: { name: "claw-task-hub", version: "0.1.0" },
+          serverInfo: { name: "claw-task-hub", version: APP_VERSION },
         },
       });
     } else if (message.method === "tools/list") {
       write({ jsonrpc: "2.0", id: message.id, result: { tools } });
     } else if (message.method === "tools/call") {
       const params = message.params as { name: string; arguments?: Record<string, unknown> };
-      const result = await callTool(params.name, params.arguments ?? {});
+      const result = await callHubTool(params.name, params.arguments ?? {});
       write({ jsonrpc: "2.0", id: message.id, result: { content: [{ type: "text", text: JSON.stringify(result) }] } });
     } else {
       write({ jsonrpc: "2.0", id: message.id, error: { code: -32601, message: `Unknown method: ${message.method}` } });

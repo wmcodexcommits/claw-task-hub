@@ -1,33 +1,4 @@
-import {
-  claimIssue,
-  dashboard,
-  deleteContextBinding,
-  endAgentSession,
-  getContextBinding,
-  getIssue,
-  getProject,
-  heartbeatAgentSession,
-  listAgentSessions,
-  listContextBindings,
-  listIssueClaims,
-  listIssueDependencies,
-  listIssues,
-  listProjectUpdates,
-  listProjects,
-  listTeams,
-  releaseIssueClaim,
-  repairIssueInvariants,
-  resolveContextProject,
-  resolveIssueDependency,
-  saveComment,
-  saveIssueDependency,
-  saveProjectUpdate,
-  startAgentSession,
-  upsertContextBinding,
-  upsertIssue,
-  upsertProject,
-} from "./store.js";
-import { dataSnapshot } from "./data-snapshot.js";
+import { callHubTool, hubToolNames } from "./tool-dispatch.js";
 
 const [, , mode, ...args] = process.argv;
 
@@ -64,97 +35,17 @@ function quotePowerShellObject(raw: string) {
     });
 }
 
-function requireString(input: Record<string, unknown>, key: string, tool: string) {
-  if (typeof input[key] !== "string" || !input[key]) {
-    throw new Error(`${tool} requires ${key}`);
-  }
-}
-
 try {
   if (mode === "tools/list") {
-    print({
-      tools: [
-        "list_teams",
-        "list_projects",
-        "refresh_data",
-        "get_project",
-        "save_project",
-        "list_project_updates",
-        "save_project_update",
-        "list_issues",
-        "get_issue",
-        "save_issue",
-        "save_comment",
-        "list_issue_dependencies",
-        "save_issue_dependency",
-        "resolve_issue_dependency",
-        "dashboard",
-        "start_agent_session",
-        "heartbeat_agent_session",
-        "end_agent_session",
-        "list_agent_sessions",
-        "claim_issue",
-        "release_issue_claim",
-        "list_issue_claims",
-        "repair_issue_invariants",
-        "save_context_binding",
-        "upsert_context_binding",
-        "get_context_binding",
-        "list_context_bindings",
-        "resolve_context_project",
-        "delete_context_binding",
-      ],
-    });
+    print({ tools: hubToolNames });
   } else if (mode === "tools/call") {
     const [tool, raw = "{}"] = args;
     const input = parseArgs(raw);
-    if (tool === "list_teams") print({ teams: listTeams() });
-    else if (tool === "list_projects") print({ projects: listProjects() });
-    else if (tool === "refresh_data") print(dataSnapshot(input));
-    else if (tool === "get_project") {
-      requireString(input, "id", "get_project");
-      print({ project: getProject(input.id, { issues_per_status: input.issues_per_status }) });
-    }
-    else if (tool === "save_project") print({ project: upsertProject(input) });
-    else if (tool === "list_project_updates") print({ updates: listProjectUpdates(input) });
-    else if (tool === "save_project_update") print({ update: saveProjectUpdate(input) });
-    else if (tool === "list_issues") print({ issues: listIssues(input) });
-    else if (tool === "save_context_binding" || tool === "upsert_context_binding") print({ binding: upsertContextBinding(input) });
-    else if (tool === "get_context_binding") {
-      const locator = typeof input.context_key === "string" && input.context_key ? input.context_key : input.id;
-      if (typeof locator !== "string" || !locator) throw new Error("get_context_binding requires id or context_key");
-      print({ binding: getContextBinding(locator) });
-    }
-    else if (tool === "list_context_bindings") print({ bindings: listContextBindings(input) });
-    else if (tool === "resolve_context_project") print(resolveContextProject(input));
-    else if (tool === "delete_context_binding") print(deleteContextBinding(input));
-    else if (tool === "get_issue") {
-      requireString(input, "id", "get_issue");
-      print({ issue: getIssue(input.id) });
-    }
-    else if (tool === "save_issue") print({ issue: upsertIssue(input) });
-    else if (tool === "save_comment") {
-      requireString(input, "issue_id", "save_comment");
-      if (typeof input.body !== "string" || !input.body) throw new Error("save_comment requires body");
-      print({ comment: saveComment(input) });
-    }
-    else if (tool === "list_issue_dependencies") print({ dependencies: listIssueDependencies(input) });
-    else if (tool === "save_issue_dependency") print({ dependency: saveIssueDependency(input) });
-    else if (tool === "resolve_issue_dependency") print(resolveIssueDependency(input));
-    else if (tool === "dashboard") print(dashboard());
-    else if (tool === "start_agent_session") print({ session: startAgentSession(input) });
-    else if (tool === "heartbeat_agent_session") print({ session: heartbeatAgentSession(input) });
-    else if (tool === "end_agent_session") print(endAgentSession(input));
-    else if (tool === "list_agent_sessions") print({ sessions: listAgentSessions(input) });
-    else if (tool === "claim_issue") print(claimIssue(input));
-    else if (tool === "release_issue_claim") print(releaseIssueClaim(input));
-    else if (tool === "list_issue_claims") print({ claims: listIssueClaims(input) });
-    else if (tool === "repair_issue_invariants") print(repairIssueInvariants());
-    else throw new Error(`Unknown tool: ${tool}`);
+    print(await callHubTool(tool, input));
   } else {
-    console.error("Usage: npm run hub -- tools/list");
-    console.error("   or: npm run hub -- tools/call list_issues '{\"limit\":10}'");
-    console.error("   or: npm run hub -- tools/call list_issues base64:<base64-json>");
+    console.error("Usage: bun run hub -- tools/list");
+    console.error("   or: bun run hub -- tools/call list_issues '{\"limit\":10}'");
+    console.error("   or: bun run hub -- tools/call list_issues base64:<base64-json>");
     process.exit(2);
   }
 } catch (error) {

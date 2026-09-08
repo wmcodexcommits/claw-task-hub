@@ -19,12 +19,14 @@ import {
   MessageSquarePlus,
   MoreHorizontal,
   Plus,
+  RefreshCw,
   Search,
   SlidersHorizontal,
   Trash2,
   UserRound,
   X,
 } from "lucide-react";
+import { design } from "./styles/design-system.js";
 import "./App.css";
 
 type ProjectHealth = "on_track" | "at_risk" | "off_track" | "complete";
@@ -489,6 +491,16 @@ function App() {
   }, [refresh]);
 
   useEffect(() => {
+    const events = new EventSource(`${apiBase}/events`);
+    const handleRefresh = () => void refresh(true);
+    events.addEventListener("data-refresh", handleRefresh);
+    return () => {
+      events.removeEventListener("data-refresh", handleRefresh);
+      events.close();
+    };
+  }, [refresh]);
+
+  useEffect(() => {
     let active = true;
     const pollHealth = async () => {
       if (active) setHealthState("checking");
@@ -717,6 +729,7 @@ function App() {
     try {
       const catalogue = await api<DatabaseCatalogue>(`/databases/${encodeURIComponent(target.id)}`, {
         method: "DELETE",
+        body: JSON.stringify({ confirm: true }),
       });
       setDatabaseCatalogue(catalogue);
       setDatabaseDeleteTarget(null);
@@ -1104,7 +1117,17 @@ function TopChrome({
   onRefresh: () => Promise<void>;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const activeName = catalogue?.active.name ?? "claw-task-hub";
+  async function runRefresh() {
+    if (refreshing) return;
+    setRefreshing(true);
+    try {
+      await onRefresh();
+    } finally {
+      setRefreshing(false);
+    }
+  }
   return (
     <header className="top-chrome">
       <div className="window-tab">
@@ -1112,6 +1135,10 @@ function TopChrome({
         <span>{activeName}</span>
       </div>
       <div className="address">Claw Task Hub</div>
+      <button className="top-refresh-pill" aria-label="Refresh data" aria-busy={refreshing} disabled={refreshing} onClick={() => void runRefresh()}>
+        <RefreshCw className={refreshing ? "refresh-spin" : undefined} size={14} />
+        <span>Refresh data</span>
+      </button>
       <span
         className={`ghost-icon health-check ${healthState}`}
         role="status"
@@ -1152,7 +1179,6 @@ function TopChrome({
             ))}
             <button role="menuitem" onClick={() => { setMenuOpen(false); onNewDatabase(); }}>Create database</button>
             <button role="menuitemcheckbox" aria-checked={darkMode} onClick={onToggleDarkMode}>Dark mode {darkMode ? "✓" : ""}</button>
-            <button role="menuitem" onClick={() => { setMenuOpen(false); void onRefresh(); }}>Refresh data</button>
           </div>
         ) : null}
       </div>
@@ -1531,7 +1557,6 @@ function ProjectOverview({ detail, onTab }: { detail: ProjectDetail; onTab: (tab
               <span>{issueCode(issue)} {issue.title}</span>
             </button>
           ))}
-          <button className="add-resource" onClick={() => onTab("issues")}><Plus size={14} /> Add issue resource</button>
         </div>
       </div>
 
@@ -1703,9 +1728,9 @@ function IssuesPage({
   );
 }
 
-const issueGroupHeaderHeight = 36;
-const issueRowHeight = 44;
-const issueListOverscan = 440;
+const issueGroupHeaderHeight = design.dimensions.issueGroup;
+const issueRowHeight = design.dimensions.issueRow;
+const issueListOverscan = design.dimensions.issueOverscan;
 
 type InlineDropdownOption = { value: string; label: string };
 
@@ -1740,14 +1765,15 @@ function InlineDropdown({
     const trigger = rootRef.current;
     if (!trigger) return;
     const rect = trigger.getBoundingClientRect();
-    const below = window.innerHeight - rect.bottom - 4;
-    const above = rect.top - 4;
-    const useAbove = below < 120 && above > below;
+    const gap = design.placement.viewportGap;
+    const below = window.innerHeight - rect.bottom - gap;
+    const above = rect.top - gap;
+    const useAbove = below < design.placement.dropdownMinimumSpace && above > below;
     setMenuStyle({
       left: rect.left,
-      ...(useAbove ? { bottom: window.innerHeight - rect.top + 4 } : { top: rect.bottom + 4 }),
+      ...(useAbove ? { bottom: window.innerHeight - rect.top + gap } : { top: rect.bottom + gap }),
       width: rect.width,
-      maxHeight: Math.max(88, Math.min(280, useAbove ? above : below)),
+      maxHeight: Math.max(design.placement.dropdownMinimumHeight, Math.min(design.placement.dropdownMaximumHeight, useAbove ? above : below)),
     });
   }, []);
 
@@ -1916,7 +1942,6 @@ function VirtualizedIssueList({
                     <StatusIcon statusType={resolveUiStatusType(issue)} />
                     <strong>{issue.title}</strong>
                     <span className="relation">{issue.project_name}</span>
-                    <AgentStateInline issue={issue} />
                     <time>{formatShortDate(issue.updated_at)}</time>
                   </button>
                 );
@@ -2202,26 +2227,6 @@ function decodeUrlSegment(value: string) {
   }
 }
 
-function AgentStateInline({ issue }: { issue: Issue }) {
-  const claimCount = activeClaimCount(issue);
-  const agentLabel = issue.active_claim_agent || issue.active_claims?.[0]?.agent_name;
-  const hasAcceptance = Boolean(issue.last_acceptance_at || latestAcceptanceForIssue(issue));
-  if (!claimCount && !hasAcceptance) {
-    return <span className="agent-inline muted-agent" title="No active agent claim"><UserRound size={15} /></span>;
-  }
-  return (
-    <span className="agent-inline">
-      {claimCount > 0 ? (
-        <span className={claimCount > 1 ? "agent-chip warning" : "agent-chip"} title={claimCount > 1 ? `${claimCount} active claims` : `Claimed by ${agentLabel || "agent"}`}>
-          <UserRound size={13} />
-          <span>{agentLabel ? shortAgentName(agentLabel) : claimCount}</span>
-        </span>
-      ) : null}
-      {hasAcceptance ? <CheckCircle2 className="agent-accepted" size={14} aria-label="Accepted" /> : null}
-    </span>
-  );
-}
-
 function AgentStatePanel({ issue }: { issue: Issue }) {
   const claimCount = activeClaimCount(issue);
   const activeClaims = issue.active_claims ?? [];
@@ -2284,13 +2289,6 @@ function isAcceptanceComment(comment: IssueComment) {
     body.startsWith("reviewer-opponent acceptance") ||
     (body.startsWith("closure note:") && body.includes("acceptance was already reached"))
   );
-}
-
-function shortAgentName(label: string) {
-  const normalized = label.replace(/^Codex GPT-[\d.]+/i, "Codex").replace(/\s+/g, " ").trim();
-  if (normalized.length <= 10) return normalized;
-  const parts = normalized.split(" ");
-  return parts[0].length <= 10 ? parts[0] : `${parts[0].slice(0, 9)}...`;
 }
 
 function apiGroupToUiGroup(group: ApiIssueGroup): UiIssueGroup {
