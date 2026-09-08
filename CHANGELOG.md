@@ -11,6 +11,7 @@ All notable changes to Claw Task Hub will be documented in this file.
 - Added one canonical contribution gate, repository hooks, bounded pull-request CI, SemVer validation, packaged-runtime smoke tests, and tag-only GitHub Releases.
 - Consolidated shared UI styling, repaired responsive detail layouts, removed misleading and duplicate controls, and added browser regressions for those states.
 - Added explicit mutation notifications so open UIs refresh after successful API, CLI, or MCP writes without database polling.
+- Made temporary SQLite test cleanup Windows-safe by isolating store-regression database handles in a worker process and retrying transient filesystem locks.
 
 ## [0.1.0]
 

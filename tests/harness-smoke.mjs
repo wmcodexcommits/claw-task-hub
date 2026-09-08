@@ -1,8 +1,9 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { createServer } from "node:net";
+import { removeTemporaryDirectory } from "./temp-dir.mjs";
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -764,5 +765,5 @@ try {
 
   console.log("Harness smoke passed");
 } finally {
-  rmSync(tempDir, { recursive: true, force: true });
+  removeTemporaryDirectory(tempDir);
 }

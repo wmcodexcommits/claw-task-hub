@@ -1,8 +1,9 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
+import { removeTemporaryDirectory } from "./temp-dir.mjs";
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -88,5 +89,5 @@ try {
   console.log("release package smoke passed");
 } finally {
   await stop(child);
-  rmSync(outputRoot, { recursive: true, force: true });
+  removeTemporaryDirectory(outputRoot);
 }

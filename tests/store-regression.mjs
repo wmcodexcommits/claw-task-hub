@@ -1,7 +1,10 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
 import { Database } from "bun:sqlite";
+import { removeTemporaryDirectory } from "./temp-dir.mjs";
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -11,10 +14,47 @@ function indexExists(database, name) {
   return Boolean(database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = @name").get({ name }));
 }
 
-const tempDir = mkdtempSync(join(tmpdir(), "claw-task-hub-store-"));
-process.env.CLAW_TASK_HUB_DB = join(tempDir, "test.sqlite");
+if (process.env.CLAW_TASK_HUB_STORE_WORKER !== "1") {
+  const parentTempDir = mkdtempSync(join(tmpdir(), "claw-task-hub-store-"));
+  const result = spawnSync(process.execPath, [fileURLToPath(import.meta.url)], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      CLAW_TASK_HUB_DB: join(parentTempDir, "test.sqlite"),
+      CLAW_TASK_HUB_STORE_WORKER: "1",
+    },
+    stdio: "inherit",
+    windowsHide: true,
+  });
+  let cleanupFailed = false;
+  try {
+    removeTemporaryDirectory(parentTempDir);
+  } catch (error) {
+    cleanupFailed = true;
+    console.error("Store cleanup failed after the worker exited:", error);
+  }
+  process.exit(cleanupFailed ? 1 : result.status ?? 1);
+}
+
+if (!process.env.CLAW_TASK_HUB_DB) throw new Error("Store regression worker requires CLAW_TASK_HUB_DB");
+const tempDir = dirname(process.env.CLAW_TASK_HUB_DB);
 let storeDb;
 let storeRegressionFailed = false;
+
+let syntheticCleanupAttempts = 0;
+removeTemporaryDirectory("synthetic-windows-lock", {
+  attempts: 3,
+  retryDelay: 0,
+  remove() {
+    syntheticCleanupAttempts += 1;
+    if (syntheticCleanupAttempts < 3) {
+      const error = new Error("synthetic transient Windows lock");
+      error.code = "EBUSY";
+      throw error;
+    }
+  },
+});
+assert(syntheticCleanupAttempts === 3, "temporary-directory cleanup did not retry a transient EBUSY lock");
 
 try {
   const {
@@ -970,7 +1010,6 @@ try {
   console.error("Store regression failed:", error);
 } finally {
   storeDb?.close();
-  rmSync(tempDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
 }
 
 if (!storeRegressionFailed) console.log("Store regression passed");
