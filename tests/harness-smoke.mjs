@@ -334,7 +334,10 @@ async function assertApiCrudParity() {
     result = await request("/databases/api-crud-database.sqlite", { method: "DELETE", body: JSON.stringify({ confirm: false }) });
     assert(result.response.status === 400, "HTTP database deletion did not fail closed without confirmation");
     result = await request("/databases/api-crud-database.sqlite", { method: "DELETE", body: JSON.stringify({ confirm: true }) });
-    assert(result.response.ok && !result.body.databases.some((database) => database.id === "api-crud-database.sqlite"), "HTTP delete database failed");
+    assert(
+      result.response.ok && !result.body.databases.some((database) => database.id === "api-crud-database.sqlite"),
+      `HTTP delete database failed: ${result.response.status} ${JSON.stringify(result.body)}`,
+    );
   } finally {
     await stopProcessTree(child);
   }

@@ -1,8 +1,9 @@
 import { Database } from "bun:sqlite";
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { removePathWithRetries } from "./filesystem.js";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const dataDir = join(root, "data");
@@ -109,10 +110,10 @@ export function createManagedDatabase(name: string, requestedPath?: string) {
     initializeDatabase(nextDatabase);
     activateOpenDatabase(nextDatabase, nextPath);
   } catch (error) {
-    nextDatabase.close();
-    rmSync(nextPath, { force: true });
-    rmSync(`${nextPath}-wal`, { force: true });
-    rmSync(`${nextPath}-shm`, { force: true });
+    closeDatabase(nextDatabase);
+    removePathWithRetries(nextPath, { force: true });
+    removePathWithRetries(`${nextPath}-wal`, { force: true });
+    removePathWithRetries(`${nextPath}-shm`, { force: true });
     throw error;
   }
   return listManagedDatabases();
@@ -128,7 +129,7 @@ export function activateManagedDatabase(id: string) {
     initializeDatabase(nextDatabase);
     activateOpenDatabase(nextDatabase, nextPath);
   } catch (error) {
-    nextDatabase.close();
+    closeDatabase(nextDatabase);
     throw error;
   }
   return listManagedDatabases();
@@ -141,10 +142,10 @@ export function deleteManagedDatabase(id: string, confirm = false) {
   if (!target) throw new Error(`Database not found: ${id}`);
   if (target.active) throw new Error("The active database cannot be deleted. Activate another database first.");
 
-  rmSync(target.path);
-  rmSync(`${target.path}-wal`, { force: true });
-  rmSync(`${target.path}-shm`, { force: true });
-  rmSync(`${target.path}-journal`, { force: true });
+  removePathWithRetries(target.path);
+  removePathWithRetries(`${target.path}-wal`, { force: true });
+  removePathWithRetries(`${target.path}-shm`, { force: true });
+  removePathWithRetries(`${target.path}-journal`, { force: true });
   unregisterDatabasePath(target.path);
   return listManagedDatabases();
 }
@@ -230,14 +231,26 @@ function managedDatabasePath(id: string) {
 }
 
 function activateOpenDatabase(nextDatabase: SqliteDatabase, nextPath: string) {
-  const temporaryPointer = `${activeDatabasePointer}.${process.pid}.tmp`;
-  registerDatabasePath(nextPath);
-  writeFileSync(temporaryPointer, `${resolve(nextPath)}\n`, { encoding: "utf8", mode: 0o600 });
-  renameSync(temporaryPointer, activeDatabasePointer);
   const previousDatabase = db;
-  db = nextDatabase;
-  dbPath = nextPath;
-  previousDatabase.close();
+  const previousPath = dbPath;
+  closeDatabase(previousDatabase);
+  const temporaryPointer = `${activeDatabasePointer}.${process.pid}.tmp`;
+  try {
+    registerDatabasePath(nextPath);
+    writeFileSync(temporaryPointer, `${resolve(nextPath)}\n`, { encoding: "utf8", mode: 0o600 });
+    renameSync(temporaryPointer, activeDatabasePointer);
+    db = nextDatabase;
+    dbPath = nextPath;
+  } catch (error) {
+    db = openDatabase(previousPath);
+    dbPath = previousPath;
+    throw error;
+  }
+}
+
+function closeDatabase(database: SqliteDatabase) {
+  Bun.gc(true);
+  database.close(true);
 }
 
 // Say which database this process is using, always, on stderr so it cannot be
@@ -259,10 +272,10 @@ export function initializeDatabase(database: SqliteDatabase) {
 }
 
 function configureDatabase(database: SqliteDatabase) {
+  database.exec("PRAGMA busy_timeout = 5000");
   database.exec("PRAGMA journal_mode = WAL");
   database.exec("PRAGMA foreign_keys = ON");
   database.exec("PRAGMA synchronous = NORMAL");
-  database.exec("PRAGMA busy_timeout = 5000");
 }
 
 function createSchema(database: SqliteDatabase) {
