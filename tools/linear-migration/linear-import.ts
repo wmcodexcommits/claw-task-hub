@@ -44,7 +44,7 @@ class LinearMcpSession {
   private pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>();
 
   constructor() {
-    const command = process.env.CLAW_TASK_HUB_LINEAR_MCP_COMMAND ?? (platform() === "win32" ? "npx.cmd" : "npx");
+    const command = process.env.CLAW_TASK_HUB_LINEAR_MCP_COMMAND ?? (platform() === "win32" ? "bunx.exe" : "bunx");
     const args = [
       "-y",
       "mcp-remote",

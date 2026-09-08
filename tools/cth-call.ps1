@@ -53,11 +53,11 @@ $null = $payloadJson | ConvertFrom-Json
 $bytes = [System.Text.Encoding]::UTF8.GetBytes($payloadJson)
 $encoded = [Convert]::ToBase64String($bytes)
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
-$npm = if ($IsWindows -or $env:OS -eq 'Windows_NT') { 'npm.cmd' } else { 'npm' }
+$bun = if ($IsWindows -or $env:OS -eq 'Windows_NT') { 'bun.exe' } else { 'bun' }
 
 Push-Location $repoRoot
 try {
-  & $npm run hub -- tools/call $Tool "base64:$encoded"
+  & $bun run hub -- tools/call $Tool "base64:$encoded"
   exit $LASTEXITCODE
 } finally {
   Pop-Location

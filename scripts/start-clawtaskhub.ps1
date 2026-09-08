@@ -52,7 +52,7 @@ $ErrLog = Join-Path $LogDir "claw-task-hub-$RunStamp.err.log"
 Add-Content -Path $SupervisorLog -Value "[$(Get-Date -Format o)] Starting Claw Task Hub from $ProjectRoot; uiReady=$uiReady apiReady=$apiReady"
 
 $process = Start-Process `
-  -FilePath "npm.cmd" `
+  -FilePath "bun.exe" `
   -ArgumentList @("run", "dev") `
   -WorkingDirectory $ProjectRoot `
   -WindowStyle Hidden `

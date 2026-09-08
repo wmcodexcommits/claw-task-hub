@@ -56,12 +56,7 @@ The public repository must not include:
 Run these before any public release candidate:
 
 ```powershell
-npm run build
-npm run store-regression
-npm run harness-smoke
-npm run ui-smoke
-npm run lint
-npm run public-hygiene
+bun run verify
 ```
 
 The harness smoke is mandatory because it proves the core agent workflow works without the browser UI or external ticketing services.
@@ -85,7 +80,7 @@ Public docs should cover:
 
 ## Repository Hygiene
 
-- `npm run build` must not create tracked churn outside intended build artifacts.
+- `bun run build` must not create tracked churn outside intended build artifacts.
 - `git status --short` must be clean except deliberate release files.
 - Untracked local scratch files must remain untracked.
 - Do not commit the live local CTH database.
@@ -94,20 +89,24 @@ Public docs should cover:
 
 ## CI Candidate
 
-The initial GitHub Actions candidate lives at `.github/workflows/ci.yml`.
+The pull-request workflow lives at `.github/workflows/ci.yml`. It installs the
+pinned Bun version and dispatches the single `bun run verify` source on Linux.
+A smaller Windows portability job covers Windows-sensitive runtime, launcher,
+database, harness, and package paths without duplicating the browser suite.
+Superseded pull-request runs are cancelled, and ordinary branch pushes do not
+start a second copy of the same checks.
 
-It runs on `push` and `pull_request` across Windows and Linux with Node 24:
+Import `.github/rulesets/main.json` as the default-branch repository ruleset.
+It requires both stable check names, blocks deletion and force pushes, and
+requires pull requests. Local hooks improve feedback time; the ruleset is the
+server-side enforcement boundary.
 
-- install Node;
-- run `npm ci`;
-- run `npm run build`;
-- run `npm run store-regression`;
-- run `npm run harness-smoke`;
-- run `npm run ui-smoke`;
-- run `npm run lint`.
-- run `npm run public-hygiene`.
+`bun run ui-smoke` installs Playwright Chromium on demand and runs against an isolated temporary database, API, and Vite UI.
 
-`npm run ui-smoke` installs Playwright Chromium on demand and runs against an isolated temporary database, API, and Vite UI.
+The tag-only `.github/workflows/release.yml` accepts explicit SemVer-shaped
+tags, verifies the tag against `package.json`, builds and smoke-tests Linux,
+macOS, and Windows packages, then creates a GitHub Release containing those
+artifacts.
 
 ## Release Acceptance
 

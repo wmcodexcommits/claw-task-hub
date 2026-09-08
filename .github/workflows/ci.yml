@@ -1,57 +1,48 @@
 name: CI
 
 on:
-  push:
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: verification-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
-  core:
-    name: Core (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - ubuntu-latest
-          - windows-latest
-
+  verification:
+    name: Verification Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
 
-      - name: Set up Node
-        uses: actions/setup-node@v6
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
         with:
-          node-version: 24
-          cache: npm
+          bun-version: 1.3.14
 
-      - name: Install dependencies
-        run: npm ci
+      - name: Run canonical verification gate
+        run: bun run verify
 
-      - name: Build
-        run: npm run build
+  windows-portability:
+    name: Windows Portability
+    runs-on: windows-latest
+    timeout-minutes: 12
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
 
-      - name: Store regression
-        run: npm run store-regression
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
 
-      - name: Harness smoke
-        run: npm run harness-smoke
+      - name: Install from the canonical lockfile
+        run: bun install --frozen-lockfile
 
-      - name: Open context smoke
-        run: npm run open-context-smoke
-
-      - name: POSIX launcher smoke
-        run: npm run posix-launcher-smoke
-
-      - name: UI smoke
-        run: npm run ui-smoke
-
-      - name: Lint
-        run: npm run lint
-
-      - name: Public hygiene
-        run: npm run public-hygiene
+      - name: Verify Windows-sensitive runtime and package paths
+        run: bun run build && bun run store-regression && bun run harness-smoke && bun run open-context-smoke && bun run release-package-smoke

@@ -7,12 +7,12 @@ cd "$ROOT_DIR"
 mkdir -p logs
 
 if [ ! -d node_modules ]; then
-  if ! npm ci >> logs/claw-task-hub-launcher.out.log 2>> logs/claw-task-hub-launcher.err.log; then
-    npm install >> logs/claw-task-hub-launcher.out.log 2>> logs/claw-task-hub-launcher.err.log
+  if ! bun install --frozen-lockfile >> logs/claw-task-hub-launcher.out.log 2>> logs/claw-task-hub-launcher.err.log; then
+    bun install >> logs/claw-task-hub-launcher.out.log 2>> logs/claw-task-hub-launcher.err.log
   fi
 fi
 
-npm run pilot:start
+bun run pilot:start
 
 if command -v open >/dev/null 2>&1; then
   open "http://localhost:5173"

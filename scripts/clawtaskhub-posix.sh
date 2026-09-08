@@ -72,9 +72,9 @@ start() {
   cd "$project_root"
 
   if command -v setsid >/dev/null 2>&1; then
-    setsid sh -c 'exec npm run dev' >"$out_log" 2>"$err_log" </dev/null &
+    setsid sh -c 'exec bun run dev' >"$out_log" 2>"$err_log" </dev/null &
   else
-    nohup sh -c 'exec npm run dev' >"$out_log" 2>"$err_log" </dev/null &
+    nohup sh -c 'exec bun run dev' >"$out_log" 2>"$err_log" </dev/null &
   fi
 
   pid=$!

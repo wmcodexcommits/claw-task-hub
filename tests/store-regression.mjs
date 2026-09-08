@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import Database from "better-sqlite3";
+import { Database } from "bun:sqlite";
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -100,7 +100,7 @@ try {
   assert(indexExists(db, "idx_context_bindings_lookup"), "default DB did not create the context binding lookup index");
   assert(runMigrations().applied.length === 0, "default DB migrations are not idempotent");
 
-  const freshMigrationDb = new Database(join(tempDir, "fresh-migration.sqlite"));
+  const freshMigrationDb = new Database(join(tempDir, "fresh-migration.sqlite"), { strict: true });
   try {
     const freshMigration = initializeDatabase(freshMigrationDb);
     assert(freshMigration.applied.includes("0001_baseline_schema"), "fresh DB did not apply the baseline migration");
@@ -116,7 +116,7 @@ try {
     freshMigrationDb.close();
   }
 
-  const legacyMigrationDb = new Database(join(tempDir, "legacy-migration.sqlite"));
+  const legacyMigrationDb = new Database(join(tempDir, "legacy-migration.sqlite"), { strict: true });
   try {
     legacyMigrationDb.exec(`
       CREATE TABLE schema_migrations (
@@ -141,7 +141,7 @@ try {
     legacyMigrationDb.close();
   }
 
-  const existingMigrationDb = new Database(join(tempDir, "existing-migration.sqlite"));
+  const existingMigrationDb = new Database(join(tempDir, "existing-migration.sqlite"), { strict: true });
   try {
     existingMigrationDb.exec("CREATE TABLE preserved_marker (id TEXT PRIMARY KEY); INSERT INTO preserved_marker (id) VALUES ('keep-me');");
     const existingMigration = initializeDatabase(existingMigrationDb);
@@ -975,6 +975,6 @@ try {
 
 if (!storeRegressionFailed) console.log("Store regression passed");
 // The database and test directory are closed above. Exit explicitly because
-// better-sqlite3 on pinned Node 24.20 can otherwise finalize transient
-// Statement cleanup hooks after Node has already destroyed its Environment.
+// Keep transient prepared statements scoped so the native Bun handle can finalize
+// cleanup hooks after the surrounding test scope has already been destroyed.
 process.exit(storeRegressionFailed ? 1 : 0);

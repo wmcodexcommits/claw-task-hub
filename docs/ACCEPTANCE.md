@@ -33,12 +33,15 @@ The system should be useful to MCP-compatible clients, CLIs, and agent-driven de
 
 ## Review Gates
 
-- Build passes with `npm run build`.
-- Seed passes with `npm run seed`.
+- Canonical contribution and release gate passes with `bun run verify`.
+- Build passes with `bun run build`.
+- Seed passes with `bun run seed`.
 - API health returns OK on `http://127.0.0.1:4781/api/health`.
-- CLI smoke passes with `npm run hub -- tools/call dashboard "{}"`.
-- Store regression passes with `npm run store-regression`.
-- POSIX launcher smoke passes with `npm run posix-launcher-smoke`.
-- UI smoke passes with `npm run ui-smoke`.
-- Public hygiene passes with `npm run public-hygiene`.
+- CLI smoke passes with `bun run hub -- tools/call dashboard "{}"`.
+- Store regression passes with `bun run store-regression`.
+- POSIX launcher smoke passes with `bun run posix-launcher-smoke`.
+- UI smoke passes with `bun run ui-smoke`.
+- Public hygiene passes with `bun run public-hygiene`.
+- Release package smoke passes with `bun run release-package-smoke`.
+- The default-branch ruleset requires `Verification Gate` and `Windows Portability`.
 - Reviewer-opponent approves MVP direction before expanding import breadth.

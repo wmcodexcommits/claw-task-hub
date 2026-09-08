@@ -10,28 +10,28 @@ function assert(condition, message) {
 
 const tempDir = mkdtempSync(join(tmpdir(), "claw-task-hub-harness-"));
 const env = { ...process.env, CLAW_TASK_HUB_DB: join(tempDir, "harness-smoke.sqlite") };
-const npm = process.platform === "win32" ? "npm.cmd" : "npm";
+const bun = process.platform === "win32" ? "bun.exe" : "bun";
 
-function runNpm(args, input) {
+function runBun(args, input) {
   if (process.platform === "win32") {
-    return spawnSync(process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", ["npm", ...args].join(" ")], {
+    return spawnSync(process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", ["bun", ...args].join(" ")], {
       cwd: process.cwd(),
       env,
       encoding: "utf8",
       input,
     });
   }
-  return spawnSync(npm, args, { cwd: process.cwd(), env, encoding: "utf8", input });
+  return spawnSync(bun, args, { cwd: process.cwd(), env, encoding: "utf8", input });
 }
 
-function runNpmAsync(args) {
+function runBunAsync(args) {
   const child = process.platform === "win32"
-    ? spawn(process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", ["npm", ...args].join(" ")], {
+    ? spawn(process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", ["bun", ...args].join(" ")], {
       cwd: process.cwd(),
       env,
       windowsHide: true,
     })
-    : spawn(npm, args, { cwd: process.cwd(), env });
+    : spawn(bun, args, { cwd: process.cwd(), env });
   let stdout = "";
   let stderr = "";
   child.stdout?.on("data", (chunk) => {
@@ -50,9 +50,9 @@ function runHub(mode, tool, payload = {}) {
   const raw = JSON.stringify(payload);
   const b64 = Buffer.from(raw, "utf8").toString("base64");
   const args = mode === "tools/list"
-    ? ["run", "-s", "hub", "--", "tools/list"]
-    : ["run", "-s", "hub", "--", "tools/call", tool, `base64:${b64}`];
-  const result = runNpm(args);
+    ? ["run", "--silent", "hub", "--", "tools/list"]
+    : ["run", "--silent", "hub", "--", "tools/call", tool, `base64:${b64}`];
+  const result = runBun(args);
   if (result.status !== 0) {
     throw new Error(`hub ${tool ?? mode} failed\nerror:\n${result.error ?? ""}\nstdout:\n${result.stdout ?? ""}\nstderr:\n${result.stderr ?? ""}`);
   }
@@ -62,7 +62,7 @@ function runHub(mode, tool, payload = {}) {
 async function runHubAsync(tool, payload = {}) {
   const raw = JSON.stringify(payload);
   const b64 = Buffer.from(raw, "utf8").toString("base64");
-  const result = await runNpmAsync(["run", "-s", "hub", "--", "tools/call", tool, `base64:${b64}`]);
+  const result = await runBunAsync(["run", "--silent", "hub", "--", "tools/call", tool, `base64:${b64}`]);
   if (result.status !== 0) {
     throw new Error(`hub ${tool} failed\nerror:\n${result.error ?? ""}\nstdout:\n${result.stdout ?? ""}\nstderr:\n${result.stderr ?? ""}`);
   }
@@ -73,13 +73,13 @@ function runHubExpectFailure(tool, payload = {}) {
   const raw = JSON.stringify(payload);
   const b64 = Buffer.from(raw, "utf8").toString("base64");
   const started = Date.now();
-  const result = runNpm(["run", "-s", "hub", "--", "tools/call", tool, `base64:${b64}`]);
+  const result = runBun(["run", "--silent", "hub", "--", "tools/call", tool, `base64:${b64}`]);
   return { ...result, elapsedMs: Date.now() - started };
 }
 
 function runMigrationExpectFailure(args = ["import", "--pages", "1"]) {
   const started = Date.now();
-  const result = runNpm(["run", "-s", "migrate:linear", "--", ...args]);
+  const result = runBun(["run", "--silent", "migrate:linear", "--", ...args]);
   return { ...result, elapsedMs: Date.now() - started };
 }
 
@@ -89,7 +89,7 @@ function runMcpToolsList() {
     JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }),
     "",
   ].join("\n");
-  const result = runNpm(["run", "-s", "mcp"], input);
+  const result = runBun(["run", "--silent", "mcp"], input);
   if (result.status !== 0) {
     throw new Error(`mcp tools/list failed\nstdout:\n${result.stdout ?? ""}\nstderr:\n${result.stderr ?? ""}`);
   }
@@ -109,7 +109,7 @@ function runMcpTool(tool, payload = {}) {
     "",
   ].join("\n");
   const started = Date.now();
-  const result = runNpm(["run", "-s", "mcp"], input);
+  const result = runBun(["run", "--silent", "mcp"], input);
   if (result.status !== 0) {
     throw new Error(`mcp ${tool} process failed\nstdout:\n${result.stdout ?? ""}\nstderr:\n${result.stderr ?? ""}`);
   }
@@ -121,16 +121,24 @@ function runMcpTool(tool, payload = {}) {
   return { message: call, elapsedMs: Date.now() - started };
 }
 
-function spawnNpm(args, extraEnv = {}) {
+function runMcpToolResult(tool, payload = {}) {
+  const call = runMcpTool(tool, payload);
+  if (call.message?.error) throw new Error(`MCP ${tool} failed: ${call.message.error.message}`);
+  const text = call.message?.result?.content?.[0]?.text;
+  if (typeof text !== "string") throw new Error(`MCP ${tool} returned no text result`);
+  return JSON.parse(text);
+}
+
+function spawnBun(args, extraEnv = {}) {
   const childEnv = { ...env, ...extraEnv };
   if (process.platform === "win32") {
-    return spawn(process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", ["npm", ...args].join(" ")], {
+    return spawn(process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", ["bun", ...args].join(" ")], {
       cwd: process.cwd(),
       env: childEnv,
       windowsHide: true,
     });
   }
-  return spawn(npm, args, { cwd: process.cwd(), env: childEnv, detached: true });
+  return spawn(bun, args, { cwd: process.cwd(), env: childEnv, detached: true });
 }
 
 async function stopProcessTree(child) {
@@ -177,7 +185,7 @@ function getFreePort() {
 
 async function assertApiLinearImportAbsent() {
   const port = await getFreePort();
-  const child = spawnNpm(["run", "-s", "api"], { PORT: String(port) });
+  const child = spawnBun(["run", "--silent", "api"], { PORT: String(port) });
   let stdout = "";
   let stderr = "";
   child.stdout?.on("data", (chunk) => {
@@ -208,7 +216,7 @@ async function assertApiLinearImportAbsent() {
 }
 
 async function assertApiRejectsUnsafeBind() {
-  const child = spawnNpm(["run", "-s", "api"], { CLAW_TASK_HUB_HOST: "0.0.0.0" });
+  const child = spawnBun(["run", "--silent", "api"], { CLAW_TASK_HUB_HOST: "0.0.0.0" });
   let stderr = "";
   child.stderr?.on("data", (chunk) => {
     stderr += chunk.toString();
@@ -223,7 +231,7 @@ async function assertApiRejectsUnsafeBind() {
 async function assertUnsafeBindStillChecksCors() {
   const port = await getFreePort();
   const allowedOrigin = "https://trusted.example";
-  const child = spawnNpm(["run", "-s", "api"], {
+  const child = spawnBun(["run", "--silent", "api"], {
     PORT: String(port),
     CLAW_TASK_HUB_HOST: "0.0.0.0",
     CLAW_TASK_HUB_UNSAFE_BIND: "1",
@@ -263,13 +271,82 @@ async function assertUnsafeBindStillChecksCors() {
   }
 }
 
+async function assertApiCrudParity() {
+  const port = await getFreePort();
+  const child = spawnBun(["run", "--silent", "api"], { PORT: String(port) });
+  let diagnostics = "";
+  child.stdout?.on("data", (chunk) => { diagnostics += chunk.toString(); });
+  child.stderr?.on("data", (chunk) => { diagnostics += chunk.toString(); });
+  const base = `http://127.0.0.1:${port}/api`;
+  const request = async (path, options = {}) => {
+    const response = await fetch(`${base}${path}`, {
+      ...options,
+      headers: { "content-type": "application/json", ...options.headers },
+    });
+    const body = await response.json();
+    return { response, body };
+  };
+  try {
+    for (let attempt = 0; attempt < 60; attempt += 1) {
+      try {
+        const response = await fetch(`${base}/health`);
+        if (response.ok) break;
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      if (attempt === 59) throw new Error(`API did not start\n${diagnostics}`);
+    }
+
+    const projectId = "api-crud-project";
+    let result = await request("/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: projectId, name: "API CRUD Project", status: "Todo", priority: 2 }),
+    });
+    assert(result.response.status === 201 && result.body.project.id === projectId, "HTTP create project failed");
+    result = await request(`/projects/${projectId}`);
+    assert(result.response.ok && result.body.project.name === "API CRUD Project", "HTTP get project failed");
+    result = await request(`/projects/${projectId}`, { method: "PATCH", body: JSON.stringify({ status: "In Progress" }) });
+    assert(result.response.ok && result.body.project.status === "In Progress", "HTTP update project failed");
+
+    result = await request("/issues", {
+      method: "POST",
+      body: JSON.stringify({ id: "api-crud-issue", identifier: "API-1", title: "API CRUD Issue", project_id: projectId, status: "Todo", priority: 2 }),
+    });
+    assert(result.response.ok && result.body.issue.id === "api-crud-issue", "HTTP create issue failed");
+    result = await request("/issues/API-1");
+    assert(result.response.ok && result.body.issue.title === "API CRUD Issue", "HTTP get issue failed");
+    result = await request("/issues/API-1", { method: "PATCH", body: JSON.stringify({ status: "In Progress" }) });
+    assert(result.response.ok && result.body.issue.status === "In Progress", "HTTP update issue failed");
+    result = await request("/issues/API-1", { method: "DELETE", body: JSON.stringify({ confirm: false }) });
+    assert(result.response.status === 400, "HTTP issue deletion did not fail closed without confirmation");
+    result = await request("/issues/API-1", { method: "DELETE", body: JSON.stringify({ confirm: true }) });
+    assert(result.response.ok && result.body.deleted === true, "HTTP delete issue failed");
+    result = await request(`/projects/${projectId}`, { method: "DELETE", body: JSON.stringify({ confirm: true }) });
+    assert(result.response.ok && result.body.deleted === true, "HTTP delete project failed");
+
+    result = await request("/databases", { method: "POST", body: JSON.stringify({ name: "API CRUD Database" }) });
+    assert(result.response.status === 201 && result.body.active.id === "api-crud-database.sqlite", "HTTP create database failed");
+    result = await request("/databases/api-crud-database.sqlite");
+    assert(result.response.ok && result.body.database.active === true, "HTTP get database failed");
+    result = await request("/databases/harness-smoke.sqlite", { method: "PATCH", body: JSON.stringify({ active: true }) });
+    assert(result.response.ok && result.body.active.id === "harness-smoke.sqlite", "HTTP update database failed");
+    result = await request("/databases/api-crud-database.sqlite", { method: "DELETE", body: JSON.stringify({ confirm: false }) });
+    assert(result.response.status === 400, "HTTP database deletion did not fail closed without confirmation");
+    result = await request("/databases/api-crud-database.sqlite", { method: "DELETE", body: JSON.stringify({ confirm: true }) });
+    assert(result.response.ok && !result.body.databases.some((database) => database.id === "api-crud-database.sqlite"), "HTTP delete database failed");
+  } finally {
+    await stopProcessTree(child);
+  }
+}
+
 try {
   const tools = runHub("tools/list");
   assert(!tools.tools.includes("import_linear"), "import_linear must not be exposed to normal harness tools");
   assert(!tools.tools.includes("backfill_linear_descriptions"), "backfill_linear_descriptions must not be exposed to normal harness tools");
   for (const name of [
-    "dashboard", "list_projects", "refresh_data", "get_project", "save_project", "list_project_updates", "save_project_update",
-    "save_issue", "get_issue", "save_comment", "list_issue_dependencies", "save_issue_dependency",
+    "dashboard", "refresh_data", "list_databases", "get_database", "create_database", "update_database", "activate_database", "delete_database",
+    "list_projects", "get_project", "create_project", "update_project", "save_project", "delete_project", "list_project_updates", "save_project_update",
+    "list_issues", "get_issue", "create_issue", "update_issue", "save_issue", "delete_issue", "save_comment", "list_issue_dependencies", "save_issue_dependency",
     "resolve_issue_dependency", "start_agent_session", "claim_issue", "release_issue_claim",
     "save_context_binding", "resolve_context_project",
   ]) {
@@ -289,6 +366,9 @@ try {
   const saveIssueSchema = mcpTools.find((tool) => tool.name === "save_issue")?.inputSchema?.properties;
   assert(saveIssueSchema?.issue_id?.type === "string", "MCP save_issue schema does not advertise issue_id:string");
   assert(saveIssueSchema?.allow_no_project?.type === "boolean", "MCP save_issue schema does not advertise allow_no_project:boolean");
+  const acceptIssueSchema = mcpTools.find((tool) => tool.name === "accept_issue")?.inputSchema;
+  assert(acceptIssueSchema?.required?.includes("issue_id"), "MCP accept_issue schema does not require issue_id");
+  assert(acceptIssueSchema?.required?.includes("body"), "MCP accept_issue schema does not require acceptance evidence");
   const releaseClaimSchema = mcpTools.find((tool) => tool.name === "release_issue_claim")?.inputSchema?.properties;
   assert(releaseClaimSchema?.claim_id?.type === "string", "MCP release_issue_claim schema does not advertise claim_id:string");
   const saveContextBindingSchema = mcpTools.find((tool) => tool.name === "save_context_binding")?.inputSchema;
@@ -305,9 +385,63 @@ try {
   const saveDependencySchema = mcpTools.find((tool) => tool.name === "save_issue_dependency")?.inputSchema;
   assert(saveDependencySchema?.required?.includes("issue_id"), "MCP save_issue_dependency schema does not require issue_id");
   assert(saveDependencySchema?.required?.includes("blocker_issue_id"), "MCP save_issue_dependency schema does not require blocker_issue_id");
+  for (const destructiveTool of ["delete_database", "delete_project", "delete_issue"]) {
+    const schema = mcpTools.find((tool) => tool.name === destructiveTool)?.inputSchema;
+    assert(schema?.required?.includes("confirm"), `MCP ${destructiveTool} does not require explicit confirmation`);
+    assert(schema?.properties?.confirm?.const === true, `MCP ${destructiveTool} confirmation is not constrained to true`);
+  }
 
   const dashboard = runHub("tools/call", "dashboard");
   assert(dashboard.counts.projects === 0, "fresh harness DB should start with no projects");
+
+  const crudProject = runMcpToolResult("create_project", {
+    id: "mcp-crud-project",
+    name: "MCP CRUD Project",
+    status: "Backlog",
+    priority: 2,
+  }).project;
+  assert(crudProject.id === "mcp-crud-project", "MCP create_project returned the wrong project");
+  assert(runMcpToolResult("get_project", { id: crudProject.id }).project.project.name === "MCP CRUD Project", "MCP get_project missed the created project");
+  const updatedCrudProject = runMcpToolResult("update_project", { id: crudProject.id, status: "In Progress" }).project;
+  assert(updatedCrudProject.status === "In Progress", "MCP update_project did not update the existing project");
+  const missingProjectUpdate = runMcpTool("update_project", { id: "missing-project", status: "Done" });
+  assert(missingProjectUpdate.message?.error?.message?.includes("Project not found"), "MCP update_project silently created a missing project");
+  const crudIssue = runMcpToolResult("create_issue", {
+    id: "mcp-crud-issue",
+    identifier: "CRUD-1",
+    title: "MCP CRUD Issue",
+    project_id: crudProject.id,
+    status: "Todo",
+    priority: 2,
+  }).issue;
+  assert(crudIssue.id === "mcp-crud-issue", "MCP create_issue returned the wrong issue");
+  assert(runMcpToolResult("get_issue", { id: "CRUD-1" }).issue.title === "MCP CRUD Issue", "MCP get_issue missed the created issue");
+  const updatedCrudIssue = runMcpToolResult("update_issue", { id: "CRUD-1", status: "In Progress" }).issue;
+  assert(updatedCrudIssue.status === "In Progress", "MCP update_issue did not update the existing issue");
+  const rejectedAcceptance = runMcpTool("accept_issue", { issue_id: "CRUD-1", body: " " });
+  assert(rejectedAcceptance.message?.error?.message?.includes("requires body"), "MCP accept_issue accepted empty evidence");
+  assert(runMcpToolResult("get_issue", { id: "CRUD-1" }).issue.status === "In Progress", "Failed MCP acceptance closed the issue");
+  const acceptedCrudIssue = runMcpToolResult("accept_issue", { issue_id: "CRUD-1", body: "CRUD lifecycle evidence passed." });
+  assert(acceptedCrudIssue.issue.status_type === "completed", "MCP accept_issue did not complete the issue");
+  assert(acceptedCrudIssue.comment.body.startsWith("Acceptance:"), "MCP accept_issue did not normalize the acceptance trail");
+  assert(runMcpToolResult("get_issue", { id: "CRUD-1" }).issue.last_acceptance_comment.id === acceptedCrudIssue.comment.id, "MCP accept_issue did not persist evidence before completion");
+  const unconfirmedIssueDelete = runMcpTool("delete_issue", { id: "CRUD-1" });
+  assert(unconfirmedIssueDelete.message?.error?.message?.includes("confirm=true"), "MCP delete_issue did not fail closed without confirmation");
+  assert(runMcpToolResult("delete_issue", { id: "CRUD-1", confirm: true }).deleted === true, "MCP delete_issue did not delete the issue");
+  assert(runMcpToolResult("get_issue", { id: "CRUD-1" }).issue === null, "MCP deleted issue is still readable");
+  assert(runMcpToolResult("delete_project", { id: crudProject.id, confirm: true }).deleted === true, "MCP delete_project did not delete the empty project");
+  assert(runMcpToolResult("get_project", { id: crudProject.id }).project === null, "MCP deleted project is still readable");
+
+  const createdDatabaseCatalogue = runMcpToolResult("create_database", { name: "Harness CRUD Database" });
+  const createdDatabaseId = createdDatabaseCatalogue.active.id;
+  assert(createdDatabaseId === "harness-crud-database.sqlite", `MCP create_database returned unexpected id ${createdDatabaseId}`);
+  assert(runMcpToolResult("get_database", { id: createdDatabaseId }).database?.active === true, "MCP get_database missed the active created database");
+  const restoredDatabaseCatalogue = runMcpToolResult("update_database", { id: "harness-smoke.sqlite", active: true });
+  assert(restoredDatabaseCatalogue.active.id === "harness-smoke.sqlite", "MCP update_database did not activate the requested database");
+  const unconfirmedDatabaseDelete = runMcpTool("delete_database", { id: createdDatabaseId });
+  assert(unconfirmedDatabaseDelete.message?.error?.message?.includes("confirm=true"), "MCP delete_database did not fail closed without confirmation");
+  const deletedDatabaseCatalogue = runMcpToolResult("delete_database", { id: createdDatabaseId, confirm: true });
+  assert(!deletedDatabaseCatalogue.databases.some((database) => database.id === createdDatabaseId), "MCP delete_database left the database registered");
 
   const project = runHub("tools/call", "save_project", {
     external_id: "harness-smoke-project",
@@ -331,6 +465,19 @@ try {
   const projects = runHub("tools/call", "list_projects").projects;
   assert(projects.some((item) => item.id === project.id), "list_projects did not return the saved project");
   assert(projects.filter((item) => item.external_id === "harness-smoke-project").length === 1, "save_project external_id update duplicated a project");
+  const cliAcceptanceTarget = runHub("tools/call", "create_issue", {
+    id: "cli-acceptance-target",
+    identifier: "SAFE-1",
+    title: "CLI acceptance target",
+    project_id: project.id,
+    status: "In Progress",
+  }).issue;
+  const cliAcceptance = runHub("tools/call", "accept_issue", {
+    issue_id: cliAcceptanceTarget.identifier,
+    body: "CLI acceptance-safe completion passed.",
+  });
+  assert(cliAcceptance.issue.status_type === "completed", "CLI accept_issue did not complete its target");
+  assert(cliAcceptance.issue.last_acceptance_comment.id === cliAcceptance.comment.id, "CLI accept_issue did not return the stored acceptance trail");
   const firstProjectUpdate = runHub("tools/call", "save_project_update", {
     external_id: "harness-smoke-update",
     project_id: project.id,
@@ -613,6 +760,7 @@ try {
   await assertApiLinearImportAbsent();
   await assertApiRejectsUnsafeBind();
   await assertUnsafeBindStillChecksCors();
+  await assertApiCrudParity();
 
   console.log("Harness smoke passed");
 } finally {

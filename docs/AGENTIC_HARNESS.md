@@ -33,14 +33,14 @@ This is the preferred human-facing path. CLI launchers and MCP calls are for age
 
 ## Controlled Pilot Startup
 
-For interactive development, `npm run dev` is enough. For a controlled pilot on Linux or macOS, harnesses should not launch `npm run dev` through plain `nohup`: some parent shells still terminate the process tree when the shell exits.
+For interactive development, `bun run dev` is enough. For a controlled pilot on Linux or macOS, harnesses should not launch `bun run dev` through plain `nohup`: some parent shells still terminate the process tree when the shell exits.
 
 Use the supplied detached pilot launcher:
 
 ```bash
-npm run pilot:start
-npm run pilot:status
-npm run pilot:stop
+bun run pilot:start
+bun run pilot:status
+bun run pilot:stop
 ```
 
 Launcher behavior:
@@ -92,7 +92,7 @@ Use these statuses unless a project has a documented local exception:
 - `completed`: `Done`
 - `canceled`: `Canceled`
 
-When a task is done, write an acceptance comment before or while moving it to `Done`.
+When a task is done, use `accept_issue` so acceptance evidence is persisted before the issue moves to `Done`. Direct `save_comment` plus `save_issue` remains available for staged or imported workflows, but callers must fail fast between those operations.
 
 Claims enforce this workflow: claiming ready work moves it to `In Progress`, releasing unfinished work moves it to `Todo`, and completing a claim moves it to `Done`. Record real blockers with `save_issue_dependency`; an unresolved dependency makes the issue effectively `Blocked` without discarding its underlying ready/in-progress state. Resolve it with `resolve_issue_dependency`. Priority is urgency, not blocker state.
 
@@ -133,19 +133,19 @@ Codex users should not rely on opening bare `http://localhost:5173` from the sid
 Create a local project for a workspace, bind it, write a shortcut, and open the UI:
 
 ```powershell
-npm run open:context -- --harness codex --cwd C:/work/my-repo --project-name "My Repo" --create-project --write-shortcut --open
+bun run open:context -- --harness codex --cwd C:/work/my-repo --project-name "My Repo" --create-project --write-shortcut --open
 ```
 
 Bind an existing Claw Task Hub project:
 
 ```powershell
-npm run open:context -- --harness codex --cwd C:/work/my-repo --project-id project_my_repo --write-shortcut --open
+bun run open:context -- --harness codex --cwd C:/work/my-repo --project-id project_my_repo --write-shortcut --open
 ```
 
 Open an already-bound workspace:
 
 ```powershell
-npm run codex:open -- --cwd C:/work/my-repo
+bun run codex:open -- --cwd C:/work/my-repo
 ```
 
 The command returns JSON with the resolved `url`, `url_path`, `project`, and `context_key`. Agents can read that URL and hand it to the harness browser. Humans can use the generated `Open Claw Task Hub.url` shortcut or the generated `OPEN_CLAW_TASK_HUB.md` file when a harness exposes project files more reliably than local-app suggestions. Other harnesses can use the same command by changing `--harness`.
@@ -167,7 +167,7 @@ Create or update a binding:
 ```powershell
 $json = '{"context_key":"codex:C:/work/my-repo","project_id":"project_my_repo","default_tab":"issues","harness":"codex","cwd":"C:/work/my-repo","repo_remote":"https://github.com/example/my-repo.git","branch":"main"}'
 $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
-npm run hub -- tools/call save_context_binding "base64:$b64"
+bun run hub -- tools/call save_context_binding "base64:$b64"
 ```
 
 Resolve by exact key:
@@ -175,7 +175,7 @@ Resolve by exact key:
 ```powershell
 $json = '{"context_key":"codex:C:/work/my-repo"}'
 $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
-npm run hub -- tools/call resolve_context_project "base64:$b64"
+bun run hub -- tools/call resolve_context_project "base64:$b64"
 ```
 
 Resolve by repository or working directory when the exact key is unavailable:
@@ -183,7 +183,7 @@ Resolve by repository or working directory when the exact key is unavailable:
 ```powershell
 $json = '{"harness":"codex","cwd":"C:/work/my-repo","repo_remote":"https://github.com/example/my-repo.git","branch":"main"}'
 $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
-npm run hub -- tools/call resolve_context_project "base64:$b64"
+bun run hub -- tools/call resolve_context_project "base64:$b64"
 ```
 
 Resolution order is deterministic: exact `context_key`, then `thread_id`, `cwd`, `repo_remote + branch`, `repo_remote`, and finally harness-scoped fallbacks. A resolved binding returns `project`, `binding`, and `url_path`.
@@ -218,13 +218,13 @@ Accepted: comments can contain "quotes", `ticks`, and multiple lines.
 Dashboard:
 
 ```powershell
-npm run hub -- tools/call dashboard "{}"
+bun run hub -- tools/call dashboard "{}"
 ```
 
 List projects:
 
 ```powershell
-npm run hub -- tools/call list_projects "{}"
+bun run hub -- tools/call list_projects "{}"
 ```
 
 Project routing is mandatory for new issues. Always select the owning project from `list_projects` and pass its `project_id` to `save_issue`. Do not copy a project id from an unrelated example or another project. Claw Task Hub intentionally rejects new issues with no project or an unknown project; `allow_no_project:true` is only for a deliberate unassigned inbox issue.
@@ -234,7 +234,7 @@ List open issues in a selected project:
 ```powershell
 $json = '{"project_id":"<target-project-id>","include_done":false,"limit":50}'
 $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
-npm run hub -- tools/call list_issues "base64:$b64"
+bun run hub -- tools/call list_issues "base64:$b64"
 ```
 
 For active-work discovery, pass `include_done:false`. This excludes normalized `completed` issues even if old imported rows have inconsistent raw status metadata.
@@ -244,7 +244,7 @@ Create a local issue:
 ```powershell
 $json = '{"title":"Document agentic harness contract","description":"Write the canonical harness contract and link it from README and AGENTS.","project_id":"<target-project-id>","team_id":"team_local","parent_id":"LOCAL-1","priority":1,"status":"Todo","status_type":"unstarted","labels":["agentic-harness","docs"],"source":"local"}'
 $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
-npm run hub -- tools/call save_issue "base64:$b64"
+bun run hub -- tools/call save_issue "base64:$b64"
 ```
 
 Move an issue to active work:
@@ -252,7 +252,7 @@ Move an issue to active work:
 ```powershell
 $json = '{"id":"CTH-267","status":"In Progress","status_type":"started"}'
 $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
-npm run hub -- tools/call save_issue "base64:$b64"
+bun run hub -- tools/call save_issue "base64:$b64"
 ```
 
 Add an acceptance comment:
@@ -260,7 +260,7 @@ Add an acceptance comment:
 ```powershell
 $json = '{"issue_id":"CTH-267","body":"Accepted: documentation exists, links are updated, build and regression checks pass.","author":"Demo Agent","source":"local"}'
 $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
-npm run hub -- tools/call save_comment "base64:$b64"
+bun run hub -- tools/call save_comment "base64:$b64"
 ```
 
 Close an issue:
@@ -268,7 +268,7 @@ Close an issue:
 ```powershell
 $json = '{"id":"CTH-267","status":"Done","status_type":"completed"}'
 $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
-npm run hub -- tools/call save_issue "base64:$b64"
+bun run hub -- tools/call save_issue "base64:$b64"
 ```
 
 ## MCP Tool Surface
@@ -287,6 +287,7 @@ Canonical tool names:
 - `get_issue`
 - `save_issue`
 - `save_comment`
+- `accept_issue`
 - `list_issue_dependencies`
 - `save_issue_dependency`
 - `resolve_issue_dependency`
@@ -317,23 +318,23 @@ Use the claim protocol when CLI/MCP tools are available:
 ```powershell
 $json = '{"id":"session-demo-agent-001","agent_name":"Demo Agent","harness":"CLI","ttl_minutes":60,"metadata":{"thread":"local"}}'
 $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
-npm run hub -- tools/call start_agent_session "base64:$b64"
+bun run hub -- tools/call start_agent_session "base64:$b64"
 
 $json = '{"session_id":"session-demo-agent-001","ttl_minutes":60}'
 $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
-npm run hub -- tools/call heartbeat_agent_session "base64:$b64"
+bun run hub -- tools/call heartbeat_agent_session "base64:$b64"
 
 $json = '{"issue_id":"CTH-268","session_id":"session-demo-agent-001","note":"Implement claim protocol","ttl_minutes":60}'
 $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
-npm run hub -- tools/call claim_issue "base64:$b64"
+bun run hub -- tools/call claim_issue "base64:$b64"
 
 $json = '{"issue_id":"CTH-268","session_id":"session-demo-agent-001"}'
 $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
-npm run hub -- tools/call list_issue_claims "base64:$b64"
+bun run hub -- tools/call list_issue_claims "base64:$b64"
 
 $json = '{"issue_id":"CTH-268","session_id":"session-demo-agent-001","status":"completed"}'
 $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
-npm run hub -- tools/call release_issue_claim "base64:$b64"
+bun run hub -- tools/call release_issue_claim "base64:$b64"
 ```
 
 Claim rules:
@@ -359,11 +360,11 @@ Use [GITHUB_OSS_READINESS.md](GITHUB_OSS_READINESS.md) as the public GitHub rele
 
 Before public GitHub publication, the repo should pass:
 
-- `npm run build`
-- `npm run lint`
-- `npm run store-regression`
-- `npm run harness-smoke`
-- `npm run ui-smoke`
-- `npm run public-hygiene`
+- `bun run build`
+- `bun run lint`
+- `bun run store-regression`
+- `bun run harness-smoke`
+- `bun run ui-smoke`
+- `bun run public-hygiene`
 - a secret scan and data exclusion review
 - README, license, sample config, and contribution documentation review

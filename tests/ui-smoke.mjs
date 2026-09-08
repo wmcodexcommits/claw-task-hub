@@ -4,7 +4,7 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
-import Database from "better-sqlite3";
+import { Database } from "bun:sqlite";
 
 const tempDir = mkdtempSync(join(tmpdir(), "claw-task-hub-ui-smoke-"));
 const apiPort = await getFreePort();
@@ -12,6 +12,7 @@ const webPort = await getFreePort();
 const env = {
   ...process.env,
   CLAW_TASK_HUB_DB: join(tempDir, "ui-smoke.sqlite"),
+  CLAW_TASK_HUB_API_BASE: `http://127.0.0.1:${apiPort}/api`,
   CLAW_TASK_HUB_CORS_ORIGINS: `http://127.0.0.1:${webPort},http://localhost:${webPort}`,
   VITE_CLAW_TASK_HUB_API_BASE: `http://127.0.0.1:${apiPort}/api`,
 };
@@ -38,15 +39,15 @@ function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
-function runNpm(args) {
-  const result = spawnNpmSync(args, {
+function runBun(args) {
+  const result = spawnBunSync(args, {
     cwd: process.cwd(),
     env,
     encoding: "utf8",
   });
   if (result.status !== 0) {
     throw new Error(
-      `npm ${args.join(" ")} failed` +
+      `bun ${args.join(" ")} failed` +
         `\nerror:\n${result.error?.message ?? ""}` +
         `\nstdout:\n${result.stdout ?? ""}` +
         `\nstderr:\n${result.stderr ?? ""}`,
@@ -55,38 +56,38 @@ function runNpm(args) {
   return result.stdout;
 }
 
-function spawnNpmSync(args, options) {
+function spawnBunSync(args, options) {
   if (process.platform !== "win32") {
-    return spawnSync("npm", args, options);
+    return spawnSync("bun", args, options);
   }
-  return spawnSync(process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", npmCommand(args)], {
+  return spawnSync(process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", bunCommand(args)], {
     ...options,
     windowsHide: true,
   });
 }
 
-function spawnNpm(args, options) {
+function spawnBun(args, options) {
   if (process.platform !== "win32") {
-    return spawn("npm", args, { ...options, detached: true });
+    return spawn("bun", args, { ...options, detached: true });
   }
-  return spawn(process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", npmCommand(args)], {
+  return spawn(process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", bunCommand(args)], {
     ...options,
     windowsHide: true,
   });
 }
 
-function npmCommand(args) {
-  return ["npm", ...args.map((arg) => String(arg))].join(" ");
+function bunCommand(args) {
+  return ["bun", ...args.map((arg) => String(arg))].join(" ");
 }
 
 function runHub(tool, payload = {}) {
   const raw = JSON.stringify(payload);
   const b64 = Buffer.from(raw, "utf8").toString("base64");
-  return JSON.parse(runNpm(["run", "-s", "hub", "--", "tools/call", tool, `base64:${b64}`]));
+  return JSON.parse(runBun(["run", "--silent", "hub", "--", "tools/call", tool, `base64:${b64}`]));
 }
 
 function seedBulkTodoIssues(count) {
-  const database = new Database(env.CLAW_TASK_HUB_DB);
+  const database = new Database(env.CLAW_TASK_HUB_DB, { strict: true });
   try {
     const insert = database.prepare(`
       INSERT INTO issues (id, identifier, title, description, status, status_type, priority, project_id, team_id, labels, source, created_at, updated_at)
@@ -143,7 +144,7 @@ async function waitForUrl(url, timeoutMs = 20000) {
 }
 
 async function ensureProcess(url, args, extraEnv = {}) {
-  const child = spawnNpm(args, {
+  const child = spawnBun(args, {
     cwd: process.cwd(),
     stdio: ["ignore", "pipe", "pipe"],
     env: { ...env, ...extraEnv },
@@ -249,7 +250,7 @@ async function waitForAppShell() {
 }
 
 try {
-runNpm(["run", "-s", "seed"]);
+runBun(["run", "--silent", "seed"]);
 runHub("save_project", {
   id: "project_claw_task_hub_mvp",
   status: "In Progress",
@@ -362,8 +363,8 @@ runHub("save_context_binding", {
   metadata: { smoke: true },
 });
 
-await ensureProcess(`http://127.0.0.1:${apiPort}/api/health`, ["run", "-s", "api"], { PORT: String(apiPort) });
-await ensureProcess(`http://127.0.0.1:${webPort}/`, ["run", "-s", "dev:web", "--", "--host", "127.0.0.1", "--port", String(webPort), "--strictPort"]);
+await ensureProcess(`http://127.0.0.1:${apiPort}/api/health`, ["run", "--silent", "api"], { PORT: String(apiPort) });
+await ensureProcess(`http://127.0.0.1:${webPort}/`, ["run", "--silent", "dev:web", "--", "--host", "127.0.0.1", "--port", String(webPort), "--strictPort"]);
 
 await page.goto(`http://127.0.0.1:${webPort}/projects/project_claw_task_hub_mvp/issues`, { waitUntil: "domcontentloaded" });
 await waitForAppShell();
@@ -382,6 +383,20 @@ await page.goto(`http://127.0.0.1:${webPort}/contexts/${encodeURIComponent("ui-s
 await waitForAppShell();
 const projectUpdateBody = `UI smoke project update ${Date.now()}`;
 await page.getByLabel("Project update").waitFor({ state: "visible", timeout: 15000 });
+const updateComposerStyles = await page.getByLabel("Project update").evaluate((textarea) => {
+  const style = getComputedStyle(textarea);
+  const composerStyle = getComputedStyle(textarea.closest(".update-composer"));
+  return {
+    resize: style.resize,
+    fieldPadding: style.padding,
+    composerPadding: composerStyle.padding,
+    radius: style.borderRadius,
+  };
+});
+assert(updateComposerStyles.resize === "none", `Project update textarea remains resizable: ${JSON.stringify(updateComposerStyles)}`);
+assert(updateComposerStyles.fieldPadding === "12px", `Project update textarea padding is not canonical: ${JSON.stringify(updateComposerStyles)}`);
+assert(updateComposerStyles.composerPadding === "16px", `Project update composer padding is not canonical: ${JSON.stringify(updateComposerStyles)}`);
+assert(updateComposerStyles.radius === "7px", `Project update textarea radius is not canonical: ${JSON.stringify(updateComposerStyles)}`);
 assert((await page.getByRole("button", { name: "Activity", exact: true }).getAttribute("class"))?.includes("active"), "Context URL did not activate the requested Activity tab");
 await page.getByLabel("Project health").selectOption("at_risk");
 await page.getByLabel("Project update").fill(projectUpdateBody);
@@ -392,6 +407,50 @@ await page.goto(`http://127.0.0.1:${webPort}/issues/LOCAL-3`, { waitUntil: "domc
 await waitForAppShell();
 await page.locator(".issue-detail .detail-top", { hasText: "LOCAL-3" }).waitFor({ state: "visible", timeout: 15000 });
 assert(await page.locator(".issue-detail h2", { hasText: "Verify paused issue status" }).isVisible(), "Direct issue URL did not select the requested issue");
+assert(await page.locator(".linear-issue-row .agent-inline").count() === 0, "Compact issue rows still expose the redundant Agent column");
+assert(await page.getByLabel("Accepted").count() === 0, "Issue rows still render a Done-like acceptance glyph");
+const issueDetailSpacing = await page.locator(".issue-detail").evaluate((detail) => {
+  const style = getComputedStyle(detail);
+  return {
+    left: style.paddingLeft,
+    right: style.paddingRight,
+    top: style.paddingTop,
+    bottom: style.paddingBottom,
+    scrollWidth: detail.scrollWidth,
+    clientWidth: detail.clientWidth,
+  };
+});
+assert(issueDetailSpacing.left === issueDetailSpacing.right && issueDetailSpacing.top === issueDetailSpacing.bottom, `Issue detail inset is uneven: ${JSON.stringify(issueDetailSpacing)}`);
+assert(issueDetailSpacing.scrollWidth === issueDetailSpacing.clientWidth, `Issue detail overflows horizontally: ${JSON.stringify(issueDetailSpacing)}`);
+const workflowBounds = await page.locator(".issue-detail .workflow-controls").evaluate((workflow) => {
+  const select = workflow.querySelector("select");
+  const form = workflow.querySelector(".dependency-form");
+  if (!(select instanceof HTMLElement) || !(form instanceof HTMLElement)) throw new Error("Issue workflow controls are incomplete");
+  const workflowRect = workflow.getBoundingClientRect();
+  const selectRect = select.getBoundingClientRect();
+  const formRect = form.getBoundingClientRect();
+  const style = getComputedStyle(workflow);
+  const contentRight = workflowRect.right - parseFloat(style.borderRightWidth) - parseFloat(style.paddingRight);
+  return {
+    contentRight,
+    selectRight: selectRect.right,
+    formRight: formRect.right,
+    selectWidth: selectRect.width,
+    workflowWidth: workflowRect.width,
+  };
+});
+assert(Math.abs(workflowBounds.contentRight - workflowBounds.selectRight) <= 1, `Issue status select does not reach the workflow content edge: ${JSON.stringify(workflowBounds)}`);
+assert(Math.abs(workflowBounds.contentRight - workflowBounds.formRight) <= 1, `Issue blocker form does not reach the workflow content edge: ${JSON.stringify(workflowBounds)}`);
+assert(workflowBounds.selectWidth > workflowBounds.workflowWidth / 2, `Issue status select does not fill the available row width: ${JSON.stringify(workflowBounds)}`);
+const snapshotsBeforeRead = requestedPaths.filter((path) => path === "/api/snapshot").length;
+runHub("get_issue", { id: "LOCAL-3" });
+await page.waitForTimeout(250);
+assert(requestedPaths.filter((path) => path === "/api/snapshot").length === snapshotsBeforeRead, "Read-only CLI tool emitted a UI refresh signal");
+runHub("update_issue", { id: "LOCAL-3", status: "In Progress" });
+await page.waitForFunction(() => document.querySelector('select[aria-label="Issue status"]')?.value === "In Progress");
+assert(requestedPaths.filter((path) => path === "/api/snapshot").length > snapshotsBeforeRead, "Successful CLI mutation did not explicitly refresh the open UI");
+runHub("update_issue", { id: "LOCAL-3", status: "Paused" });
+await page.waitForFunction(() => document.querySelector('select[aria-label="Issue status"]')?.value === "Paused");
 
 await page.goto(`http://127.0.0.1:${webPort}/`, { waitUntil: "domcontentloaded" });
 await waitForAppShell();
@@ -418,6 +477,49 @@ assert(await publicProjectRow.getByText("In Progress", { exact: true }).isVisibl
 assert(await page.locator(".view-tabs .stack-icon").count() === 0, "Duplicate database icon is still present beside the project views");
 assert(await page.getByRole("button", { name: /favorite/i }).count() === 0, "Unimplemented favorite button is still present");
 assert((await page.locator(".address").textContent())?.trim() === "Claw Task Hub", "Top chrome does not identify Claw Task Hub");
+const navTitleStyle = await page.locator(".address").evaluate((title) => {
+  const titleRect = title.getBoundingClientRect();
+  const chrome = title.closest(".top-chrome");
+  const chromeRect = chrome?.getBoundingClientRect();
+  if (!(chrome instanceof HTMLElement)) throw new Error("Top chrome is missing");
+  const rgb = (color) => (color.match(/[\d.]+/g) ?? [0, 0, 0]).slice(0, 3).map(Number);
+  const luminance = (color) => rgb(color).map((channel) => channel / 255).map((channel) => channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4).reduce((sum, channel, index) => sum + channel * [0.2126, 0.7152, 0.0722][index], 0);
+  const foreground = getComputedStyle(title).color;
+  const background = getComputedStyle(chrome).backgroundColor;
+  const values = [luminance(foreground), luminance(background)].sort((left, right) => right - left);
+  return {
+    fontSize: parseFloat(getComputedStyle(title).fontSize),
+    fontWeight: Number(getComputedStyle(title).fontWeight),
+    color: foreground,
+    contrast: (values[0] + 0.05) / (values[1] + 0.05),
+    chromeHeight: chromeRect?.height ?? 0,
+    contained: Boolean(chromeRect && titleRect.top >= chromeRect.top && titleRect.bottom <= chromeRect.bottom),
+    centerOffset: chromeRect ? Math.abs((titleRect.top + titleRect.bottom) / 2 - (chromeRect.top + chromeRect.bottom) / 2) : Infinity,
+  };
+});
+assert(Math.abs(navTitleStyle.fontSize - 32) <= 0.1, `Top navigation title is not exactly 32px: ${JSON.stringify(navTitleStyle)}`);
+assert(navTitleStyle.fontWeight >= 800, `Top navigation title remains too light: ${JSON.stringify(navTitleStyle)}`);
+assert(navTitleStyle.contrast >= 7, `Dark-mode navigation title contrast is below 7:1: ${JSON.stringify(navTitleStyle)}`);
+assert(navTitleStyle.chromeHeight >= 56, `Top chrome does not accommodate the 32px title: ${JSON.stringify(navTitleStyle)}`);
+assert(navTitleStyle.contained, `Top navigation title escapes the top chrome: ${JSON.stringify(navTitleStyle)}`);
+assert(navTitleStyle.centerOffset <= 1, `Top navigation title is not vertically centered: ${JSON.stringify(navTitleStyle)}`);
+await page.setViewportSize({ width: 360, height: 800 });
+const mobileNavTitle = await page.locator(".address").evaluate((title) => {
+  const titleRect = title.getBoundingClientRect();
+  const chromeRect = title.closest(".top-chrome")?.getBoundingClientRect();
+  return {
+    visible: titleRect.width > 0 && titleRect.height > 0,
+    fontSize: parseFloat(getComputedStyle(title).fontSize),
+    contained: Boolean(chromeRect && titleRect.left >= chromeRect.left && titleRect.right <= chromeRect.right && titleRect.top >= chromeRect.top && titleRect.bottom <= chromeRect.bottom),
+  };
+});
+assert(mobileNavTitle.visible, `Top navigation title disappears at mobile width: ${JSON.stringify(mobileNavTitle)}`);
+assert(Math.abs(mobileNavTitle.fontSize - 32) <= 0.1, `Mobile navigation title is not exactly 32px: ${JSON.stringify(mobileNavTitle)}`);
+assert(mobileNavTitle.contained, `Mobile navigation title escapes the top chrome: ${JSON.stringify(mobileNavTitle)}`);
+assert(await page.locator(".window-tab").isHidden(), "Database chrome did not collapse before the product title at mobile width");
+assert(await page.getByRole("button", { name: "Refresh data", exact: true }).isVisible(), "Refresh control disappears at mobile width");
+assert(await page.locator(".top-refresh-pill span").isHidden(), "Refresh label did not collapse to its icon at mobile width");
+await page.setViewportSize({ width: 1280, height: 960 });
 assert((await page.locator(".window-tab span").textContent())?.trim() === "ui-smoke", "Top chrome does not show the active database name without the implied SQLite extension");
 const databaseReadPaths = new Set(["/api/snapshot", "/api/refresh", "/api/projects", "/api/issues"]);
 const dataReadsBeforeHealthPoll = requestedPaths.filter((path) => databaseReadPaths.has(path)).length;
@@ -425,11 +527,21 @@ const healthRequest = page.waitForResponse((response) => new URL(response.url())
 await healthRequest;
 assert((await page.getByRole("status", { name: "Server healthy" }).getAttribute("class"))?.includes("healthy"), "Health polling did not show a successful check");
 assert(requestedPaths.filter((path) => databaseReadPaths.has(path)).length === dataReadsBeforeHealthPoll, "Health polling triggered a database data fetch");
-await page.getByRole("button", { name: "Manage databases", exact: true }).click();
-const explicitRefreshRequest = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/refresh" && response.request().method() === "POST" && response.ok());
-await page.getByRole("menuitem", { name: "Refresh data", exact: true }).click();
-await explicitRefreshRequest;
-await page.getByRole("button", { name: "Manage databases", exact: true }).click();
+  const refreshControls = page.getByRole("button", { name: "Refresh data", exact: true });
+  assert(await refreshControls.count() === 1, "Refresh data must have exactly one UI control");
+  await page.route("**/api/refresh", async (route) => {
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    await route.continue();
+  }, { times: 1 });
+  const explicitRefreshRequest = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/refresh" && response.request().method() === "POST" && response.ok());
+  await refreshControls.click({ noWaitAfter: true });
+  await page.waitForFunction(() => document.querySelector(".top-refresh-pill")?.getAttribute("aria-busy") === "true");
+  assert(await refreshControls.locator(".refresh-spin").count() === 1, "Refresh data icon does not animate while refresh is in flight");
+  assert(await refreshControls.isDisabled(), "Refresh data allows duplicate clicks while refresh is in flight");
+  await explicitRefreshRequest;
+  await page.waitForFunction(() => document.querySelector(".top-refresh-pill")?.getAttribute("aria-busy") === "false");
+  await page.getByRole("button", { name: "Manage databases", exact: true }).click();
+  assert(await page.getByRole("menuitem", { name: "Refresh data", exact: true }).count() === 0, "Database menu duplicates the top-nav Refresh data control");
 const darkModeToggle = page.getByRole("menuitemcheckbox", { name: /Dark mode/ });
 assert(await darkModeToggle.getAttribute("aria-checked") === "true", "Dark theme is not the default appearance");
 await darkModeToggle.click();
@@ -498,6 +610,7 @@ assert(await page.getByRole("button", { name: "Activity", exact: true }).isVisib
 assert(await page.getByRole("button", { name: "Issues", exact: true }).isVisible(), "Issues tab is missing");
 assert(await page.getByText("Properties").isVisible(), "Overview properties are missing");
 assert(await page.getByText("Resources").isVisible(), "Overview resources are missing");
+assert(await page.getByRole("button", { name: "Add issue resource", exact: true }).count() === 0, "Inert Add issue resource control is still rendered");
 const [shortcutDownload] = await Promise.all([
   page.waitForEvent("download"),
   page.getByRole("button", { name: "Download project shortcut" }).click(),
@@ -722,6 +835,40 @@ assert((await page.locator(".window-tab span").textContent())?.trim() === create
 await page.getByRole("button", { name: "Manage databases", exact: true }).click();
 assert(await page.getByRole("menu", { name: "Databases" }).isVisible(), "Database manager did not open");
 assert(await page.getByRole("menuitemradio", { name: new RegExp(`${createdCatalogue.active.fileName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}.*active`, "i") }).isVisible(), "Database manager does not identify the active database by exact filename");
+
+const activeDeleteResponse = await fetch(`${env.VITE_CLAW_TASK_HUB_API_BASE}/databases/${encodeURIComponent(createdCatalogue.active.id)}`, {
+  method: "DELETE",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ confirm: true }),
+});
+assert(activeDeleteResponse.status === 409, `Active database deletion returned ${activeDeleteResponse.status} instead of 409`);
+assert(existsSync(selectedDatabasePath), "Active database deletion protection removed the database file");
+
+const activateOriginalRequest = page.waitForResponse((response) => {
+  const url = new URL(response.url());
+  return url.pathname.endsWith("/databases/ui-smoke.sqlite/activate") && response.request().method() === "POST" && response.ok();
+});
+await page.getByRole("menuitemradio", { name: "ui-smoke.sqlite", exact: true }).click();
+await activateOriginalRequest;
+await page.waitForFunction(() => document.querySelector(".window-tab span")?.textContent?.trim() === "ui-smoke");
+
+await page.getByRole("button", { name: "Manage databases", exact: true }).click();
+await page.getByRole("menuitem", { name: `Delete ${createdCatalogue.active.fileName}`, exact: true }).click();
+const deleteDatabaseDialog = page.getByRole("dialog", { name: "Delete database?" });
+assert(await deleteDatabaseDialog.getByText(createdCatalogue.active.fileName, { exact: true }).isVisible(), "Delete confirmation does not identify the database filename");
+assert(await deleteDatabaseDialog.getByText(selectedDatabasePath, { exact: true }).isVisible(), "Delete confirmation does not show the exact database path");
+const deleteDatabaseRequest = page.waitForResponse((response) => {
+  const url = new URL(response.url());
+  return decodeURIComponent(url.pathname).endsWith(`/databases/${createdCatalogue.active.id}`) && response.request().method() === "DELETE" && response.ok();
+});
+await deleteDatabaseDialog.getByRole("button", { name: "Delete database", exact: true }).click();
+const deleteDatabaseResponse = await deleteDatabaseRequest;
+const deletedCatalogue = await deleteDatabaseResponse.json();
+assert(!deletedCatalogue.databases.some((database) => database.id === createdCatalogue.active.id), "Deleted database remains in the API catalogue");
+assert(!existsSync(selectedDatabasePath), "Confirmed database deletion did not remove the SQLite file");
+await page.getByRole("button", { name: "Manage databases", exact: true }).click();
+assert(await page.getByRole("menuitem", { name: `Delete ${createdCatalogue.active.fileName}`, exact: true }).count() === 0, "Deleted database still has a delete action in the database menu");
+assert(await page.getByRole("menuitemradio", { name: createdCatalogue.active.fileName, exact: true }).count() === 0, "Deleted database remains selectable in the database menu");
 
 await browser.close();
 console.log("UI smoke passed");

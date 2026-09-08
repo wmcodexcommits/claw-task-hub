@@ -42,7 +42,7 @@ After migration, Claw Task Hub remains the local source of truth.
 
 ## Prerequisites
 
-- Claw Task Hub dependencies are installed with `npm ci`.
+- Claw Task Hub dependencies are installed with `bun install --frozen-lockfile`.
 - The target local database is selected, either by default or with `CLAW_TASK_HUB_DB`.
 - The operator has access to the Linear workspace being migrated.
 - The optional `mcp-remote` Linear flow can authenticate in the operator environment.
@@ -53,7 +53,7 @@ Optional Linear import environment variables:
 | Variable | Purpose |
 | --- | --- |
 | `CLAW_TASK_HUB_ALLOW_LINEAR_IMPORT=1` | Enables the standalone migration command for this process only. |
-| `CLAW_TASK_HUB_LINEAR_MCP_COMMAND` | Overrides the command used to start the Linear MCP bridge. Defaults to `npx.cmd` on Windows and `npx` elsewhere. |
+| `CLAW_TASK_HUB_LINEAR_MCP_COMMAND` | Overrides the command used to start the Linear MCP bridge. Defaults to `bunx.exe` on Windows and `bunx` elsewhere. |
 | `CLAW_TASK_HUB_LINEAR_MCP_URL` | Overrides the Linear MCP URL. |
 | `CLAW_TASK_HUB_LINEAR_MCP_CALLBACK_PORT` | Overrides the local OAuth callback port. |
 | `CLAW_TASK_HUB_LINEAR_MCP_HOST` | Overrides the local callback host. |
@@ -69,7 +69,7 @@ For the safest backup, stop the Claw Task Hub API and UI before copying database
 Check the current dashboard:
 
 ```powershell
-npm run hub -- tools/call dashboard "{}"
+bun run hub -- tools/call dashboard "{}"
 ```
 
 ## Step 2: Back Up The Database
@@ -107,7 +107,7 @@ Do not save these values in committed repo files.
 The normal API, MCP server, and hub CLI do not expose Linear migration. Run the separate operator tool directly:
 
 ```powershell
-npm run migrate:linear -- import --pages 1000
+bun run migrate:linear -- import --pages 1000
 ```
 
 The command returns a `runId`, import stats, and the next checkpoint cursor when successful.
@@ -117,7 +117,7 @@ The command returns a `runId`, import stats, and the next checkpoint cursor when
 Some Linear list responses can include truncated descriptions. Run the backfill tool after the main import:
 
 ```powershell
-npm run migrate:linear -- backfill-descriptions --limit 500
+bun run migrate:linear -- backfill-descriptions --limit 500
 ```
 
 Repeat with a higher limit or run again until the repaired count reaches zero.
@@ -127,13 +127,13 @@ Repeat with a higher limit or run again until the repaired count reaches zero.
 Check dashboard counts:
 
 ```powershell
-npm run hub -- tools/call dashboard "{}"
+bun run hub -- tools/call dashboard "{}"
 ```
 
 List imported projects:
 
 ```powershell
-npm run hub -- tools/call list_projects "{}"
+bun run hub -- tools/call list_projects "{}"
 ```
 
 Check imported issues by visible identifier or query:
@@ -141,7 +141,7 @@ Check imported issues by visible identifier or query:
 ```powershell
 $json = '{"query":"<source-prefix-or-keyword>","limit":20}'
 $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
-npm run hub -- tools/call list_issues "base64:$b64"
+bun run hub -- tools/call list_issues "base64:$b64"
 ```
 
 Read a specific imported issue:
@@ -149,7 +149,7 @@ Read a specific imported issue:
 ```powershell
 $json = '{"id":"<imported-issue-identifier>"}'
 $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
-npm run hub -- tools/call get_issue "base64:$b64"
+bun run hub -- tools/call get_issue "base64:$b64"
 ```
 
 If the API is running, sync run history is available at:
@@ -170,7 +170,7 @@ Remove-Item Env:\CLAW_TASK_HUB_LINEAR_MCP_ENABLE_PROXY -ErrorAction SilentlyCont
 Confirm the normal hub CLI has no Linear import tool:
 
 ```powershell
-npm run hub -- tools/call import_linear "{}"
+bun run hub -- tools/call import_linear "{}"
 ```
 
 Expected result: the command exits with an `Unknown tool: import_linear` error.
@@ -178,7 +178,7 @@ Expected result: the command exits with an `Unknown tool: import_linear` error.
 Confirm the standalone migration command is disabled without the gate:
 
 ```powershell
-npm run migrate:linear -- import --pages 1
+bun run migrate:linear -- import --pages 1
 ```
 
 Expected result: the command exits with an error explaining that `CLAW_TASK_HUB_ALLOW_LINEAR_IMPORT=1` is required.
@@ -209,14 +209,14 @@ If counts look wrong:
 
 - check `/api/sync-runs` for the failed run and error text;
 - re-run the import with the same database, because imported records use `external_id` for idempotent updates;
-- run `npm run migrate:linear -- backfill-descriptions --limit 500` for truncated descriptions;
+- run `bun run migrate:linear -- backfill-descriptions --limit 500` for truncated descriptions;
 - keep the backup until project and issue spot checks pass.
 
 ## Acceptance Checklist
 
 - Database backup exists.
-- `npm run migrate:linear -- import --pages 1000` completed successfully.
-- `npm run migrate:linear -- backfill-descriptions --limit 500` completed or has documented remaining failures.
+- `bun run migrate:linear -- import --pages 1000` completed successfully.
+- `bun run migrate:linear -- backfill-descriptions --limit 500` completed or has documented remaining failures.
 - Dashboard counts match expectations.
 - Sample projects and issues open locally.
 - Linear import tools are disabled again.

@@ -17,9 +17,9 @@ function usage() {
   process.stdout.write(`Claw Task Hub Linear migration tool
 
 Usage:
-  npm run migrate:linear -- import --pages 1000
-  npm run migrate:linear -- backfill-descriptions --limit 500
-  npm run migrate:linear -- help
+  bun run migrate:linear -- import --pages 1000
+  bun run migrate:linear -- backfill-descriptions --limit 500
+  bun run migrate:linear -- help
 
 Safety:
   Set CLAW_TASK_HUB_ALLOW_LINEAR_IMPORT=1 only for a planned one-off migration window.

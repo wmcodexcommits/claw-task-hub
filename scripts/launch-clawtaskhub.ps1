@@ -13,10 +13,10 @@ function Add-LaunchLog {
   Add-Content -Path $OutLog -Value "[$(Get-Date -Format o)] $Message"
 }
 
-function Invoke-NpmInstall {
+function Invoke-BunInstall {
   param([string[]]$Arguments)
   $process = Start-Process `
-    -FilePath "npm.cmd" `
+    -FilePath "bun.exe" `
     -ArgumentList $Arguments `
     -WorkingDirectory $ProjectRoot `
     -WindowStyle Hidden `
@@ -31,11 +31,11 @@ try {
   Add-LaunchLog "Launcher started from $ProjectRoot"
 
   if (-not (Test-Path -LiteralPath (Join-Path $ProjectRoot "node_modules"))) {
-    Add-LaunchLog "node_modules missing; running npm ci"
-    $exitCode = Invoke-NpmInstall -Arguments @("ci")
+    Add-LaunchLog "node_modules missing; running bun install --frozen-lockfile"
+    $exitCode = Invoke-BunInstall -Arguments @("install", "--frozen-lockfile")
     if ($exitCode -ne 0) {
-      Add-LaunchLog "npm ci failed with $exitCode; running npm install"
-      $exitCode = Invoke-NpmInstall -Arguments @("install")
+      Add-LaunchLog "frozen Bun install failed with $exitCode; running bun install"
+      $exitCode = Invoke-BunInstall -Arguments @("install")
     }
     if ($exitCode -ne 0) {
       Add-LaunchLog "dependency install failed with $exitCode"
