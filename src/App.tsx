@@ -605,10 +605,10 @@ function TopChrome() {
         <Database size={15} />
         <span>clawtaskhub</span>
       </div>
-      <button className="ghost-icon"><Plus size={16} /></button>
+      <span className="ghost-icon" aria-hidden="true"><Plus size={16} /></span>
       <div className="address">{window.location.host || "localhost:5173"}</div>
-      <button className="ghost-icon"><Activity size={16} /></button>
-      <button className="ghost-icon"><MoreHorizontal size={17} /></button>
+      <span className="ghost-icon" aria-hidden="true"><Activity size={16} /></span>
+      <span className="ghost-icon" aria-hidden="true"><MoreHorizontal size={17} /></span>
     </header>
   );
 }
@@ -634,7 +634,7 @@ function HeaderBar({
   return (
     <>
       <div className="crumbbar">
-        <button className="crumb-icon"><Layers size={15} /></button>
+        <span className="crumb-icon" aria-hidden="true"><Layers size={15} /></span>
         {page === "projects" ? (
           <strong>Projects</strong>
         ) : page === "workspace" ? (
@@ -646,8 +646,8 @@ function HeaderBar({
             <strong>{project?.name}</strong>
           </>
         )}
-        <button className="ghost-icon"><Star size={15} /></button>
-        <button className="ghost-icon"><MoreHorizontal size={17} /></button>
+        <span className="ghost-icon" aria-hidden="true"><Star size={15} /></span>
+        <span className="ghost-icon" aria-hidden="true"><MoreHorizontal size={17} /></span>
         <div className="crumb-actions">
           <button
             className="project-shortcut-button"
@@ -659,8 +659,8 @@ function HeaderBar({
             <Link size={15} />
             <span>Shortcut</span>
           </button>
-          <button className="ghost-icon"><Bell size={15} /></button>
-          <button className="ghost-icon"><Plus size={16} /></button>
+          <span className="ghost-icon" aria-hidden="true"><Bell size={15} /></span>
+          <span className="ghost-icon" aria-hidden="true"><Plus size={16} /></span>
         </div>
       </div>
 
@@ -680,10 +680,10 @@ function HeaderBar({
             <button className={tab === "issues" ? "pill active" : "pill"} onClick={() => onTab("issues")}>Issues</button>
           </>
         ) : null}
-        <button className="stack-icon"><Layers size={14} /></button>
+        <span className="stack-icon" aria-hidden="true"><Layers size={14} /></span>
         <div className="view-tools">
-          <button className="round-icon"><ListFilter size={15} /></button>
-          <button className="round-icon"><SlidersHorizontal size={15} /></button>
+          <span className="round-icon" aria-hidden="true"><ListFilter size={15} /></span>
+          <span className="round-icon" aria-hidden="true"><SlidersHorizontal size={15} /></span>
         </div>
       </div>
     </>
@@ -829,7 +829,7 @@ function IssuesPage({
   return (
     <section className="issues-screen">
       <div className="issue-filter-row">
-        <div className="searchbar"><Search size={16} /><input value={query} onChange={(event) => onQuery(event.target.value)} placeholder={`Search ${title}`} /></div>
+        <div className="searchbar"><Search size={16} /><input aria-label={`Search ${title}`} value={query} onChange={(event) => onQuery(event.target.value)} placeholder={`Search ${title}`} /></div>
         <label className="issue-limit-control">
           <span>Per status</span>
           <select aria-label="Issues per status" value={issueDisplayLimit} onChange={(event) => onIssueDisplayLimit(event.target.value as IssueDisplayLimit)}>
@@ -839,8 +839,8 @@ function IssuesPage({
             <option value="all">All</option>
           </select>
         </label>
-        <button className="round-icon"><ListFilter size={15} /></button>
-        <button className="round-icon"><SlidersHorizontal size={15} /></button>
+        <span className="round-icon" aria-hidden="true"><ListFilter size={15} /></span>
+        <span className="round-icon" aria-hidden="true"><SlidersHorizontal size={15} /></span>
       </div>
       <div className="mode-row">
         <button className={statusMode === "blockers" ? "mode-chip danger active" : "mode-chip danger"} onClick={() => onStatusMode("blockers")}><AlertTriangle size={14} />Blockers</button>
@@ -853,9 +853,9 @@ function IssuesPage({
       {canCreate ? (
         <form className="linear-create" onSubmit={onCreate}>
           <Plus size={16} />
-          <input name="title" placeholder={`New issue in ${title}`} />
-          <select name="priority" defaultValue="3"><option value="1">P1</option><option value="2">P2</option><option value="3">P3</option><option value="4">P4</option></select>
-          <input name="description" placeholder="Short note" />
+          <input name="title" aria-label="Issue title" placeholder={`New issue in ${title}`} />
+          <select name="priority" aria-label="Issue priority" defaultValue="3"><option value="1">P1</option><option value="2">P2</option><option value="3">P3</option><option value="4">P4</option></select>
+          <input name="description" aria-label="Issue description" placeholder="Short note" />
           <button disabled={creating}>{creating ? "Saving" : "Add"}</button>
         </form>
       ) : (
@@ -871,7 +871,7 @@ function IssuesPage({
             <div className="empty-list">No issues found</div>
           ) : grouped.map((group) => (
             <div key={group.key} className="issue-group">
-              <div className="group-head"><span>⌄</span><StatusIcon statusType={group.statusType} /><strong>{group.label}</strong><em>{groupCountLabel(group)}</em><button><Plus size={14} /></button></div>
+              <div className="group-head"><span>⌄</span><StatusIcon statusType={group.statusType} /><strong>{group.label}</strong><em>{groupCountLabel(group)}</em><span aria-hidden="true"><Plus size={14} /></span></div>
               {group.items.map((issue) => {
                 const statusType = resolveUiStatusType(issue);
                 return (
@@ -912,7 +912,7 @@ function IssueDetail({ issue, onAddComment }: { issue: Issue | null; onAddCommen
       <div className="comments-box">
         <strong>Activity</strong>
         {issue.comments?.map((comment) => <article key={comment.id}><b>{comment.author}</b><span>{comment.body}</span></article>)}
-        <form onSubmit={onAddComment}><input name="body" placeholder="Add an agent note" /><button>Add</button></form>
+        <form onSubmit={onAddComment}><input name="body" aria-label="Add agent note" placeholder="Add an agent note" /><button>Add</button></form>
       </div>
     </aside>
   );
@@ -931,7 +931,7 @@ function IssueDialog({ issue, onClose, onAddComment }: { issue: Issue; onClose: 
         <div className="comments-box">
           <strong>Activity</strong>
           {issue.comments?.map((comment) => <article key={comment.id}><b>{comment.author}</b><span>{comment.body}</span></article>)}
-          <form onSubmit={onAddComment}><input name="body" placeholder="Add an agent note" /><button>Add</button></form>
+          <form onSubmit={onAddComment}><input name="body" aria-label="Add agent note" placeholder="Add an agent note" /><button>Add</button></form>
         </div>
       </section>
     </div>

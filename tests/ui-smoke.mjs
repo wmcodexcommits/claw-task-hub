@@ -274,6 +274,10 @@ await waitForAppShell();
 await page.getByRole("button", { name: "Issues", exact: true }).waitFor({ state: "visible", timeout: 15000 });
 assert((await page.getByRole("button", { name: "Issues", exact: true }).getAttribute("class"))?.includes("active"), "Direct project issues URL did not activate the Issues tab");
 assert(await page.locator(".searchbar input").getAttribute("placeholder") === "Search Claw Task Hub MVP", "Direct project issues URL did not load the project issue view");
+assert(await page.getByRole("textbox", { name: "Search Claw Task Hub MVP" }).isVisible(), "Issue search does not have an accessible name");
+assert(await page.getByRole("textbox", { name: "Issue title" }).isVisible(), "Issue title field does not have an accessible name");
+assert(await page.getByRole("combobox", { name: "Issue priority" }).isVisible(), "Issue priority field does not have an accessible name");
+assert(await page.getByRole("textbox", { name: "Issue description" }).isVisible(), "Issue description field does not have an accessible name");
 
 await page.goto(`http://127.0.0.1:${webPort}/contexts/${encodeURIComponent("ui-smoke:project")}/activity`, { waitUntil: "domcontentloaded" });
 await waitForAppShell();
