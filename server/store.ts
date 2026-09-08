@@ -225,7 +225,7 @@ export function getProject(id: string, options: { issues_per_status?: unknown } 
       SUM(CASE WHEN ${normalizedStatusTypeSql} = 'completed' THEN 1 ELSE 0 END) AS done,
       SUM(CASE WHEN ${normalizedStatusTypeSql} = 'started' THEN 1 ELSE 0 END) AS started,
       SUM(CASE WHEN ${normalizedStatusTypeSql} IN ('backlog','unstarted','blocked','paused') THEN 1 ELSE 0 END) AS open,
-      SUM(CASE WHEN priority = 1 AND ${normalizedStatusTypeSql} != 'completed' THEN 1 ELSE 0 END) AS blockers
+      SUM(CASE WHEN ${normalizedStatusTypeSql} = 'blocked' THEN 1 ELSE 0 END) AS blockers
     FROM issues
     WHERE project_id = @project_id AND archived_at IS NULL
   `).get({ project_id: project.id });
@@ -242,7 +242,7 @@ export function getProject(id: string, options: { issues_per_status?: unknown } 
       CASE
         WHEN ${normalizedStatusTypeSql} = 'completed' THEN 'completed'
         WHEN ${normalizedStatusTypeSql} = 'started' THEN 'started'
-        WHEN i.priority = 1 THEN 'blocker'
+        WHEN ${normalizedStatusTypeSql} = 'blocked' THEN 'blocker'
         ELSE 'updated'
       END AS verb
     FROM issues i

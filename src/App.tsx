@@ -512,7 +512,7 @@ function App() {
         (statusMode === "paused" && statusType === "paused") ||
         (statusMode === "backlog" && statusType === "backlog") ||
         (statusMode === "todo" && statusType === "unstarted") ||
-        (statusMode === "blockers" && issue.priority === 1 && statusType !== "completed");
+        (statusMode === "blockers" && statusType === "blocked");
       return matchesText && matchesMode;
     });
   }, [matchingServerSearch, projectDetail?.issues, statusMode, trimmedQuery, workspaceIssues]);

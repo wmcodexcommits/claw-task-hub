@@ -249,6 +249,30 @@ runHub("save_issue", {
   labels: ["ui-smoke"],
   source: "local",
 });
+runHub("save_issue", {
+  id: "LOCAL-6",
+  external_id: "LOCAL-6",
+  identifier: "LOCAL-6",
+  title: "Urgent Todo is not a blocker",
+  description: "Seeded to distinguish urgent priority from blocked status.",
+  project_id: "project_claw_task_hub_mvp",
+  status: "Todo",
+  priority: 1,
+  labels: ["ui-smoke"],
+  source: "local",
+});
+runHub("save_issue", {
+  id: "LOCAL-7",
+  external_id: "LOCAL-7",
+  identifier: "LOCAL-7",
+  title: "Medium priority Blocked is a blocker",
+  description: "Seeded to distinguish blocked status from urgent priority.",
+  project_id: "project_claw_task_hub_mvp",
+  status: "Blocked",
+  priority: 3,
+  labels: ["ui-smoke"],
+  source: "local",
+});
 runHub("save_comment", {
   issue_id: "LOCAL-1",
   body: "UI smoke seeded activity comment.",
@@ -392,6 +416,9 @@ await page.locator(".dialog-close").click();
 await page.getByRole("button", { name: /Blockers/i }).click();
 const blockerClass = await page.getByRole("button", { name: /Blockers/i }).getAttribute("class");
 assert(blockerClass?.includes("active"), "Blockers filter did not become active");
+const blockerRows = await page.locator(".linear-issue-row").allTextContents();
+assert(blockerRows.some((row) => row.includes("Medium priority Blocked is a blocker")), "Blockers filter omitted a medium-priority Blocked issue");
+assert(!blockerRows.some((row) => row.includes("Urgent Todo is not a blocker")), "Blockers filter included an urgent Todo issue");
 await page.screenshot({ path: "test-results/linearish-project-issues.png", fullPage: true });
 
 await page.getByRole("button", { name: "Paused", exact: true }).click();
