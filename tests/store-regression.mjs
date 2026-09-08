@@ -231,6 +231,32 @@ try {
   }
   assert(invalidProjectMessage === "Project not found: project-does-not-exist", `invalid project error was not clear: ${invalidProjectMessage}`);
   assert(db.prepare("SELECT COUNT(*) AS count FROM issues").get().count === rowCountBeforeMissingProject, "invalid project_id created an issue");
+  let invalidTeamMessage = "";
+  try {
+    upsertIssue({ title: "Invalid team must fail", status: "Todo", project_id: storeProject.id, team_id: "team-does-not-exist" });
+  } catch (error) {
+    invalidTeamMessage = error instanceof Error ? error.message : String(error);
+  }
+  assert(invalidTeamMessage === "Team not found: team-does-not-exist", `invalid team error was not clear: ${invalidTeamMessage}`);
+  assert(db.prepare("SELECT COUNT(*) AS count FROM issues").get().count === rowCountBeforeMissingProject, "invalid team_id created an issue");
+  let invalidParentMessage = "";
+  try {
+    upsertIssue({ title: "Invalid parent must fail", status: "Todo", project_id: storeProject.id, parent_id: "CTH-DOES-NOT-EXIST" });
+  } catch (error) {
+    invalidParentMessage = error instanceof Error ? error.message : String(error);
+  }
+  assert(invalidParentMessage === "Parent issue not found: CTH-DOES-NOT-EXIST", `invalid parent error was not clear: ${invalidParentMessage}`);
+  assert(db.prepare("SELECT COUNT(*) AS count FROM issues").get().count === rowCountBeforeMissingProject, "invalid parent_id created an issue");
+  const explicitNullReferences = upsertIssue({
+    title: "Explicit null references are preserved",
+    identifier: "CTH-900023",
+    status: "Todo",
+    project_id: storeProject.id,
+    team_id: null,
+    parent_id: null,
+  });
+  assert(explicitNullReferences.team_id === null, "explicit null team_id was replaced");
+  assert(explicitNullReferences.parent_id === null, "explicit null parent_id was replaced");
   const deliberateUnassigned = upsertIssue({
     title: "Deliberate unassigned inbox issue",
     identifier: "CTH-900022",

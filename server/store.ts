@@ -760,8 +760,8 @@ function upsertIssueLocked(input: IssueInput) {
     status_type: statusType,
     priority: input.priority ?? numberValue(existing?.priority) ?? 3,
     project_id: resolveIssueProjectId(input, existing),
-    team_id: hasOwn(input, "team_id") ? resolveTeamId(input.team_id) : stringValue(existing?.team_id) ?? defaultTeamId(),
-    parent_id: hasOwn(input, "parent_id") ? resolveParentId(input.parent_id) : stringValue(existing?.parent_id),
+    team_id: hasOwn(input, "team_id") ? resolveIssueTeamId(input.team_id) : stringValue(existing?.team_id) ?? defaultTeamId(),
+    parent_id: hasOwn(input, "parent_id") ? resolveIssueParentId(input.parent_id) : stringValue(existing?.parent_id),
     assignee: hasOwn(input, "assignee") ? input.assignee ?? null : stringValue(existing?.assignee),
     labels: json(hasOwn(input, "labels") ? normalizeLabels(input.labels) : normalizeLabels(existing?.labels)),
     source: input.source ?? stringValue(existing?.source) ?? "local",
@@ -1436,6 +1436,13 @@ function resolveTeamId(value: string | null | undefined) {
   return team?.id ?? null;
 }
 
+function resolveIssueTeamId(value: string | null | undefined) {
+  if (value == null) return null;
+  const teamId = resolveTeamId(value);
+  if (!teamId) throw new Error(`Team not found: ${value}`);
+  return teamId;
+}
+
 function defaultTeamId() {
   return String((ensureDefaultTeam() as { id: string }).id);
 }
@@ -1443,4 +1450,11 @@ function defaultTeamId() {
 function resolveParentId(value: string | null | undefined) {
   const issue = value ? db.prepare("SELECT id FROM issues WHERE id = @id OR external_id = @id OR identifier = @id").get({ id: value }) as { id: string } | undefined : undefined;
   return issue?.id ?? null;
+}
+
+function resolveIssueParentId(value: string | null | undefined) {
+  if (value == null) return null;
+  const parentId = resolveParentId(value);
+  if (!parentId) throw new Error(`Parent issue not found: ${value}`);
+  return parentId;
 }
