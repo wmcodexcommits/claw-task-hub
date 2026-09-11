@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFile
 import { createHash } from "node:crypto";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { removePathWithRetries } from "./filesystem.js";
+import { removePathWithRetries, waitSync } from "./filesystem.js";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const dataDir = join(root, "data");
@@ -25,6 +25,12 @@ type SqliteDatabase = Omit<Database, "prepare" | "query"> & {
 function openDatabase(path: string): SqliteDatabase {
   return new Database(path, { strict: true }) as unknown as SqliteDatabase;
 }
+
+export type WalModeOptions = {
+  attempts?: number;
+  retryDelay?: number;
+  warn?: (message: string) => void;
+};
 
 export type ManagedDatabase = {
   id: string;
@@ -273,9 +279,83 @@ export function initializeDatabase(database: SqliteDatabase) {
 
 function configureDatabase(database: SqliteDatabase) {
   database.exec("PRAGMA busy_timeout = 5000");
-  database.exec("PRAGMA journal_mode = WAL");
+  enableWalMode(database);
   database.exec("PRAGMA foreign_keys = ON");
   database.exec("PRAGMA synchronous = NORMAL");
+}
+
+/**
+ * Switching a database into WAL takes an exclusive journal-mode change, and on
+ * Windows a concurrent opener turns that into a file sharing violation that the
+ * Win32 VFS reports as SQLITE_IOERR_* -- observed as SQLITE_IOERR_TRUNCATE
+ * truncating the -wal file when eight hub processes started at once. `PRAGMA
+ * busy_timeout` does NOT cover those: it retries SQLITE_BUSY only, so the pragma
+ * threw straight out of module initialization and killed the process.
+ *
+ * Two things make it survivable, and the first does most of the work:
+ *
+ *  1. Read the mode before writing it. Only the process that wins the race runs
+ *     the exclusive change at all; every later one sees `wal` and touches
+ *     nothing. A plain read needs no exclusive lock and no truncate.
+ *  2. Retry the change itself on contention-shaped errors. The whole
+ *     SQLITE_IOERR family is treated as transient HERE, and only here, because
+ *     enumerating the sharing-violation subcodes is a guess that reintroduces the
+ *     flake when Windows picks a different one. A real disk failure still
+ *     surfaces -- it just surfaces after the retries are spent.
+ *
+ * A database that cannot reach WAL is degraded, not broken: writers serialize
+ * through busy_timeout instead of running concurrently. That is worth a loud
+ * warning and not worth killing the process over.
+ */
+export function enableWalMode(database: SqliteDatabase, options: WalModeOptions = {}) {
+  const attempts = options.attempts ?? 10;
+  const retryDelay = options.retryDelay ?? 50;
+  const warn = options.warn ?? ((message: string) => process.stderr.write(`${message}\n`));
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      const current = readJournalMode(database);
+      if (current === "wal") return "wal";
+      // An in-memory database cannot journal to a file at all, so "memory" is
+      // the correct terminal answer rather than something to retry.
+      if (current === "memory") return current;
+      // SQLite reports the mode it ended up in rather than failing when another
+      // connection blocks the change, so the return value is the real verdict.
+      const mode = normalizeJournalMode(database.prepare("PRAGMA journal_mode = WAL").get());
+      if (mode === "wal") return "wal";
+      lastError = new Error(`PRAGMA journal_mode = WAL left the database in ${mode || "an unknown mode"}`);
+    } catch (error) {
+      if (!isTransientSqliteError(error)) throw error;
+      lastError = error;
+    }
+    if (attempt < attempts) waitSync(retryDelay * attempt);
+  }
+
+  const reason = lastError instanceof Error ? lastError.message : String(lastError);
+  warn(`claw-task-hub: continuing without WAL journaling on ${database.filename}: ${reason}`);
+  try {
+    return readJournalMode(database);
+  } catch {
+    return "";
+  }
+}
+
+function readJournalMode(database: SqliteDatabase) {
+  return normalizeJournalMode(database.prepare("PRAGMA journal_mode").get());
+}
+
+function normalizeJournalMode(row: unknown) {
+  const mode = row && typeof row === "object" && "journal_mode" in row ? (row as { journal_mode: unknown }).journal_mode : null;
+  return typeof mode === "string" ? mode.toLowerCase() : "";
+}
+
+function isTransientSqliteError(error: unknown) {
+  const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
+  return code.startsWith("SQLITE_IOERR")
+    || code.startsWith("SQLITE_BUSY")
+    || code.startsWith("SQLITE_LOCKED")
+    || code === "SQLITE_PROTOCOL";
 }
 
 function createSchema(database: SqliteDatabase) {

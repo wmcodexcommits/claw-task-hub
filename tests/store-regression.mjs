@@ -89,8 +89,123 @@ try {
     upsertProject,
     upsertTeam,
   } = await import("../server/store.ts");
-  const { db, dbPath, initializeDatabase, resolveDbPath, runMigrations } = await import("../server/db.ts");
+  const { db, dbPath, enableWalMode, initializeDatabase, resolveDbPath, runMigrations } = await import("../server/db.ts");
   storeDb = db;
+
+  // Windows reports a sharing violation from a concurrently-opening process as
+  // SQLITE_IOERR_*, which `PRAGMA busy_timeout` does not retry, so eight
+  // parallel hub processes killed one of themselves inside module init with
+  // SQLITE_IOERR_TRUNCATE. These pin the recovery: the pragma is read before it
+  // is written, contention is retried, a real fault still escapes, and an
+  // unrecoverable one degrades loudly instead of throwing.
+  assert(enableWalMode(db) === "wal", "an already-WAL database should report wal");
+
+  function fakeDatabase({ modes, onSet }) {
+    let sets = 0;
+    return {
+      filename: "synthetic.sqlite",
+      reads: 0,
+      get sets() {
+        return sets;
+      },
+      prepare(sql) {
+        if (sql === "PRAGMA journal_mode") {
+          this.reads += 1;
+          return { get: () => ({ journal_mode: modes[Math.min(this.reads, modes.length) - 1] }) };
+        }
+        return {
+          get: () => {
+            sets += 1;
+            return onSet(sets);
+          },
+        };
+      },
+    };
+  }
+
+  // A database already in WAL must never run the exclusive journal-mode change:
+  // that is the step Windows refuses, and skipping it is what makes concurrent
+  // startup safe rather than merely retried.
+  const alreadyWal = fakeDatabase({
+    modes: ["wal"],
+    onSet: () => {
+      throw new Error("journal_mode was rewritten on a database already in WAL");
+    },
+  });
+  assert(enableWalMode(alreadyWal) === "wal", "an already-WAL database should short-circuit");
+  assert(alreadyWal.sets === 0, "an already-WAL database must not attempt the journal-mode change");
+
+  for (const transientCode of ["SQLITE_IOERR_TRUNCATE", "SQLITE_BUSY", "SQLITE_LOCKED_SHAREDCACHE", "SQLITE_PROTOCOL"]) {
+    const contended = fakeDatabase({
+      modes: ["delete", "delete", "delete"],
+      onSet: (attempt) => {
+        if (attempt < 3) {
+          const error = new Error(`synthetic ${transientCode}`);
+          error.code = transientCode;
+          throw error;
+        }
+        return { journal_mode: "wal" };
+      },
+    });
+    assert(
+      enableWalMode(contended, { attempts: 5, retryDelay: 0 }) === "wal",
+      `a transient ${transientCode} was not retried into WAL`,
+    );
+    assert(contended.sets === 3, `a transient ${transientCode} did not retry until it succeeded`);
+  }
+
+  // SQLite answers with the mode it ended up in instead of failing when another
+  // connection blocks the change, so a quiet "delete" is a failure too.
+  const refused = fakeDatabase({ modes: ["delete"], onSet: () => ({ journal_mode: "delete" }) });
+  assert(
+    enableWalMode(refused, { attempts: 3, retryDelay: 0, warn: () => {} }) === "delete",
+    "a blocked change should retry, not report wal",
+  );
+  assert(refused.sets === 3, "a silently-refused journal-mode change was not retried");
+
+  let walWarning = "";
+  const exhausted = fakeDatabase({
+    modes: ["delete"],
+    onSet: () => {
+      const error = new Error("synthetic unrecoverable lock");
+      error.code = "SQLITE_IOERR_TRUNCATE";
+      throw error;
+    },
+  });
+  const degraded = enableWalMode(exhausted, { attempts: 2, retryDelay: 0, warn: (message) => { walWarning = message; } });
+  assert(degraded === "delete", "an exhausted retry should report the mode actually in force");
+  assert(walWarning.includes("without WAL journaling"), `exhausted WAL retries did not warn: ${walWarning}`);
+
+  // A fault that is not contention must escape immediately rather than being
+  // retried into a slow, misreported degradation.
+  let corruptError = "";
+  try {
+    enableWalMode(
+      fakeDatabase({
+        modes: ["delete"],
+        onSet: () => {
+          const error = new Error("database disk image is malformed");
+          error.code = "SQLITE_CORRUPT";
+          throw error;
+        },
+      }),
+      { attempts: 5, retryDelay: 0 },
+    );
+  } catch (error) {
+    corruptError = error instanceof Error ? error.message : String(error);
+  }
+  assert(corruptError.includes("malformed"), `a non-transient SQLite error was swallowed: ${corruptError}`);
+
+  // An in-memory database cannot journal to a file; that is a terminal answer,
+  // not something to spend the whole retry budget on.
+  const memory = fakeDatabase({
+    modes: ["memory"],
+    onSet: () => {
+      throw new Error("journal_mode was rewritten on an in-memory database");
+    },
+  });
+  assert(enableWalMode(memory) === "memory", "an in-memory database should report memory");
+  assert(memory.sets === 0, "an in-memory database must not attempt the journal-mode change");
   assert(dbPath === process.env.CLAW_TASK_HUB_DB, `CLAW_TASK_HUB_DB did not select the test DB: ${dbPath}`);
   assert(
     resolveDbPath({ CODEX_TASK_HUB_DB: join(tempDir, "legacy-env.sqlite") }, false) === join(tempDir, "legacy-env.sqlite"),
