@@ -1,8 +1,10 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
+import { stopProcessTree } from "./process-tree.mjs";
+import { removeTemporaryDirectory } from "./temp-dir.mjs";
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -18,16 +20,6 @@ function freePort() {
       server.close(() => resolve(port));
     });
   });
-}
-
-async function stop(child) {
-  if (!child || child.exitCode !== null) return;
-  child.kill("SIGTERM");
-  await Promise.race([
-    new Promise((resolve) => child.once("exit", resolve)),
-    new Promise((resolve) => setTimeout(resolve, 3000)),
-  ]);
-  if (child.exitCode === null) child.kill("SIGKILL");
 }
 
 const outputRoot = mkdtempSync(join(tmpdir(), "claw-task-hub-release-smoke-"));
@@ -60,6 +52,7 @@ try {
     },
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
+    detached: process.platform !== "win32",
   });
   let diagnostics = "";
   child.stdout.on("data", (chunk) => { diagnostics += chunk.toString(); });
@@ -87,6 +80,6 @@ try {
   assert(readFileSync(join(result.stage, "package.json"), "utf8").includes('"packageManager": "bun@1.3.14"'), "package lost the pinned Bun contract");
   console.log("release package smoke passed");
 } finally {
-  await stop(child);
-  rmSync(outputRoot, { recursive: true, force: true });
+  await stopProcessTree(child);
+  removeTemporaryDirectory(outputRoot);
 }

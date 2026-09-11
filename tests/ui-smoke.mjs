@@ -1,10 +1,11 @@
 import { chromium } from "playwright";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { Database } from "bun:sqlite";
+import { removeTemporaryDirectory } from "./temp-dir.mjs";
 
 const tempDir = mkdtempSync(join(tmpdir(), "claw-task-hub-ui-smoke-"));
 const apiPort = await getFreePort();
@@ -168,7 +169,7 @@ function cleanup() {
       }
     }
   }
-  rmSync(tempDir, { recursive: true, force: true });
+  removeTemporaryDirectory(tempDir);
 }
 
 process.on("exit", cleanup);

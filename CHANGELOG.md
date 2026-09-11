@@ -11,6 +11,12 @@ All notable changes to Claw Task Hub will be documented in this file.
 - Added one canonical contribution gate, repository hooks, bounded pull-request CI, SemVer validation, packaged-runtime smoke tests, and tag-only GitHub Releases.
 - Consolidated shared UI styling, repaired responsive detail layouts, removed misleading and duplicate controls, and added browser regressions for those states.
 - Added explicit mutation notifications so open UIs refresh after successful API, CLI, or MCP writes without database polling.
+- Made temporary SQLite test cleanup Windows-safe by isolating store-regression database handles in a worker process and retrying transient filesystem locks.
+- Made database activation fully release the previous Bun SQLite connection so switched databases can be deleted on Windows.
+- Applied SQLite's busy timeout before WAL negotiation so concurrent CLI startup waits instead of failing with `SQLITE_BUSY_RECOVERY`.
+- Made release smoke teardown terminate and await the complete packaged process tree before retrying transient Windows filesystem locks.
+- Added an append-only compatibility migration for existing issue dependency tables missing the current `source` field.
+- Read SQLite's journal mode before rewriting it and retried contention-shaped `SQLITE_IOERR_*` failures, so concurrent hub startup on Windows no longer dies with `SQLITE_IOERR_TRUNCATE`.
 
 ## [0.1.0]
 

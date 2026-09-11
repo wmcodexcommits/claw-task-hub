@@ -1,8 +1,10 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { createServer } from "node:net";
+import { stopProcessTree } from "./process-tree.mjs";
+import { removeTemporaryDirectory } from "./temp-dir.mjs";
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -139,36 +141,6 @@ function spawnBun(args, extraEnv = {}) {
     });
   }
   return spawn(bun, args, { cwd: process.cwd(), env: childEnv, detached: true });
-}
-
-async function stopProcessTree(child) {
-  if (!child.pid) return;
-  let settled = false;
-  const exited = new Promise((resolve) => {
-    child.once("exit", resolve);
-    child.once("close", resolve);
-  });
-  exited.then(() => {
-    settled = true;
-  });
-  if (process.platform === "win32") {
-    spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore" });
-  } else {
-    try {
-      process.kill(-child.pid, "SIGTERM");
-    } catch {
-      child.kill("SIGTERM");
-    }
-  }
-  await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, 3000))]);
-  if (!settled && process.platform !== "win32") {
-    try {
-      process.kill(-child.pid, "SIGKILL");
-    } catch {
-      child.kill("SIGKILL");
-    }
-    await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, 1000))]);
-  }
 }
 
 function getFreePort() {
@@ -333,7 +305,10 @@ async function assertApiCrudParity() {
     result = await request("/databases/api-crud-database.sqlite", { method: "DELETE", body: JSON.stringify({ confirm: false }) });
     assert(result.response.status === 400, "HTTP database deletion did not fail closed without confirmation");
     result = await request("/databases/api-crud-database.sqlite", { method: "DELETE", body: JSON.stringify({ confirm: true }) });
-    assert(result.response.ok && !result.body.databases.some((database) => database.id === "api-crud-database.sqlite"), "HTTP delete database failed");
+    assert(
+      result.response.ok && !result.body.databases.some((database) => database.id === "api-crud-database.sqlite"),
+      `HTTP delete database failed: ${result.response.status} ${JSON.stringify(result.body)}`,
+    );
   } finally {
     await stopProcessTree(child);
   }
@@ -764,5 +739,5 @@ try {
 
   console.log("Harness smoke passed");
 } finally {
-  rmSync(tempDir, { recursive: true, force: true });
+  removeTemporaryDirectory(tempDir);
 }

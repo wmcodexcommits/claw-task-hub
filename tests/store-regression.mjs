@@ -1,7 +1,10 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
 import { Database } from "bun:sqlite";
+import { removeTemporaryDirectory } from "./temp-dir.mjs";
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -11,10 +14,49 @@ function indexExists(database, name) {
   return Boolean(database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = @name").get({ name }));
 }
 
-const tempDir = mkdtempSync(join(tmpdir(), "claw-task-hub-store-"));
-process.env.CLAW_TASK_HUB_DB = join(tempDir, "test.sqlite");
+if (process.env.CLAW_TASK_HUB_STORE_WORKER !== "1") {
+  const parentTempDir = mkdtempSync(join(tmpdir(), "claw-task-hub-store-"));
+  const result = spawnSync(process.execPath, [fileURLToPath(import.meta.url)], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      CLAW_TASK_HUB_DB: join(parentTempDir, "test.sqlite"),
+      CLAW_TASK_HUB_STORE_WORKER: "1",
+    },
+    stdio: "inherit",
+    windowsHide: true,
+  });
+  let cleanupFailed = false;
+  try {
+    removeTemporaryDirectory(parentTempDir);
+  } catch (error) {
+    cleanupFailed = true;
+    console.error("Store cleanup failed after the worker exited:", error);
+  }
+  process.exit(cleanupFailed ? 1 : result.status ?? 1);
+}
+
+if (!process.env.CLAW_TASK_HUB_DB) throw new Error("Store regression worker requires CLAW_TASK_HUB_DB");
+const tempDir = dirname(process.env.CLAW_TASK_HUB_DB);
 let storeDb;
 let storeRegressionFailed = false;
+
+for (const transientCode of ["EBUSY", "EACCES"]) {
+  let syntheticCleanupAttempts = 0;
+  removeTemporaryDirectory("synthetic-windows-lock", {
+    attempts: 3,
+    retryDelay: 0,
+    remove() {
+      syntheticCleanupAttempts += 1;
+      if (syntheticCleanupAttempts < 3) {
+        const error = new Error("synthetic transient Windows lock");
+        error.code = transientCode;
+        throw error;
+      }
+    },
+  });
+  assert(syntheticCleanupAttempts === 3, `temporary-directory cleanup did not retry a transient ${transientCode} lock`);
+}
 
 try {
   const {
@@ -47,8 +89,123 @@ try {
     upsertProject,
     upsertTeam,
   } = await import("../server/store.ts");
-  const { db, dbPath, initializeDatabase, resolveDbPath, runMigrations } = await import("../server/db.ts");
+  const { db, dbPath, enableWalMode, initializeDatabase, resolveDbPath, runMigrations } = await import("../server/db.ts");
   storeDb = db;
+
+  // Windows reports a sharing violation from a concurrently-opening process as
+  // SQLITE_IOERR_*, which `PRAGMA busy_timeout` does not retry, so eight
+  // parallel hub processes killed one of themselves inside module init with
+  // SQLITE_IOERR_TRUNCATE. These pin the recovery: the pragma is read before it
+  // is written, contention is retried, a real fault still escapes, and an
+  // unrecoverable one degrades loudly instead of throwing.
+  assert(enableWalMode(db) === "wal", "an already-WAL database should report wal");
+
+  function fakeDatabase({ modes, onSet }) {
+    let sets = 0;
+    return {
+      filename: "synthetic.sqlite",
+      reads: 0,
+      get sets() {
+        return sets;
+      },
+      prepare(sql) {
+        if (sql === "PRAGMA journal_mode") {
+          this.reads += 1;
+          return { get: () => ({ journal_mode: modes[Math.min(this.reads, modes.length) - 1] }) };
+        }
+        return {
+          get: () => {
+            sets += 1;
+            return onSet(sets);
+          },
+        };
+      },
+    };
+  }
+
+  // A database already in WAL must never run the exclusive journal-mode change:
+  // that is the step Windows refuses, and skipping it is what makes concurrent
+  // startup safe rather than merely retried.
+  const alreadyWal = fakeDatabase({
+    modes: ["wal"],
+    onSet: () => {
+      throw new Error("journal_mode was rewritten on a database already in WAL");
+    },
+  });
+  assert(enableWalMode(alreadyWal) === "wal", "an already-WAL database should short-circuit");
+  assert(alreadyWal.sets === 0, "an already-WAL database must not attempt the journal-mode change");
+
+  for (const transientCode of ["SQLITE_IOERR_TRUNCATE", "SQLITE_BUSY", "SQLITE_LOCKED_SHAREDCACHE", "SQLITE_PROTOCOL"]) {
+    const contended = fakeDatabase({
+      modes: ["delete", "delete", "delete"],
+      onSet: (attempt) => {
+        if (attempt < 3) {
+          const error = new Error(`synthetic ${transientCode}`);
+          error.code = transientCode;
+          throw error;
+        }
+        return { journal_mode: "wal" };
+      },
+    });
+    assert(
+      enableWalMode(contended, { attempts: 5, retryDelay: 0 }) === "wal",
+      `a transient ${transientCode} was not retried into WAL`,
+    );
+    assert(contended.sets === 3, `a transient ${transientCode} did not retry until it succeeded`);
+  }
+
+  // SQLite answers with the mode it ended up in instead of failing when another
+  // connection blocks the change, so a quiet "delete" is a failure too.
+  const refused = fakeDatabase({ modes: ["delete"], onSet: () => ({ journal_mode: "delete" }) });
+  assert(
+    enableWalMode(refused, { attempts: 3, retryDelay: 0, warn: () => {} }) === "delete",
+    "a blocked change should retry, not report wal",
+  );
+  assert(refused.sets === 3, "a silently-refused journal-mode change was not retried");
+
+  let walWarning = "";
+  const exhausted = fakeDatabase({
+    modes: ["delete"],
+    onSet: () => {
+      const error = new Error("synthetic unrecoverable lock");
+      error.code = "SQLITE_IOERR_TRUNCATE";
+      throw error;
+    },
+  });
+  const degraded = enableWalMode(exhausted, { attempts: 2, retryDelay: 0, warn: (message) => { walWarning = message; } });
+  assert(degraded === "delete", "an exhausted retry should report the mode actually in force");
+  assert(walWarning.includes("without WAL journaling"), `exhausted WAL retries did not warn: ${walWarning}`);
+
+  // A fault that is not contention must escape immediately rather than being
+  // retried into a slow, misreported degradation.
+  let corruptError = "";
+  try {
+    enableWalMode(
+      fakeDatabase({
+        modes: ["delete"],
+        onSet: () => {
+          const error = new Error("database disk image is malformed");
+          error.code = "SQLITE_CORRUPT";
+          throw error;
+        },
+      }),
+      { attempts: 5, retryDelay: 0 },
+    );
+  } catch (error) {
+    corruptError = error instanceof Error ? error.message : String(error);
+  }
+  assert(corruptError.includes("malformed"), `a non-transient SQLite error was swallowed: ${corruptError}`);
+
+  // An in-memory database cannot journal to a file; that is a terminal answer,
+  // not something to spend the whole retry budget on.
+  const memory = fakeDatabase({
+    modes: ["memory"],
+    onSet: () => {
+      throw new Error("journal_mode was rewritten on an in-memory database");
+    },
+  });
+  assert(enableWalMode(memory) === "memory", "an in-memory database should report memory");
+  assert(memory.sets === 0, "an in-memory database must not attempt the journal-mode change");
   assert(dbPath === process.env.CLAW_TASK_HUB_DB, `CLAW_TASK_HUB_DB did not select the test DB: ${dbPath}`);
   assert(
     resolveDbPath({ CODEX_TASK_HUB_DB: join(tempDir, "legacy-env.sqlite") }, false) === join(tempDir, "legacy-env.sqlite"),
@@ -95,6 +252,7 @@ try {
   assert(appliedMigrations.includes("0003_context_bindings"), "default DB did not record the context bindings migration");
   assert(appliedMigrations.includes("0004_project_updates_and_issue_dependencies"), "default DB did not record project update/dependency migration");
   assert(appliedMigrations.includes("0005_project_target_date"), "default DB did not record the project target date migration");
+  assert(appliedMigrations.includes("0006_issue_dependency_source"), "default DB did not record the dependency source compatibility migration");
   assert(db.prepare("PRAGMA table_info(projects)").all().some((column) => column.name === "target_date"), "default DB does not expose the project target_date column");
   assert(indexExists(db, "idx_comments_issue_created"), "default DB did not create the comments issue/date index");
   assert(indexExists(db, "idx_context_bindings_lookup"), "default DB did not create the context binding lookup index");
@@ -108,7 +266,8 @@ try {
     assert(freshMigration.applied.includes("0003_context_bindings"), "fresh DB did not apply the context bindings migration");
     assert(freshMigration.applied.includes("0004_project_updates_and_issue_dependencies"), "fresh DB did not apply project update/dependency migration");
     assert(freshMigration.applied.includes("0005_project_target_date"), "fresh DB did not apply the project target date migration");
-    assert(freshMigrationDb.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get().count === 5, "fresh DB stored the wrong migration count");
+    assert(freshMigration.applied.includes("0006_issue_dependency_source"), "fresh DB did not apply the dependency source compatibility migration");
+    assert(freshMigrationDb.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get().count === 6, "fresh DB stored the wrong migration count");
     assert(indexExists(freshMigrationDb, "idx_comments_issue_created"), "fresh DB did not create the comments issue/date index");
     assert(indexExists(freshMigrationDb, "idx_context_bindings_lookup"), "fresh DB did not create the context binding lookup index");
     assert(runMigrations(freshMigrationDb).applied.length === 0, "fresh DB migration rerun was not a no-op");
@@ -132,8 +291,9 @@ try {
     assert(legacyMigration.applied.includes("0003_context_bindings"), "legacy migration table did not accept the context bindings migration");
     assert(legacyMigration.applied.includes("0004_project_updates_and_issue_dependencies"), "legacy migration table did not accept project update/dependency migration");
     assert(legacyMigration.applied.includes("0005_project_target_date"), "legacy migration table did not accept the project target date migration");
+    assert(legacyMigration.applied.includes("0006_issue_dependency_source"), "legacy migration table did not accept the dependency source compatibility migration");
     const legacyRows = legacyMigrationDb.prepare("SELECT id, name, description FROM schema_migrations ORDER BY id").all();
-    assert(legacyRows.length === 5, `legacy migration table stored wrong row count: ${legacyRows.length}`);
+    assert(legacyRows.length === 6, `legacy migration table stored wrong row count: ${legacyRows.length}`);
     assert(legacyRows.every((row) => row.name && row.description), "legacy migration table has incomplete name/description values");
     assert(indexExists(legacyMigrationDb, "idx_comments_issue_created"), "legacy DB did not create the comments issue/date index");
     assert(indexExists(legacyMigrationDb, "idx_context_bindings_lookup"), "legacy DB did not create the context binding lookup index");
@@ -150,6 +310,7 @@ try {
     assert(existingMigration.applied.includes("0003_context_bindings"), "existing DB did not apply the context bindings migration");
     assert(existingMigration.applied.includes("0004_project_updates_and_issue_dependencies"), "existing DB did not apply project update/dependency migration");
     assert(existingMigration.applied.includes("0005_project_target_date"), "existing DB did not apply the project target date migration");
+    assert(existingMigration.applied.includes("0006_issue_dependency_source"), "existing DB did not apply the dependency source compatibility migration");
     assert(indexExists(existingMigrationDb, "idx_comments_issue_created"), "existing DB did not create the comments issue/date index");
     assert(indexExists(existingMigrationDb, "idx_context_bindings_lookup"), "existing DB did not create the context binding lookup index");
     const marker = existingMigrationDb.prepare("SELECT id FROM preserved_marker").get();
@@ -175,11 +336,52 @@ try {
     assert(ftsRepairMigration.applied.includes("0003_context_bindings"), "context bindings migration did not rerun on a pre-metadata DB");
     assert(ftsRepairMigration.applied.includes("0004_project_updates_and_issue_dependencies"), "project update/dependency migration did not rerun on a pre-metadata DB");
     assert(ftsRepairMigration.applied.includes("0005_project_target_date"), "project target date migration did not rerun on a pre-metadata DB");
+    assert(ftsRepairMigration.applied.includes("0006_issue_dependency_source"), "dependency source compatibility migration did not rerun on a pre-metadata DB");
     assert(existingMigrationDb.prepare("SELECT COUNT(*) AS count FROM issues WHERE id = 'premigration_fts_issue'").get().count === 1, "baseline migration did not preserve an existing issue");
     assert(existingMigrationDb.prepare("SELECT COUNT(*) AS count FROM comments WHERE id = 'premigration_comment'").get().count === 1, "baseline migration did not preserve an existing comment");
     assert(existingMigrationDb.prepare("SELECT COUNT(*) AS count FROM issue_fts WHERE issue_fts MATCH 'Premigration'").get().count === 1, "baseline migration did not rebuild FTS for pre-existing issues");
   } finally {
     existingMigrationDb.close();
+  }
+
+  const dependencySourceMigrationDb = new Database(join(tempDir, "dependency-source-migration.sqlite"), { strict: true });
+  try {
+    dependencySourceMigrationDb.exec(`
+      CREATE TABLE schema_migrations (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        applied_at TEXT NOT NULL
+      );
+      INSERT INTO schema_migrations (id, name, applied_at) VALUES
+        ('0001_baseline_schema', 'baseline', '2026-01-01T00:00:00.000Z'),
+        ('0002_comments_issue_created_index', 'comments index', '2026-01-01T00:00:00.000Z'),
+        ('0003_context_bindings', 'context bindings', '2026-01-01T00:00:00.000Z'),
+        ('0004_project_updates_and_issue_dependencies', 'dependencies', '2026-01-01T00:00:00.000Z'),
+        ('0005_project_target_date', 'project target date', '2026-01-01T00:00:00.000Z');
+      CREATE TABLE issue_dependencies (
+        id TEXT PRIMARY KEY,
+        external_id TEXT UNIQUE,
+        issue_id TEXT NOT NULL,
+        blocker_issue_id TEXT NOT NULL,
+        reason TEXT,
+        status TEXT NOT NULL DEFAULT 'open',
+        resolved_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(issue_id, blocker_issue_id)
+      );
+    `);
+    const compatibilityMigration = initializeDatabase(dependencySourceMigrationDb);
+    assert(compatibilityMigration.applied.length === 1 && compatibilityMigration.applied[0] === "0006_issue_dependency_source", "existing dependency table did not receive only the compatibility migration");
+    assert(dependencySourceMigrationDb.prepare("PRAGMA table_info(issue_dependencies)").all().some((column) => column.name === "source"), "compatibility migration did not add issue_dependencies.source");
+    dependencySourceMigrationDb.prepare(`
+      INSERT INTO issue_dependencies (id, issue_id, blocker_issue_id, created_at, updated_at)
+      VALUES ('legacy-dependency', 'issue-a', 'issue-b', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')
+    `).run();
+    assert(dependencySourceMigrationDb.prepare("SELECT source FROM issue_dependencies WHERE id='legacy-dependency'").get().source === "local", "compatibility migration did not backfill the dependency source default");
+    assert(runMigrations(dependencySourceMigrationDb).applied.length === 0, "dependency source compatibility migration was not idempotent");
+  } finally {
+    dependencySourceMigrationDb.close();
   }
   ensureDefaultTeam();
   const firstNullExternalTeam = upsertTeam({
@@ -970,7 +1172,6 @@ try {
   console.error("Store regression failed:", error);
 } finally {
   storeDb?.close();
-  rmSync(tempDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
 }
 
 if (!storeRegressionFailed) console.log("Store regression passed");
