@@ -292,6 +292,7 @@ bun run public-hygiene
 ## Documentation
 
 - Agent and harness contract: [docs/AGENTIC_HARNESS.md](docs/AGENTIC_HARNESS.md)
+- Registering external Postgres/Supabase connections: [docs/EXTERNAL_DATABASES.md](docs/EXTERNAL_DATABASES.md)
 - Optional history import from Linear: [docs/LINEAR_MIGRATION.md](docs/LINEAR_MIGRATION.md)
 - Launch kit and announcement drafts: [docs/LAUNCH.md](docs/LAUNCH.md)
 - Public release readiness: [docs/GITHUB_OSS_READINESS.md](docs/GITHUB_OSS_READINESS.md)

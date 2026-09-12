@@ -6,6 +6,7 @@ import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { activateManagedDatabase, createManagedDatabase, databaseIdFromName, dbPath, deleteManagedDatabase, getManagedDatabase, listManagedDatabases } from "./db.js";
+import { deleteExternalConnection, listExternalConnections, registerExternalConnection, testExternalConnection } from "./db-connections.js";
 import { dataSnapshot } from "./data-snapshot.js";
 import {
   dashboard,
@@ -228,6 +229,49 @@ app.delete("/api/databases/:id", (req, res) => {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const status = message.startsWith("Database not found:") ? 404 : message.startsWith("The active database") ? 409 : 400;
+    res.status(status).json({ error: message });
+  }
+});
+
+// External (Postgres/Supabase) connections are registered and testable, but
+// intentionally have no /activate route: the store layer below still talks to
+// SQLite synchronously, so pointing "active" at one of these would silently
+// break every read and write instead of doing what it looks like it does.
+// See server/db-connections.ts for the full reasoning.
+app.get("/api/db-connections", (_req, res) => res.json({ connections: listExternalConnections() }));
+app.post("/api/db-connections", (req, res) => {
+  const schema = z.object({
+    name: z.string().trim().min(1).max(80),
+    kind: z.enum(["postgres", "supabase"]),
+    connectionString: z.string().trim().min(1).max(4096).optional(),
+    connectionStringEnv: z.string().trim().min(1).max(200).optional(),
+    ssl: z.boolean().optional(),
+  });
+  try {
+    const value = schema.parse(req.body);
+    const connection = registerExternalConnection(value);
+    res.status(201).json({ connection });
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+app.post("/api/db-connections/:id/test", async (req, res) => {
+  try {
+    const result = await testExternalConnection(req.params.id);
+    res.status(result.ok ? 200 : 502).json(result);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    res.status(message.startsWith("Connection not found:") ? 404 : 400).json({ error: message });
+  }
+});
+app.delete("/api/db-connections/:id", (req, res) => {
+  const schema = z.object({ confirm: z.literal(true) });
+  try {
+    const value = schema.parse(req.body);
+    res.json({ connections: deleteExternalConnection(req.params.id, value.confirm) });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const status = message.startsWith("Connection not found:") ? 404 : 400;
     res.status(status).json({ error: message });
   }
 });
@@ -479,10 +523,32 @@ const server = app.listen(port, host, () => {
 // and the already-running service went on answering with six-hour-old code
 // while the files on disk were edited three times. Nothing in the UI or the
 // API could show that, because the API was the stale thing.
-server.on("error", async (error: NodeJS.ErrnoException) => {
+//
+// The listener is deliberately synchronous. An async EventEmitter listener that
+// rejects drops its rejection on the floor, and this listener is the one thing
+// standing between a lost port and a silent death -- so the async probe runs in
+// an IIFE whose failure still reaches the exit below, and the exit lives in a
+// finally so no path can skip it.
+server.on("error", (error: NodeJS.ErrnoException) => {
+  void (async () => {
+    try {
+      await reportStartupFailure(error);
+    } catch (reportingError) {
+      console.error(
+        `Claw Task Hub API could not report its startup failure: ${
+          reportingError instanceof Error ? reportingError.message : String(reportingError)
+        }`,
+      );
+    } finally {
+      process.exit(1);
+    }
+  })();
+});
+
+async function reportStartupFailure(error: NodeJS.ErrnoException) {
   if (error.code !== "EADDRINUSE") {
     console.error(`Claw Task Hub API failed to start: ${error.message}`);
-    process.exit(1);
+    return;
   }
 
   console.error(`Claw Task Hub API cannot start: ${host}:${port} is already in use.`);
@@ -511,5 +577,4 @@ server.on("error", async (error: NodeJS.ErrnoException) => {
     console.error(
       "Something is listening there and did not answer /api/health. Set PORT to use a different port.");
   }
-  process.exit(1);
-});
+}

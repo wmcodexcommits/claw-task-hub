@@ -1787,7 +1787,11 @@ export function ensureIssueIdentifiers() {
     const rows = db.prepare(`
       SELECT id, identifier
       FROM issues
-      ORDER BY created_at, rowid
+      -- id, not rowid, as the tiebreaker: rowid is a SQLite implicit column that
+      -- Postgres does not have. Both are arbitrary among rows sharing a
+      -- created_at; what this ordering has to be is stable, so that assigning
+      -- identifiers twice assigns the same ones.
+      ORDER BY created_at, id
     `).all() as { id: string; identifier: string | null }[];
     const used = new Set(rows.map((row) => row.identifier).filter(isShortIssueIdentifier));
     let next = nextLocalIssueNumber(used);

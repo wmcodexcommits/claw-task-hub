@@ -212,6 +212,21 @@ type DatabaseCatalogue = {
   databases: ManagedDatabase[];
 };
 
+type ExternalDatabaseKind = "postgres" | "supabase";
+
+type ExternalConnection = {
+  id: string;
+  name: string;
+  kind: ExternalDatabaseKind;
+  ssl: boolean;
+  target: string;
+  secretSource: "stored" | "env";
+  createdAt: string;
+  lastTestedAt: string | null;
+  lastTestStatus: "ok" | "error" | null;
+  lastTestError: string | null;
+};
+
 type RefreshSnapshot = {
   refreshed_at: string;
   projects: Project[];
@@ -306,6 +321,11 @@ function App() {
   const [databaseDeleting, setDatabaseDeleting] = useState(false);
   const [databaseDeleteError, setDatabaseDeleteError] = useState<string | null>(null);
   const [databaseCatalogue, setDatabaseCatalogue] = useState<DatabaseCatalogue | null>(null);
+  const [externalConnections, setExternalConnections] = useState<ExternalConnection[]>([]);
+  const [externalConnectionTestingId, setExternalConnectionTestingId] = useState<string | null>(null);
+  const [externalConnectionDeleteTarget, setExternalConnectionDeleteTarget] = useState<ExternalConnection | null>(null);
+  const [externalConnectionDeleting, setExternalConnectionDeleting] = useState(false);
+  const [externalConnectionDeleteError, setExternalConnectionDeleteError] = useState<string | null>(null);
   const [healthState, setHealthState] = useState<HealthState>("unknown");
   const [darkMode, setDarkMode] = useState(() => window.localStorage.getItem("claw-task-hub-theme") !== "light");
   const [projectFiltersOpen, setProjectFiltersOpen] = useState(false);
@@ -740,6 +760,89 @@ function App() {
     }
   }
 
+  const refreshExternalConnections = useCallback(async () => {
+    try {
+      const result = await api<{ connections: ExternalConnection[] }>("/db-connections");
+      setExternalConnections(result.connections);
+    } catch {
+      // External connections are additive; a failed fetch here should not
+      // block the rest of the app from loading.
+    }
+  }, []);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      void refreshExternalConnections();
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [refreshExternalConnections]);
+
+  async function createExternalConnection(event: FormEvent<HTMLFormElement>, kind: ExternalDatabaseKind) {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const data = new FormData(form);
+    const name = String(data.get("name") ?? "").trim();
+    const connectionString = String(data.get("connectionString") ?? "").trim();
+    const connectionStringEnv = String(data.get("connectionStringEnv") ?? "").trim();
+    const ssl = data.get("ssl") === "on";
+    if (!name) return;
+    setDatabaseError(null);
+    setDatabaseSaving(true);
+    try {
+      await api<{ connection: ExternalConnection }>("/db-connections", {
+        method: "POST",
+        body: JSON.stringify({
+          name,
+          kind,
+          ssl,
+          ...(connectionString ? { connectionString } : { connectionStringEnv }),
+        }),
+      });
+      form.reset();
+      setDatabaseEditorOpen(false);
+      await refreshExternalConnections();
+    } catch (error) {
+      setDatabaseError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setDatabaseSaving(false);
+    }
+  }
+
+  async function runExternalConnectionTest(id: string) {
+    setExternalConnectionTestingId(id);
+    try {
+      await api<{ ok: boolean; error?: string }>(`/db-connections/${encodeURIComponent(id)}/test`, {
+        method: "POST",
+        body: "{}",
+      });
+    } catch {
+      // The failure is recorded server-side against the entry and shows up
+      // once the refreshed list comes back below.
+    } finally {
+      setExternalConnectionTestingId(null);
+      await refreshExternalConnections();
+    }
+  }
+
+  async function deleteExternalConnectionEntry() {
+    const target = externalConnectionDeleteTarget;
+    if (!target) return;
+    setExternalConnectionDeleteError(null);
+    setExternalConnectionDeleting(true);
+    try {
+      await api(`/db-connections/${encodeURIComponent(target.id)}`, {
+        method: "DELETE",
+        body: JSON.stringify({ confirm: true }),
+      });
+      setExternalConnectionDeleteTarget(null);
+      await refreshExternalConnections();
+    } catch (error) {
+      setExternalConnectionDeleteError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setExternalConnectionDeleting(false);
+    }
+  }
+
   function resetForDatabaseChange() {
     setProjects([]);
     setWorkspaceIssues([]);
@@ -924,6 +1027,8 @@ function App() {
     <main className="linear-shell">
       <TopChrome
         catalogue={databaseCatalogue}
+        externalConnections={externalConnections}
+        externalConnectionTestingId={externalConnectionTestingId}
         healthState={healthState}
         darkMode={darkMode}
         onNewDatabase={() => {
@@ -934,6 +1039,11 @@ function App() {
         onDeleteDatabase={(database) => {
           setDatabaseDeleteError(null);
           setDatabaseDeleteTarget(database);
+        }}
+        onTestExternalConnection={(id) => void runExternalConnectionTest(id)}
+        onDeleteExternalConnection={(connection) => {
+          setExternalConnectionDeleteError(null);
+          setExternalConnectionDeleteTarget(connection);
         }}
         onToggleDarkMode={() => setDarkMode((enabled) => !enabled)}
         onRefresh={() => refresh(true, true)}
@@ -1068,7 +1178,8 @@ function App() {
           saving={databaseSaving}
           error={databaseError}
           onClose={() => setDatabaseEditorOpen(false)}
-          onSubmit={createDatabase}
+          onSubmitSqlite={createDatabase}
+          onSubmitExternal={createExternalConnection}
         />
       ) : null}
       {databaseDeleteTarget ? (
@@ -1080,6 +1191,17 @@ function App() {
             if (!databaseDeleting) setDatabaseDeleteTarget(null);
           }}
           onConfirm={() => void deleteDatabase()}
+        />
+      ) : null}
+      {externalConnectionDeleteTarget ? (
+        <DeleteExternalConnectionDialog
+          connection={externalConnectionDeleteTarget}
+          deleting={externalConnectionDeleting}
+          error={externalConnectionDeleteError}
+          onClose={() => {
+            if (!externalConnectionDeleting) setExternalConnectionDeleteTarget(null);
+          }}
+          onConfirm={() => void deleteExternalConnectionEntry()}
         />
       ) : null}
       {issueEditorOpen && projectDetail ? (
@@ -1099,20 +1221,28 @@ function App() {
 
 function TopChrome({
   catalogue,
+  externalConnections,
+  externalConnectionTestingId,
   healthState,
   darkMode,
   onNewDatabase,
   onActivateDatabase,
   onDeleteDatabase,
+  onTestExternalConnection,
+  onDeleteExternalConnection,
   onToggleDarkMode,
   onRefresh,
 }: {
   catalogue: DatabaseCatalogue | null;
+  externalConnections: ExternalConnection[];
+  externalConnectionTestingId: string | null;
   healthState: HealthState;
   darkMode: boolean;
   onNewDatabase: () => void;
   onActivateDatabase: (id: string) => Promise<void>;
   onDeleteDatabase: (database: ManagedDatabase) => void;
+  onTestExternalConnection: (id: string) => void;
+  onDeleteExternalConnection: (connection: ExternalConnection) => void;
   onToggleDarkMode: () => void;
   onRefresh: () => Promise<void>;
 }) {
@@ -1178,6 +1308,46 @@ function TopChrome({
               </div>
             ))}
             <button role="menuitem" onClick={() => { setMenuOpen(false); onNewDatabase(); }}>Create database</button>
+            {externalConnections.length > 0 ? (
+              <>
+                <strong>External connections</strong>
+                {externalConnections.map((connection) => {
+                  const statusLabel = connection.lastTestStatus === "ok"
+                    ? "last test: ok"
+                    : connection.lastTestStatus === "error"
+                      ? `last test failed: ${connection.lastTestError ?? "unknown error"}`
+                      : "not tested yet";
+                  return (
+                    <div className="database-menu-row" key={connection.id} role="presentation">
+                      <button
+                        className="database-select"
+                        role="menuitem"
+                        disabled
+                        title={`${connection.kind} — ${connection.target} — ${statusLabel}`}
+                      >{connection.name} ({connection.kind}{connection.lastTestStatus ? `, ${connection.lastTestStatus}` : ""})</button>
+                      <button
+                        className="database-test"
+                        role="menuitem"
+                        aria-label={`Test ${connection.name}`}
+                        title="Test connection"
+                        disabled={externalConnectionTestingId === connection.id}
+                        onClick={() => onTestExternalConnection(connection.id)}
+                      ><RefreshCw className={externalConnectionTestingId === connection.id ? "refresh-spin" : undefined} size={14} /></button>
+                      <button
+                        className="database-delete"
+                        role="menuitem"
+                        aria-label={`Delete ${connection.name}`}
+                        title={`Delete ${connection.name}`}
+                        onClick={() => {
+                          setMenuOpen(false);
+                          onDeleteExternalConnection(connection);
+                        }}
+                      ><Trash2 size={14} /></button>
+                    </div>
+                  );
+                })}
+              </>
+            ) : null}
             <button role="menuitemcheckbox" aria-checked={darkMode} onClick={onToggleDarkMode}>Dark mode {darkMode ? "✓" : ""}</button>
           </div>
         ) : null}
@@ -1414,7 +1584,21 @@ function ProjectDialog({ saving, error, onClose, onSubmit }: { saving: boolean; 
   );
 }
 
-function DatabaseDialog({ saving, error, onClose, onSubmit }: { saving: boolean; error: string | null; onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) {
+function DatabaseDialog({
+  saving,
+  error,
+  onClose,
+  onSubmitSqlite,
+  onSubmitExternal,
+}: {
+  saving: boolean;
+  error: string | null;
+  onClose: () => void;
+  onSubmitSqlite: (event: FormEvent<HTMLFormElement>) => void;
+  onSubmitExternal: (event: FormEvent<HTMLFormElement>, kind: ExternalDatabaseKind) => void;
+}) {
+  const [activeTab, setActiveTab] = useState<"sqlite" | ExternalDatabaseKind>("sqlite");
+  const [secretMode, setSecretMode] = useState<"stored" | "env">("stored");
   const nameRef = useRef<HTMLInputElement>(null);
   const pathRef = useRef<HTMLInputElement>(null);
   const [picking, setPicking] = useState(false);
@@ -1441,20 +1625,70 @@ function DatabaseDialog({ saving, error, onClose, onSubmit }: { saving: boolean;
       <section className="issue-dialog database-dialog" role="dialog" aria-modal="true" aria-labelledby="database-dialog-title" onMouseDown={(event) => event.stopPropagation()}>
         <button className="dialog-close" onClick={onClose} aria-label="Close new database"><X size={16} /></button>
         <h2 id="database-dialog-title">New database</h2>
-        <p>Choose where to store the new SQLite database, then make it active. Existing databases are preserved and remain available from the database menu.</p>
-        <form className="database-form" onSubmit={onSubmit}>
-          <label><span>Name</span><input ref={nameRef} name="name" aria-label="Database name" required autoFocus maxLength={80} /></label>
-          <label>
-            <span>Location</span>
-            <div className="database-path-control">
-              <input ref={pathRef} name="path" aria-label="Database location" placeholder="Default managed database folder" maxLength={4096} />
-              <button type="button" disabled={picking} onClick={() => void browseForDatabase()}><FolderOpen size={15} />{picking ? "Choosing…" : "Browse…"}</button>
-            </div>
-            <small>Leave blank to use the managed database folder, or choose an absolute `.sqlite` path.</small>
-          </label>
-          {error || pickerError ? <div className="create-error"><AlertTriangle size={14} />{error || pickerError}</div> : null}
-          <div className="project-form-actions"><button type="button" onClick={onClose}>Cancel</button><button type="submit" disabled={saving}>{saving ? "Creating" : "Create database"}</button></div>
-        </form>
+
+        <div className="database-kind-tabs" role="tablist" aria-label="Database type">
+          <button type="button" role="tab" aria-selected={activeTab === "sqlite"} className={activeTab === "sqlite" ? "pill active" : "pill"} onClick={() => setActiveTab("sqlite")}>SQLite</button>
+          <button type="button" role="tab" aria-selected={activeTab === "postgres"} className={activeTab === "postgres" ? "pill active" : "pill"} onClick={() => setActiveTab("postgres")}>Postgres</button>
+          <button type="button" role="tab" aria-selected={activeTab === "supabase"} className={activeTab === "supabase" ? "pill active" : "pill"} onClick={() => setActiveTab("supabase")}>Supabase</button>
+        </div>
+
+        {activeTab === "sqlite" ? (
+          <>
+            <p>Choose where to store the new SQLite database, then make it active. Existing databases are preserved and remain available from the database menu.</p>
+            <form className="database-form" onSubmit={onSubmitSqlite}>
+              <label><span>Name</span><input ref={nameRef} name="name" aria-label="Database name" required autoFocus maxLength={80} /></label>
+              <label>
+                <span>Location</span>
+                <div className="database-path-control">
+                  <input ref={pathRef} name="path" aria-label="Database location" placeholder="Default managed database folder" maxLength={4096} />
+                  <button type="button" disabled={picking} onClick={() => void browseForDatabase()}><FolderOpen size={15} />{picking ? "Choosing…" : "Browse…"}</button>
+                </div>
+                <small>Leave blank to use the managed database folder, or choose an absolute `.sqlite` path.</small>
+              </label>
+              {error || pickerError ? <div className="create-error"><AlertTriangle size={14} />{error || pickerError}</div> : null}
+              <div className="project-form-actions"><button type="button" onClick={onClose}>Cancel</button><button type="submit" disabled={saving}>{saving ? "Creating" : "Create database"}</button></div>
+            </form>
+          </>
+        ) : (
+          <>
+            <p>
+              {activeTab === "supabase"
+                ? "Register a Supabase connection (Project Settings → Database → Connection string)."
+                : "Register a Postgres-compatible connection — Postgres, Neon, RDS, CockroachDB, or anything else speaking the Postgres wire protocol."}
+              {" "}This registers and test-pings the connection. It does not become the active app database: issues and projects still read and write through the active SQLite database above.
+            </p>
+            <form className="database-form" onSubmit={(event) => onSubmitExternal(event, activeTab)}>
+              <label><span>Name</span><input name="name" aria-label="Connection name" required maxLength={80} /></label>
+
+              <div className="database-kind-tabs" role="tablist" aria-label="Where the connection string comes from">
+                <button type="button" role="tab" aria-selected={secretMode === "stored"} className={secretMode === "stored" ? "pill active" : "pill"} onClick={() => setSecretMode("stored")}>Paste connection string</button>
+                <button type="button" role="tab" aria-selected={secretMode === "env"} className={secretMode === "env" ? "pill active" : "pill"} onClick={() => setSecretMode("env")}>Use an environment variable</button>
+              </div>
+
+              {secretMode === "stored" ? (
+                <label>
+                  <span>Connection string</span>
+                  <input name="connectionString" aria-label="Connection string" type="password" placeholder="postgres://user:password@host:5432/database" maxLength={4096} required />
+                  <small>Stored locally under `data/`, which is gitignored, and never committed.</small>
+                </label>
+              ) : (
+                <label>
+                  <span>Environment variable name</span>
+                  <input name="connectionStringEnv" aria-label="Environment variable name" placeholder="CLAW_TASK_HUB_PG_PROD_URL" maxLength={200} required />
+                  <small>Set this variable before testing the connection. Nothing is stored on disk.</small>
+                </label>
+              )}
+
+              <label className="database-checkbox-row">
+                <input name="ssl" type="checkbox" defaultChecked />
+                <span>Require TLS (recommended; required by Supabase)</span>
+              </label>
+
+              {error ? <div className="create-error"><AlertTriangle size={14} />{error}</div> : null}
+              <div className="project-form-actions"><button type="button" onClick={onClose}>Cancel</button><button type="submit" disabled={saving}>{saving ? "Registering" : "Register connection"}</button></div>
+            </form>
+          </>
+        )}
       </section>
     </div>
   );
@@ -1487,6 +1721,39 @@ function DeleteDatabaseDialog({
         <div className="project-form-actions">
           <button type="button" disabled={deleting} onClick={onClose}>Cancel</button>
           <button className="danger-action" type="button" disabled={deleting} onClick={onConfirm}>{deleting ? "Deleting" : "Delete database"}</button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function DeleteExternalConnectionDialog({
+  connection,
+  deleting,
+  error,
+  onClose,
+  onConfirm,
+}: {
+  connection: ExternalConnection;
+  deleting: boolean;
+  error: string | null;
+  onClose: () => void;
+  onConfirm: () => void;
+}) {
+  return (
+    <div className="issue-dialog-backdrop" role="presentation" onMouseDown={onClose}>
+      <section className="issue-dialog database-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-connection-dialog-title" onMouseDown={(event) => event.stopPropagation()}>
+        <button className="dialog-close" disabled={deleting} onClick={onClose} aria-label="Close delete connection"><X size={16} /></button>
+        <h2 id="delete-connection-dialog-title">Delete connection?</h2>
+        <p>This removes the registered {connection.kind} connection. It does not affect any external database{" — "}only the local registration is deleted.</p>
+        <div className="database-delete-summary">
+          <strong>{connection.name}</strong>
+          <code>{connection.target}</code>
+        </div>
+        {error ? <div className="create-error"><AlertTriangle size={14} />{error}</div> : null}
+        <div className="project-form-actions">
+          <button type="button" disabled={deleting} onClick={onClose}>Cancel</button>
+          <button className="danger-action" type="button" disabled={deleting} onClick={onConfirm}>{deleting ? "Deleting" : "Delete connection"}</button>
         </div>
       </section>
     </div>

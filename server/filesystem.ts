@@ -25,7 +25,13 @@ export function removePathWithRetries(path: string, options: RemovePathOptions =
   let lastError: unknown;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
-      remove(path, { recursive: options.recursive, force: options.force });
+      // Node's fs.rmSync tolerates `recursive`/`force` being explicitly
+      // undefined and falls back to their documented `false` defaults; Bun's
+      // implementation validates the key strictly and throws
+      // `The "options.recursive" property must be of type boolean` if it is
+      // present but not a real boolean. Default them here so the value is
+      // always a boolean on both runtimes.
+      remove(path, { recursive: options.recursive ?? false, force: options.force ?? false });
       return;
     } catch (error) {
       lastError = error;

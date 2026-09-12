@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { removePathWithRetries, waitSync } from "./filesystem.js";
+import { clearStatementCache, prepareCached } from "./statement-cache.js";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const dataDir = join(root, "data");
@@ -23,7 +24,33 @@ type SqliteDatabase = Omit<Database, "prepare" | "query"> & {
 };
 
 function openDatabase(path: string): SqliteDatabase {
-  return new Database(path, { strict: true }) as unknown as SqliteDatabase;
+  const database = new Database(path, { strict: true }) as unknown as SqliteDatabase;
+  return withStatementCache(database);
+}
+
+// Route prepare() through the statement cache for every handle this module hands
+// out, so the callers in store.ts get compiled statements without 91 call sites
+// having to ask for them. The cache keys on the instance, so this stays correct
+// across an activation swap.
+//
+// An own property shadows the prototype method; the bound original is kept for
+// the cache to compile through, so a cache miss still reaches real bun:sqlite.
+function withStatementCache(database: SqliteDatabase): SqliteDatabase {
+  // Kill switch. The cache changes statement lifetime rather than SQL, so if it
+  // is ever implicated in a bug this reverts to compiling per call without a
+  // redeploy -- and it makes an A/B measurement run the identical code path.
+  if (isFalsyEnv(process.env.CLAW_TASK_HUB_STATEMENT_CACHE)) return database;
+  // Bind the real prepare before shadowing it, so a cache miss compiles through
+  // bun:sqlite instead of recursing into this wrapper. The cache is keyed on the
+  // handle itself, which is what closeDatabase() clears.
+  const compile = database.prepare.bind(database);
+  Object.defineProperty(database, "prepare", {
+    configurable: true,
+    writable: true,
+    enumerable: false,
+    value: (sql: string) => prepareCached(database, sql, compile),
+  });
+  return database;
 }
 
 export type WalModeOptions = {
@@ -62,6 +89,11 @@ export function resolveDbPath(env: NodeJS.ProcessEnv = process.env, legacyExists
       "use: " + (legacyExists ? legacyDbPath : clawDbPath));
   }
   return legacyExists ? legacyDbPath : clawDbPath;
+}
+
+function isFalsyEnv(value: string | undefined) {
+  if (value === undefined) return false;
+  return ["0", "false", "no", "off"].includes(value.trim().toLowerCase());
 }
 
 function isTruthyEnv(value: string | undefined) {
@@ -255,6 +287,9 @@ function activateOpenDatabase(nextDatabase: SqliteDatabase, nextPath: string) {
 }
 
 function closeDatabase(database: SqliteDatabase) {
+  // close(true) throws rather than closing over live statements, so the cached
+  // statements have to be finalized first or an activation would fail.
+  clearStatementCache(database);
   Bun.gc(true);
   database.close(true);
 }
