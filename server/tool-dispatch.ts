@@ -114,99 +114,99 @@ function splitId(input: Record<string, unknown>, tool: string) {
 
 export async function callHubTool(name: string, args: Record<string, unknown>) {
   if (!hubToolNames.includes(name as HubToolName)) throw new Error(`Unknown tool: ${name}`);
-  const result = dispatchHubTool(name as HubToolName, args);
+  const result = await dispatchHubTool(name as HubToolName, args);
   if (hubWriteTools.has(name as HubToolName)) await notifyOpenUis(`tool:${name}`);
   return result;
 }
 
-function dispatchHubTool(name: HubToolName, args: Record<string, unknown>) {
-  if (name === "dashboard") return dashboard();
-  if (name === "list_teams") return { teams: listTeams() };
-  if (name === "refresh_data") return dataSnapshot(args);
+async function dispatchHubTool(name: HubToolName, args: Record<string, unknown>) {
+  if (name === "dashboard") return await dashboard();
+  if (name === "list_teams") return { teams: await listTeams() };
+  if (name === "refresh_data") return await dataSnapshot(args);
 
   if (name === "list_databases") return listManagedDatabases();
   if (name === "get_database") return { database: getManagedDatabase(requiredString(args, "id", name)) };
   if (name === "create_database") {
     const catalogue = createManagedDatabase(requiredString(args, "name", name), typeof args.path === "string" ? args.path : undefined);
-    ensureDefaultTeam();
+    await ensureDefaultTeam();
     return catalogue;
   }
   if (name === "update_database" || name === "activate_database") {
     if (name === "update_database" && args.active !== true) throw new Error("update_database currently requires active=true");
     const catalogue = activateManagedDatabase(requiredString(args, "id", name));
-    ensureDefaultTeam();
+    await ensureDefaultTeam();
     return catalogue;
   }
   if (name === "delete_database") {
     return deleteManagedDatabase(requiredString(args, "id", name), args.confirm === true);
   }
 
-  if (name === "list_projects") return { projects: listProjects() };
-  if (name === "get_project") return { project: getProject(requiredString(args, "id", name), { issues_per_status: args.issues_per_status }) };
-  if (name === "create_project" || name === "save_project") return { project: upsertProject(args) };
+  if (name === "list_projects") return { projects: await listProjects() };
+  if (name === "get_project") return { project: await getProject(requiredString(args, "id", name), { issues_per_status: args.issues_per_status }) };
+  if (name === "create_project" || name === "save_project") return { project: await upsertProject(args) };
   if (name === "update_project") {
     const { id, value } = splitId(args, name);
-    return { project: updateProject(id, value) };
+    return { project: await updateProject(id, value) };
   }
   if (name === "delete_project") {
-    return deleteProject({
+    return await deleteProject({
       id: requiredString(args, "id", name),
       confirm: args.confirm === true,
       delete_issues: args.delete_issues === true,
       force: args.force === true,
     });
   }
-  if (name === "list_project_updates") return { updates: listProjectUpdates(args as { project_id: string }) };
-  if (name === "save_project_update") return { update: saveProjectUpdate(args as { project_id: string; body: string }) };
+  if (name === "list_project_updates") return { updates: await listProjectUpdates(args as { project_id: string }) };
+  if (name === "save_project_update") return { update: await saveProjectUpdate(args as { project_id: string; body: string }) };
 
-  if (name === "list_issues") return { issues: listIssues(args) };
-  if (name === "get_issue") return { issue: getIssue(requiredString(args, "id", name)) };
-  if (name === "create_issue" || name === "save_issue") return { issue: upsertIssue(args) };
+  if (name === "list_issues") return { issues: await listIssues(args) };
+  if (name === "get_issue") return { issue: await getIssue(requiredString(args, "id", name)) };
+  if (name === "create_issue" || name === "save_issue") return { issue: await upsertIssue(args) };
   if (name === "update_issue") {
     const { id, value } = splitId(args, name);
     delete value.issue_id;
-    return { issue: updateIssue(id, value) };
+    return { issue: await updateIssue(id, value) };
   }
   if (name === "delete_issue") {
-    return deleteIssue({ id: requiredString(args, "id", name), confirm: args.confirm === true, force: args.force === true });
+    return await deleteIssue({ id: requiredString(args, "id", name), confirm: args.confirm === true, force: args.force === true });
   }
-  if (name === "save_comment") return { comment: saveComment(args as { issue_id: string; body: string; author?: string }) };
+  if (name === "save_comment") return { comment: await saveComment(args as { issue_id: string; body: string; author?: string }) };
   if (name === "accept_issue") {
     const issueId = requiredString(args, "issue_id", name);
     const body = requiredString(args, "body", name);
     const acceptanceBody = /^accept(?:ance|ed)\b/i.test(body) ? body : `Acceptance: ${body}`;
-    const comment = saveComment({
+    const comment = await saveComment({
       issue_id: issueId,
       body: acceptanceBody,
       author: typeof args.author === "string" ? args.author : undefined,
       source: typeof args.source === "string" ? args.source : undefined,
       external_id: typeof args.external_id === "string" ? args.external_id : undefined,
     });
-    return { comment, issue: updateIssue(issueId, { status: "Done" }) };
+    return { comment, issue: await updateIssue(issueId, { status: "Done" }) };
   }
-  if (name === "list_issue_dependencies") return { dependencies: listIssueDependencies(args as { issue_id: string }) };
-  if (name === "save_issue_dependency") return { dependency: saveIssueDependency(args as { issue_id: string; blocker_issue_id: string }) };
-  if (name === "resolve_issue_dependency") return resolveIssueDependency(args);
+  if (name === "list_issue_dependencies") return { dependencies: await listIssueDependencies(args as { issue_id: string }) };
+  if (name === "save_issue_dependency") return { dependency: await saveIssueDependency(args as { issue_id: string; blocker_issue_id: string }) };
+  if (name === "resolve_issue_dependency") return await resolveIssueDependency(args);
 
-  if (name === "start_agent_session") return { session: startAgentSession(args as { agent_name: string }) };
-  if (name === "heartbeat_agent_session") return { session: heartbeatAgentSession(args as { session_id: string }) };
-  if (name === "end_agent_session") return endAgentSession(args as { session_id: string });
-  if (name === "list_agent_sessions") return { sessions: listAgentSessions(args) };
-  if (name === "claim_issue") return claimIssue(args as { issue_id: string; session_id: string });
-  if (name === "release_issue_claim") return releaseIssueClaim(args as Parameters<typeof releaseIssueClaim>[0]);
-  if (name === "list_issue_claims") return { claims: listIssueClaims(args) };
-  if (name === "repair_issue_invariants") return repairIssueInvariants();
+  if (name === "start_agent_session") return { session: await startAgentSession(args as { agent_name: string }) };
+  if (name === "heartbeat_agent_session") return { session: await heartbeatAgentSession(args as { session_id: string }) };
+  if (name === "end_agent_session") return await endAgentSession(args as { session_id: string });
+  if (name === "list_agent_sessions") return { sessions: await listAgentSessions(args) };
+  if (name === "claim_issue") return await claimIssue(args as { issue_id: string; session_id: string });
+  if (name === "release_issue_claim") return await releaseIssueClaim(args as Parameters<typeof releaseIssueClaim>[0]);
+  if (name === "list_issue_claims") return { claims: await listIssueClaims(args) };
+  if (name === "repair_issue_invariants") return await repairIssueInvariants();
 
   if (name === "save_context_binding" || name === "upsert_context_binding") {
-    return { binding: upsertContextBinding(args as { context_key: string; project_id: string }) };
+    return { binding: await upsertContextBinding(args as { context_key: string; project_id: string }) };
   }
   if (name === "get_context_binding") {
     const locator = typeof args.context_key === "string" && args.context_key ? args.context_key : args.id;
     if (typeof locator !== "string" || !locator) throw new Error("get_context_binding requires id or context_key");
-    return { binding: getContextBinding(locator) };
+    return { binding: await getContextBinding(locator) };
   }
-  if (name === "list_context_bindings") return { bindings: listContextBindings(args) };
-  if (name === "resolve_context_project") return resolveContextProject(args);
-  if (name === "delete_context_binding") return deleteContextBinding(args as { id?: string; context_key?: string });
+  if (name === "list_context_bindings") return { bindings: await listContextBindings(args) };
+  if (name === "resolve_context_project") return await resolveContextProject(args);
+  if (name === "delete_context_binding") return await deleteContextBinding(args as { id?: string; context_key?: string });
   throw new Error(`Unknown tool: ${name}`);
 }

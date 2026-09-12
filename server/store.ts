@@ -1,5 +1,5 @@
 import { customAlphabet } from "nanoid";
-import { db, json, nowIso, parseJson } from "./db.js";
+import { adapter, json, nowIso, parseJson } from "./db.js";
 
 const nanoid = customAlphabet("0123456789abcdefghijklmnopqrstuvwxyz", 12);
 const localIssuePrefix = "CTH";
@@ -292,22 +292,31 @@ export function makeId(prefix: string) {
   return `${prefix}_${nanoid()}`;
 }
 
-export function ensureDefaultTeam() {
-  const existing = db.prepare("SELECT * FROM teams LIMIT 1").get();
+export async function ensureDefaultTeam() {
+  const existing = await adapter.get("SELECT * FROM teams LIMIT 1");
   if (existing) return existing as Record<string, unknown>;
   const at = nowIso();
-  db.prepare(`
+  // ON CONFLICT DO NOTHING rather than a bare INSERT: the check above and this
+  // write are not atomic, and several hub processes starting at once -- the
+  // systemd service, a manual run, the MCP server -- all find no team and all
+  // try to create it. The loser died on "UNIQUE constraint failed: teams.id".
+  //
+  // The race predates the async port; going async only widened the window from
+  // microseconds to milliseconds, which is what made it reproducible. Both
+  // engines accept this form.
+  await adapter.run(`
     INSERT INTO teams (id, name, key, source, created_at, updated_at)
     VALUES (@id, @name, @key, 'local', @created_at, @updated_at)
-  `).run({ id: "team_local", name: "Local Agents", key: "LOC", created_at: at, updated_at: at });
-  return db.prepare("SELECT * FROM teams WHERE id = 'team_local'").get() as Record<string, unknown>;
+    ON CONFLICT (id) DO NOTHING
+  `, { id: "team_local", name: "Local Agents", key: "LOC", created_at: at, updated_at: at });
+  return await adapter.get("SELECT * FROM teams WHERE id = 'team_local'") as Record<string, unknown>;
 }
 
-export function listTeams() {
-  return db.prepare("SELECT * FROM teams ORDER BY name").all();
+export async function listTeams() {
+  return await adapter.all("SELECT * FROM teams ORDER BY name");
 }
 
-export function upsertTeam(input: { id?: string; external_id?: string; name: string; key?: string; source?: string; created_at?: string; updated_at?: string }) {
+export async function upsertTeam(input: { id?: string; external_id?: string; name: string; key?: string; source?: string; created_at?: string; updated_at?: string }) {
   const at = nowIso();
   const row = {
     id: input.id ?? input.external_id ?? makeId("team"),
@@ -318,19 +327,19 @@ export function upsertTeam(input: { id?: string; external_id?: string; name: str
     created_at: input.created_at ?? at,
     updated_at: input.updated_at ?? at,
   };
-  db.prepare(`
+  await adapter.run(`
     INSERT INTO teams (id, external_id, name, key, source, created_at, updated_at)
     VALUES (@id, @external_id, @name, @key, @source, @created_at, @updated_at)
     ON CONFLICT(external_id) DO UPDATE SET
       name=excluded.name, key=excluded.key, updated_at=excluded.updated_at
-  `).run(row);
-  if (row.external_id) return db.prepare("SELECT * FROM teams WHERE external_id = @external_id").get(row);
-  return db.prepare("SELECT * FROM teams WHERE id = @id").get(row);
+  `, row);
+  if (row.external_id) return await adapter.get("SELECT * FROM teams WHERE external_id = @external_id", row);
+  return await adapter.get("SELECT * FROM teams WHERE id = @id", row);
 }
 
-export function listProjects() {
-  ensureIssueIdentifiers();
-  return db.prepare(`
+export async function listProjects() {
+  await ensureIssueIdentifiers();
+  return await adapter.all(`
     SELECT
       p.*,
       COUNT(i.id) AS issue_count,
@@ -363,12 +372,12 @@ export function listProjects() {
     WHERE p.archived_at IS NULL
     GROUP BY p.id
     ORDER BY COALESCE(latest_update_at, p.updated_at) DESC
-  `).all();
+  `);
 }
 
-export function getProject(id: string, options: { issues_per_status?: unknown } = {}) {
-  ensureIssueIdentifiers();
-  const project = db.prepare(`
+export async function getProject(id: string, options: { issues_per_status?: unknown } = {}) {
+  await ensureIssueIdentifiers();
+  const project = await adapter.get(`
     SELECT
       p.*,
       (
@@ -396,26 +405,26 @@ export function getProject(id: string, options: { issues_per_status?: unknown } 
     WHERE p.id = @id OR p.external_id = @id
     ORDER BY CASE WHEN p.id = @id THEN 0 ELSE 1 END
     LIMIT 1
-  `).get({ id }) as Record<string, unknown> | undefined;
+  `, { id }) as Record<string, unknown> | undefined;
   if (!project) return null;
   const issueDisplayLimit = parseIssueDisplayLimit(options.issues_per_status, 50);
-  const issueGroups = listIssueGroups({ project: String(project.id) }, issueDisplayLimit);
-  const issues = listIssues({ project: String(project.id), limit: 250 });
-  const statusCounts = db.prepare(`
+  const issueGroups = await listIssueGroups({ project: String(project.id) }, issueDisplayLimit);
+  const issues = await listIssues({ project: String(project.id), limit: 250 });
+  const statusCounts = await adapter.all(`
     SELECT i.status, ${effectiveIssueStatusTypeSql} AS status_type, COUNT(*) AS count
     FROM issues i
     WHERE i.project_id = @project_id AND i.archived_at IS NULL
     GROUP BY i.status, ${effectiveIssueStatusTypeSql}
     ORDER BY count DESC
-  `).all({ project_id: project.id });
-  const priorityCounts = db.prepare(`
+  `, { project_id: project.id });
+  const priorityCounts = await adapter.all(`
     SELECT priority, COUNT(*) AS count
     FROM issues
     WHERE project_id = @project_id AND archived_at IS NULL
     GROUP BY priority
     ORDER BY priority
-  `).all({ project_id: project.id });
-  const counts = db.prepare(`
+  `, { project_id: project.id });
+  const counts = await adapter.get(`
     SELECT
       COUNT(*) AS total,
       SUM(CASE WHEN ${effectiveIssueStatusTypeSql} = 'completed' THEN 1 ELSE 0 END) AS done,
@@ -424,8 +433,8 @@ export function getProject(id: string, options: { issues_per_status?: unknown } 
       SUM(CASE WHEN ${effectiveIssueStatusTypeSql} = 'blocked' THEN 1 ELSE 0 END) AS blockers
     FROM issues i
     WHERE i.project_id = @project_id AND i.archived_at IS NULL
-  `).get({ project_id: project.id });
-  const issueEvents = db.prepare(`
+  `, { project_id: project.id });
+  const issueEvents = await adapter.all(`
     SELECT
       i.id,
       i.identifier,
@@ -445,8 +454,8 @@ export function getProject(id: string, options: { issues_per_status?: unknown } 
     WHERE i.project_id = @project_id AND i.archived_at IS NULL
     ORDER BY i.updated_at DESC
     LIMIT 40
-  `).all({ project_id: project.id });
-  const commentEvents = db.prepare(`
+  `, { project_id: project.id });
+  const commentEvents = await adapter.all(`
     SELECT
       c.id,
       i.identifier,
@@ -464,8 +473,8 @@ export function getProject(id: string, options: { issues_per_status?: unknown } 
     WHERE i.project_id = @project_id AND i.archived_at IS NULL
     ORDER BY c.updated_at DESC
     LIMIT 20
-  `).all({ project_id: project.id });
-  const dependencyEvents = db.prepare(`
+  `, { project_id: project.id });
+  const dependencyEvents = await adapter.all(`
     SELECT
       d.id,
       i.identifier,
@@ -486,8 +495,8 @@ export function getProject(id: string, options: { issues_per_status?: unknown } 
     WHERE i.project_id = @project_id AND i.archived_at IS NULL
     ORDER BY d.updated_at DESC
     LIMIT 20
-  `).all({ project_id: project.id });
-  const projectUpdateEvents = db.prepare(`
+  `, { project_id: project.id });
+  const projectUpdateEvents = await adapter.all(`
     SELECT
       u.id,
       NULL AS identifier,
@@ -510,26 +519,26 @@ export function getProject(id: string, options: { issues_per_status?: unknown } 
     WHERE u.project_id = @project_id
     ORDER BY u.updated_at DESC
     LIMIT 20
-  `).all({ project_id: project.id });
-  const projectUpdates = listProjectUpdates({ project_id: String(project.id), limit: 50 });
+  `, { project_id: project.id });
+  const projectUpdates = await listProjectUpdates({ project_id: String(project.id), limit: 50 });
   const activity = [...issueEvents, ...commentEvents, ...dependencyEvents, ...projectUpdateEvents]
     .sort((a, b) => String((b as { updated_at: string }).updated_at).localeCompare(String((a as { updated_at: string }).updated_at)))
     .slice(0, 50);
   return { project, counts, statusCounts, priorityCounts, issues, issueGroups, issueDisplayLimit, projectUpdates, activity };
 }
 
-export function upsertProject(input: ProjectInput) {
+export async function upsertProject(input: ProjectInput) {
   const at = nowIso();
   const internalId = nonEmptyString(input.id);
   const externalId = nonEmptyString(input.external_id);
   const existing = internalId || externalId
-    ? db.prepare(`
+    ? await adapter.get(`
         SELECT * FROM projects
         WHERE (@id IS NOT NULL AND id = @id)
            OR (@external_id IS NOT NULL AND external_id = @external_id)
         ORDER BY CASE WHEN id = @id THEN 0 ELSE 1 END
         LIMIT 1
-      `).get({ id: internalId ?? null, external_id: externalId ?? null }) as Record<string, unknown> | undefined
+      `, { id: internalId ?? null, external_id: externalId ?? null }) as Record<string, unknown> | undefined
     : undefined;
   if (!existing && !nonEmptyString(input.name)) throw new Error("name is required when creating a project");
   const row = {
@@ -547,7 +556,7 @@ export function upsertProject(input: ProjectInput) {
     created_at: input.created_at ?? stringValue(existing?.created_at) ?? at,
     updated_at: input.updated_at ?? at,
   };
-  db.prepare(`
+  await adapter.run(`
     INSERT INTO projects (id, external_id, name, summary, description, status, priority, lead, target_date, source, archived_at, created_at, updated_at)
     VALUES (@id, @external_id, @name, @summary, @description, @status, @priority, @lead, @target_date, @source, @archived_at, @created_at, @updated_at)
     ON CONFLICT(external_id) DO UPDATE SET
@@ -559,31 +568,31 @@ export function upsertProject(input: ProjectInput) {
       status=excluded.status, priority=excluded.priority, lead=excluded.lead, target_date=excluded.target_date,
       source=excluded.source, archived_at=excluded.archived_at,
       updated_at=excluded.updated_at
-  `).run(row);
-  if (row.external_id) return db.prepare("SELECT * FROM projects WHERE external_id = @external_id").get(row);
-  return db.prepare("SELECT * FROM projects WHERE id = @id").get(row);
+  `, row);
+  if (row.external_id) return await adapter.get("SELECT * FROM projects WHERE external_id = @external_id", row);
+  return await adapter.get("SELECT * FROM projects WHERE id = @id", row);
 }
 
-export function updateProject(id: string, input: Omit<ProjectInput, "id">) {
-  const projectId = resolveProjectId(id);
+export async function updateProject(id: string, input: Omit<ProjectInput, "id">) {
+  const projectId = await resolveProjectId(id);
   if (!projectId) throw new Error(`Project not found: ${id}`);
-  return upsertProject({ ...input, id: projectId });
+  return await upsertProject({ ...input, id: projectId });
 }
 
-export function deleteProject(input: DeleteProjectInput) {
+export async function deleteProject(input: DeleteProjectInput) {
   if (input.confirm !== true) throw new Error("delete_project requires confirm=true. Nothing was deleted.");
-  const projectId = resolveProjectId(input.id);
+  const projectId = await resolveProjectId(input.id);
   if (!projectId) throw new Error(`Project not found: ${input.id}`);
-  const project = db.prepare("SELECT id, external_id, name FROM projects WHERE id=@id").get({ id: projectId }) as {
+  const project = await adapter.get("SELECT id, external_id, name FROM projects WHERE id=@id", { id: projectId }) as {
     id: string;
     external_id: string | null;
     name: string;
   };
-  const issueCount = Number((db.prepare("SELECT COUNT(*) AS count FROM issues WHERE project_id=@project_id").get({ project_id: projectId }) as { count: number }).count);
+  const issueCount = Number((await adapter.get("SELECT COUNT(*) AS count FROM issues WHERE project_id=@project_id", { project_id: projectId }) as { count: number }).count);
   if (issueCount > 0 && input.delete_issues !== true) {
     throw new Error(`Project ${project.name} has ${issueCount} issue(s). Pass delete_issues=true to delete them; nothing was deleted.`);
   }
-  const activeClaimCount = Number((db.prepare(`
+  const activeClaimCount = Number((await adapter.get(`
     SELECT COUNT(*) AS count
     FROM issue_claims c
     JOIN agent_sessions s ON s.id=c.session_id
@@ -591,33 +600,32 @@ export function deleteProject(input: DeleteProjectInput) {
     WHERE i.project_id=@project_id
       AND c.released_at IS NULL AND c.status='active' AND c.expires_at>@now
       AND s.status='active' AND s.expires_at>@now
-  `).get({ project_id: projectId, now: nowIso() }) as { count: number }).count);
+  `, { project_id: projectId, now: nowIso() }) as { count: number }).count);
   if (activeClaimCount > 0 && input.force !== true) {
     throw new Error(`Project ${project.name} has ${activeClaimCount} active issue claim(s). Pass force=true with delete_issues=true to delete them; nothing was deleted.`);
   }
-  const transaction = db.transaction(() => {
-    if (input.delete_issues === true) db.prepare("DELETE FROM issues WHERE project_id=@project_id").run({ project_id: projectId });
-    db.prepare("DELETE FROM projects WHERE id=@id").run({ id: projectId });
+  await adapter.transaction(async () => {
+    if (input.delete_issues === true) await adapter.run("DELETE FROM issues WHERE project_id=@project_id", { project_id: projectId });
+    await adapter.run("DELETE FROM projects WHERE id=@id", { id: projectId });
   });
-  transaction.immediate();
   return { deleted: true, project, deleted_issues: input.delete_issues === true ? issueCount : 0 };
 }
 
-export function listProjectUpdates(input: { project_id: string; limit?: number | string | null }) {
-  const projectId = resolveProjectId(input.project_id);
+export async function listProjectUpdates(input: { project_id: string; limit?: number | string | null }) {
+  const projectId = await resolveProjectId(input.project_id);
   if (!projectId) throw new Error(`Project not found: ${input.project_id}`);
-  return db.prepare(`
+  return await adapter.all(`
     SELECT u.*, p.name AS project_name
     FROM project_updates u
     JOIN projects p ON p.id = u.project_id
     WHERE u.project_id = @project_id
     ORDER BY u.created_at DESC
     LIMIT @limit
-  `).all({ project_id: projectId, limit: boundedNumber(input.limit, 20, 1, 100) });
+  `, { project_id: projectId, limit: boundedNumber(input.limit, 20, 1, 100) });
 }
 
-export function saveProjectUpdate(input: ProjectUpdateInput) {
-  const projectId = resolveProjectId(input.project_id);
+export async function saveProjectUpdate(input: ProjectUpdateInput) {
+  const projectId = await resolveProjectId(input.project_id);
   if (!projectId) throw new Error(`Project not found: ${input.project_id}`);
   const body = boundedRequiredString(input.body, "body", 10000);
   const health = normalizeProjectHealth(input.health);
@@ -634,7 +642,7 @@ export function saveProjectUpdate(input: ProjectUpdateInput) {
     created_at: input.created_at ?? at,
     updated_at: input.updated_at ?? at,
   };
-  db.prepare(`
+  await adapter.run(`
     INSERT INTO project_updates (id, external_id, project_id, body, health, author, source, created_at, updated_at)
     VALUES (@id, @external_id, @project_id, @body, @health, @author, @source, @created_at, @updated_at)
     ON CONFLICT(external_id) DO UPDATE SET
@@ -643,19 +651,19 @@ export function saveProjectUpdate(input: ProjectUpdateInput) {
     ON CONFLICT(id) DO UPDATE SET
       external_id=excluded.external_id, project_id=excluded.project_id, body=excluded.body,
       health=excluded.health, author=excluded.author, source=excluded.source, updated_at=excluded.updated_at
-  `).run(row);
-  return db.prepare(`
+  `, row);
+  return await adapter.get(`
     SELECT u.*, p.name AS project_name
     FROM project_updates u JOIN projects p ON p.id = u.project_id
     WHERE u.id = @id OR (@external_id IS NOT NULL AND u.external_id = @external_id)
     ORDER BY CASE WHEN u.id = @id THEN 0 ELSE 1 END
     LIMIT 1
-  `).get({ id: row.id, external_id: externalId });
+  `, { id: row.id, external_id: externalId });
 }
 
-export function upsertContextBinding(input: ContextBindingInput) {
+export async function upsertContextBinding(input: ContextBindingInput) {
   const contextKey = normalizedRequiredString(input.context_key, "context_key");
-  const projectId = resolveProjectId(input.project_id);
+  const projectId = await resolveProjectId(input.project_id);
   if (!projectId) throw new Error(`Project not found: ${input.project_id}`);
   const at = nowIso();
   const row = {
@@ -674,7 +682,7 @@ export function upsertContextBinding(input: ContextBindingInput) {
     created_at: input.created_at ?? at,
     updated_at: input.updated_at ?? at,
   };
-  db.prepare(`
+  await adapter.run(`
     INSERT INTO context_bindings (id, context_key, project_id, default_tab, harness, workspace_name, cwd, repo_remote, branch, thread_id, metadata, source, created_at, updated_at)
     VALUES (@id, @context_key, @project_id, @default_tab, @harness, @workspace_name, @cwd, @repo_remote, @branch, @thread_id, @metadata, @source, @created_at, @updated_at)
     ON CONFLICT(context_key) DO UPDATE SET
@@ -689,22 +697,22 @@ export function upsertContextBinding(input: ContextBindingInput) {
       metadata=excluded.metadata,
       source=excluded.source,
       updated_at=excluded.updated_at
-  `).run(row);
-  return getContextBinding(contextKey);
+  `, row);
+  return await getContextBinding(contextKey);
 }
 
-export function getContextBinding(contextKey: string) {
-  const row = db.prepare(`
+export async function getContextBinding(contextKey: string) {
+  const row = await adapter.get(`
     SELECT cb.*, p.name AS project_name
     FROM context_bindings cb
     JOIN projects p ON p.id = cb.project_id
     WHERE (cb.context_key = @id OR cb.id = @id)
       AND p.archived_at IS NULL
-  `).get({ id: contextKey });
+  `, { id: contextKey });
   return row ? hydrateContextBinding(row) : null;
 }
 
-export function listContextBindings(filters: ContextBindingFilters = {}) {
+export async function listContextBindings(filters: ContextBindingFilters = {}) {
   const where = ["p.archived_at IS NULL"];
   const params: Record<string, unknown> = { limit: boundedNumber(filters.limit, 50, 1, 250) };
   if (filters.context_key) {
@@ -712,7 +720,7 @@ export function listContextBindings(filters: ContextBindingFilters = {}) {
     params.context_key = filters.context_key;
   }
   if (filters.project_id) {
-    const projectId = resolveProjectId(filters.project_id);
+    const projectId = await resolveProjectId(filters.project_id);
     if (!projectId) throw new Error(`Project not found: ${filters.project_id}`);
     where.push("cb.project_id = @project_id");
     params.project_id = projectId;
@@ -733,35 +741,35 @@ export function listContextBindings(filters: ContextBindingFilters = {}) {
     where.push("cb.branch = @branch");
     params.branch = branch;
   }
-  return db.prepare(`
+  return (await adapter.all(`
     SELECT cb.*, p.name AS project_name
     FROM context_bindings cb
     JOIN projects p ON p.id = cb.project_id
     WHERE ${where.join(" AND ")}
     ORDER BY cb.updated_at DESC
     LIMIT @limit
-  `).all(params).map(hydrateContextBinding);
+  `, params)).map(hydrateContextBinding);
 }
 
-export function resolveContextProject(filters: ContextBindingFilters) {
-  const binding = findContextBinding(filters);
+export async function resolveContextProject(filters: ContextBindingFilters) {
+  const binding = await findContextBinding(filters);
   if (!binding) return { binding: null, project: null, url_path: null };
-  const project = db.prepare("SELECT * FROM projects WHERE id = @id AND archived_at IS NULL").get({ id: binding.project_id }) ?? null;
+  const project = await adapter.get("SELECT * FROM projects WHERE id = @id AND archived_at IS NULL", { id: binding.project_id }) ?? null;
   return { binding, project, url_path: contextBindingUrlPath(binding) };
 }
 
-export function deleteContextBinding(input: { id?: string; context_key?: string }) {
+export async function deleteContextBinding(input: { id?: string; context_key?: string }) {
   const locator = nonEmptyString(input.id) ?? nonEmptyString(input.context_key);
   if (!locator) throw new Error("delete_context_binding requires id or context_key");
-  const binding = getContextBinding(locator);
+  const binding = await getContextBinding(locator);
   if (!binding) return { deleted: false, binding: null };
-  db.prepare("DELETE FROM context_bindings WHERE id = @id").run({ id: binding.id });
+  await adapter.run("DELETE FROM context_bindings WHERE id = @id", { id: binding.id });
   return { deleted: true, binding };
 }
 
-function findContextBinding(filters: ContextBindingFilters) {
+async function findContextBinding(filters: ContextBindingFilters) {
   const exactKey = nonEmptyString(filters.context_key);
-  if (exactKey) return getContextBinding(exactKey);
+  if (exactKey) return await getContextBinding(exactKey);
   const candidates: ContextBindingFilters[] = [];
   const threadId = nonEmptyString(filters.thread_id);
   if (threadId) candidates.push({ thread_id: threadId });
@@ -775,7 +783,7 @@ function findContextBinding(filters: ContextBindingFilters) {
   if (harness && cwd) candidates.push({ harness, cwd });
   if (harness && repoRemote) candidates.push({ harness, repo_remote: repoRemote });
   for (const candidate of candidates) {
-    const [binding] = listContextBindings({ ...candidate, limit: 1 });
+    const [binding] = await listContextBindings({ ...candidate, limit: 1 });
     if (binding) return binding;
   }
   return null;
@@ -823,19 +831,23 @@ function normalizeRepoRemote(value: unknown) {
   }
 }
 
-export function listIssues(filters: ListIssueFilters) {
-  return listIssuesInternal(filters, 250);
+export async function listIssues(filters: ListIssueFilters) {
+  return await listIssuesInternal(filters, 250);
 }
 
-export function listIssueGroups(filters: ListIssueFilters, limitInput: unknown = 50): IssueGroup[] {
+export async function listIssueGroups(filters: ListIssueFilters, limitInput: unknown = 50): Promise<IssueGroup[]> {
   const issueDisplayLimit = parseIssueDisplayLimit(limitInput, 50);
   const effectiveLimit = issueDisplayLimit === "all" ? groupedIssueAllLimit : issueDisplayLimit;
   const includeDone = booleanValue(filters.include_done, true);
   const requestedStatusTypes = groupedRequestedStatusTypes(filters);
-  return issueStatusGroups
-    .filter((group) => includeDone || !["completed", "canceled"].includes(group.status_type))
-    .filter((group) => !requestedStatusTypes || requestedStatusTypes.has(group.status_type))
-    .map((group) => {
+  // Each group counts and lists independently, so they are gathered together
+  // rather than awaited one after another -- and the totals have to be resolved
+  // before the last filter can read them.
+  const groups = await Promise.all(
+    issueStatusGroups
+      .filter((group) => includeDone || !["completed", "canceled"].includes(group.status_type))
+      .filter((group) => !requestedStatusTypes || requestedStatusTypes.has(group.status_type))
+      .map(async (group) => {
       const groupFilters = {
         ...filters,
         status: undefined,
@@ -843,19 +855,20 @@ export function listIssueGroups(filters: ListIssueFilters, limitInput: unknown =
         limit: effectiveLimit,
         offset: 0,
       };
-      const total = countIssues(groupFilters);
-      const issues = total ? listIssuesInternal(groupFilters, groupedIssueAllLimit) : [];
-      return {
-        key: group.status_type,
-        status_type: group.status_type,
-        label: group.label,
-        total,
-        returned: issues.length,
-        truncated: total > issues.length,
-        issues,
-      };
-    })
-    .filter((group) => group.total > 0);
+      const total = await countIssues(groupFilters);
+      const issues = total ? await listIssuesInternal(groupFilters, groupedIssueAllLimit) : [];
+        return {
+          key: group.status_type,
+          status_type: group.status_type,
+          label: group.label,
+          total,
+          returned: issues.length,
+          truncated: total > issues.length,
+          issues,
+        };
+      }),
+  );
+  return groups.filter((group) => group.total > 0);
 }
 
 function groupedRequestedStatusTypes(filters: ListIssueFilters) {
@@ -870,8 +883,8 @@ export function parseIssueDisplayLimit(value: unknown, fallback: IssueDisplayLim
   return fallback;
 }
 
-function listIssuesInternal(filters: ListIssueFilters, maxLimit: number) {
-  ensureIssueIdentifiers();
+async function listIssuesInternal(filters: ListIssueFilters, maxLimit: number) {
+  await ensureIssueIdentifiers();
   const limit = boundedNumber(filters.limit, 50, 1, maxLimit);
   const offset = boundedNumber(filters.offset, 0, 0, 100000);
   const { where, params, orderBy } = issueQueryParts(filters);
@@ -940,19 +953,19 @@ function listIssuesInternal(filters: ListIssueFilters, maxLimit: number) {
     LEFT JOIN teams t ON t.id = i.team_id
   `;
   sql += ` WHERE ${where.join(" AND ")} ORDER BY ${orderBy} LIMIT @limit OFFSET @offset`;
-  return db.prepare(sql).all(params).map(hydrateIssue);
+  return (await adapter.all(sql, params)).map(hydrateIssue);
 }
 
-function countIssues(filters: ListIssueFilters) {
-  ensureIssueIdentifiers();
+async function countIssues(filters: ListIssueFilters) {
+  await ensureIssueIdentifiers();
   const { where, params } = issueQueryParts(filters);
-  const row = db.prepare(`
+  const row = await adapter.get(`
     SELECT COUNT(*) AS count
     FROM issues i
     LEFT JOIN projects p ON p.id = i.project_id
     LEFT JOIN teams t ON t.id = i.team_id
     WHERE ${where.join(" AND ")}
-  `).get(params) as { count: number };
+  `, params) as { count: number };
   return Number(row.count ?? 0);
 }
 
@@ -1032,9 +1045,9 @@ function escapeLike(value: string) {
   return value.replace(/[\\%_]/g, "\\$&");
 }
 
-export function getIssue(id: string) {
-  ensureIssueIdentifiers();
-  const issue = db.prepare(`
+export async function getIssue(id: string) {
+  await ensureIssueIdentifiers();
+  const issue = await adapter.get(`
     SELECT i.*, p.name AS project_name, t.name AS team_name,
       (SELECT COUNT(*) FROM issue_dependencies d WHERE d.issue_id=i.id AND d.status='open') AS blocker_count,
       (SELECT COUNT(*) FROM issue_dependencies d WHERE d.blocker_issue_id=i.id AND d.status='open') AS blocking_count
@@ -1042,11 +1055,11 @@ export function getIssue(id: string) {
     LEFT JOIN projects p ON p.id = i.project_id
     LEFT JOIN teams t ON t.id = i.team_id
     WHERE i.id = @id OR i.external_id = @id OR i.identifier = @id
-  `).get({ id });
+  `, { id });
   if (!issue) return null;
-  const comments = db.prepare("SELECT * FROM comments WHERE issue_id = @issue_id ORDER BY created_at").all({ issue_id: (issue as { id: string }).id });
+  const comments = await adapter.all("SELECT * FROM comments WHERE issue_id = @issue_id ORDER BY created_at", { issue_id: (issue as { id: string }).id });
   const issueId = (issue as { id: string }).id;
-  const activeClaims = activeIssueClaims(issueId);
+  const activeClaims = await activeIssueClaims(issueId);
   return {
     ...hydrateIssue(issue),
     comments,
@@ -1054,21 +1067,22 @@ export function getIssue(id: string) {
     active_claim_count: activeClaims.length,
     active_claim_agent: activeClaims[0]?.agent_name ?? null,
     active_claim_harness: activeClaims[0]?.harness ?? null,
-    last_acceptance_comment: latestAcceptanceComment(issueId),
-    dependencies: listIssueDependencies({ issue_id: issueId, include_resolved: true }),
-    blocking: listBlockingIssues({ issue_id: issueId, include_resolved: true }),
+    last_acceptance_comment: await latestAcceptanceComment(issueId),
+    dependencies: await listIssueDependencies({ issue_id: issueId, include_resolved: true }),
+    blocking: await listBlockingIssues({ issue_id: issueId, include_resolved: true }),
   };
 }
 
-export function listTruncatedLinearIssues(limit = 500) {
-  return db.prepare(
+export async function listTruncatedLinearIssues(limit = 500) {
+  return await adapter.all(
     "SELECT id, external_id, identifier, title, updated_at " +
       "FROM issues " +
       "WHERE source = 'linear' " +
       "AND description LIKE '%truncated, use `get_issue` for full description%' " +
       "ORDER BY updated_at DESC " +
       "LIMIT @limit",
-  ).all({ limit: Math.min(limit, 1000) }) as {
+    { limit: Math.min(limit, 1000) },
+  ) as {
     id: string;
     external_id: string | null;
     identifier: string | null;
@@ -1077,14 +1091,14 @@ export function listTruncatedLinearIssues(limit = 500) {
   }[];
 }
 
-export function upsertIssue(input: IssueInput) {
+export async function upsertIssue(input: IssueInput) {
   assertKnownIssueFields(input);
   const retryAutomaticIdentifier = shouldRetryAutomaticIdentifier(input);
   const maxAttempts = retryAutomaticIdentifier ? 3 : 1;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
-      const issueKey = db.transaction((transactionInput: IssueInput) => upsertIssueLocked(transactionInput)).immediate(input);
-      const issue = getIssue(issueKey);
+      const issueKey = await adapter.transaction(async () => await upsertIssueLocked(input));
+      const issue = await getIssue(issueKey);
       if (!issue) throw new Error(`Saved issue not found: ${issueKey}`);
       return issue;
     } catch (error) {
@@ -1095,40 +1109,40 @@ export function upsertIssue(input: IssueInput) {
   throw new Error("save_issue failed after retrying automatic identifier allocation");
 }
 
-export function updateIssue(id: string, input: Omit<IssueInput, "id" | "issue_id">) {
-  const issueId = resolveParentId(id);
+export async function updateIssue(id: string, input: Omit<IssueInput, "id" | "issue_id">) {
+  const issueId = await resolveParentId(id);
   if (!issueId) throw new Error(`Issue not found: ${id}`);
-  return upsertIssue({ ...input, id: issueId });
+  return await upsertIssue({ ...input, id: issueId });
 }
 
-export function deleteIssue(input: DeleteIssueInput) {
+export async function deleteIssue(input: DeleteIssueInput) {
   if (input.confirm !== true) throw new Error("delete_issue requires confirm=true. Nothing was deleted.");
-  const issueId = resolveParentId(input.id);
+  const issueId = await resolveParentId(input.id);
   if (!issueId) throw new Error(`Issue not found: ${input.id}`);
-  const issue = db.prepare("SELECT id, external_id, identifier, title FROM issues WHERE id=@id").get({ id: issueId }) as {
+  const issue = await adapter.get("SELECT id, external_id, identifier, title FROM issues WHERE id=@id", { id: issueId }) as {
     id: string;
     external_id: string | null;
     identifier: string | null;
     title: string;
   };
-  const activeClaimCount = Number((db.prepare(`
+  const activeClaimCount = Number((await adapter.get(`
     SELECT COUNT(*) AS count
     FROM issue_claims c
     JOIN agent_sessions s ON s.id=c.session_id
     WHERE c.issue_id=@issue_id
       AND c.released_at IS NULL AND c.status='active' AND c.expires_at>@now
       AND s.status='active' AND s.expires_at>@now
-  `).get({ issue_id: issueId, now: nowIso() }) as { count: number }).count);
+  `, { issue_id: issueId, now: nowIso() }) as { count: number }).count);
   if (activeClaimCount > 0 && input.force !== true) {
     throw new Error(`Issue ${issue.identifier ?? issue.id} has ${activeClaimCount} active claim(s). Pass force=true to delete it; nothing was deleted.`);
   }
-  db.prepare("DELETE FROM issues WHERE id=@id").run({ id: issueId });
+  await adapter.run("DELETE FROM issues WHERE id=@id", { id: issueId });
   return { deleted: true, issue };
 }
 
-function upsertIssueLocked(input: IssueInput) {
+async function upsertIssueLocked(input: IssueInput) {
   const at = nowIso();
-  const existing = resolveIssueForUpsert(input);
+  const existing = await resolveIssueForUpsert(input);
   if (!existing && !input.title) {
     throw new Error("title is required when creating an issue");
   }
@@ -1154,15 +1168,15 @@ function upsertIssueLocked(input: IssueInput) {
   const row = {
     id: stringValue(existing?.id) ?? requestedId ?? input.external_id ?? makeId("issue"),
     external_id: hasOwn(input, "external_id") ? input.external_id ?? null : stringValue(existing?.external_id),
-    identifier: resolveIssueIdentifier(input, existing),
+    identifier: await resolveIssueIdentifier(input, existing),
     title: input.title ?? stringValue(existing?.title) ?? "Untitled issue",
     description: hasOwn(input, "description") ? input.description ?? null : stringValue(existing?.description),
     status,
     status_type: statusType,
     priority: input.priority ?? numberValue(existing?.priority) ?? 3,
-    project_id: resolveIssueProjectId(input, existing),
-    team_id: hasOwn(input, "team_id") ? resolveIssueTeamId(input.team_id) : stringValue(existing?.team_id) ?? defaultTeamId(),
-    parent_id: hasOwn(input, "parent_id") ? resolveIssueParentId(input.parent_id) : stringValue(existing?.parent_id),
+    project_id: await resolveIssueProjectId(input, existing),
+    team_id: hasOwn(input, "team_id") ? await resolveIssueTeamId(input.team_id) : stringValue(existing?.team_id) ?? await defaultTeamId(),
+    parent_id: hasOwn(input, "parent_id") ? await resolveIssueParentId(input.parent_id) : stringValue(existing?.parent_id),
     assignee: hasOwn(input, "assignee") ? input.assignee ?? null : stringValue(existing?.assignee),
     labels: json(hasOwn(input, "labels") ? normalizeLabels(input.labels) : normalizeLabels(existing?.labels)),
     source: input.source ?? stringValue(existing?.source) ?? "local",
@@ -1172,7 +1186,7 @@ function upsertIssueLocked(input: IssueInput) {
     created_at: input.created_at ?? stringValue(existing?.created_at) ?? at,
     updated_at: input.updated_at ?? at,
   };
-  db.prepare(`
+  await adapter.run(`
     INSERT INTO issues (id, external_id, identifier, title, description, status, status_type, priority, project_id, team_id, parent_id, assignee, labels, source, url, archived_at, completed_at, created_at, updated_at)
     VALUES (@id, @external_id, @identifier, @title, @description, @status, @status_type, @priority, @project_id, @team_id, @parent_id, @assignee, @labels, @source, @url, @archived_at, @completed_at, @created_at, @updated_at)
     ON CONFLICT(external_id) DO UPDATE SET
@@ -1185,15 +1199,15 @@ function upsertIssueLocked(input: IssueInput) {
       status_type=excluded.status_type, priority=excluded.priority, project_id=excluded.project_id, team_id=excluded.team_id,
       parent_id=excluded.parent_id, assignee=excluded.assignee, labels=excluded.labels, url=excluded.url,
       archived_at=excluded.archived_at, completed_at=excluded.completed_at, updated_at=excluded.updated_at
-  `).run(row);
+  `, row);
   return row.id;
 }
 
-export function saveComment(input: { id?: string; external_id?: string; issue_id: string; body: string; author?: string; source?: string; created_at?: string; updated_at?: string; allow_closed?: boolean | string | number | null }) {
+export async function saveComment(input: { id?: string; external_id?: string; issue_id: string; body: string; author?: string; source?: string; created_at?: string; updated_at?: string; allow_closed?: boolean | string | number | null }) {
   const at = nowIso();
-  const issueId = resolveParentId(input.issue_id);
+  const issueId = await resolveParentId(input.issue_id);
   if (!issueId) throw new Error(`Issue not found: ${input.issue_id}`);
-  const issue = getClaimableIssue(issueId);
+  const issue = await getClaimableIssue(issueId);
   assertIssueOpenForAgentWrite(issue, input.allow_closed, "comment on");
   const externalId = nonEmptyString(input.external_id);
   const row = {
@@ -1206,22 +1220,22 @@ export function saveComment(input: { id?: string; external_id?: string; issue_id
     created_at: input.created_at ?? at,
     updated_at: input.updated_at ?? at,
   };
-  db.prepare(`
+  await adapter.run(`
     INSERT INTO comments (id, external_id, issue_id, body, author, source, created_at, updated_at)
     VALUES (@id, @external_id, @issue_id, @body, @author, @source, @created_at, @updated_at)
     ON CONFLICT(external_id) DO UPDATE SET body=excluded.body, author=excluded.author, updated_at=excluded.updated_at
-  `).run(row);
+  `, row);
   if (row.external_id) {
-    return db.prepare("SELECT * FROM comments WHERE external_id = @external_id").get(row);
+    return await adapter.get("SELECT * FROM comments WHERE external_id = @external_id", row);
   }
-  return db.prepare("SELECT * FROM comments WHERE id = @id").get(row);
+  return await adapter.get("SELECT * FROM comments WHERE id = @id", row);
 }
 
-export function listIssueDependencies(input: { issue_id: string; include_resolved?: boolean | string | number | null; limit?: number | string | null }) {
-  const issueId = resolveParentId(input.issue_id);
+export async function listIssueDependencies(input: { issue_id: string; include_resolved?: boolean | string | number | null; limit?: number | string | null }) {
+  const issueId = await resolveParentId(input.issue_id);
   if (!issueId) throw new Error(`Issue not found: ${input.issue_id}`);
   const includeResolved = booleanValue(input.include_resolved, false);
-  return db.prepare(`
+  return await adapter.all(`
     SELECT d.*, issue.identifier AS issue_identifier, issue.title AS issue_title,
       blocker.identifier AS blocker_identifier, blocker.title AS blocker_title
     FROM issue_dependencies d
@@ -1231,14 +1245,14 @@ export function listIssueDependencies(input: { issue_id: string; include_resolve
       AND (@include_resolved = 1 OR d.status = 'open')
     ORDER BY CASE d.status WHEN 'open' THEN 0 ELSE 1 END, d.updated_at DESC
     LIMIT @limit
-  `).all({ issue_id: issueId, include_resolved: includeResolved ? 1 : 0, limit: boundedNumber(input.limit, 50, 1, 250) });
+  `, { issue_id: issueId, include_resolved: includeResolved ? 1 : 0, limit: boundedNumber(input.limit, 50, 1, 250) });
 }
 
-export function listBlockingIssues(input: { issue_id: string; include_resolved?: boolean | string | number | null; limit?: number | string | null }) {
-  const issueId = resolveParentId(input.issue_id);
+export async function listBlockingIssues(input: { issue_id: string; include_resolved?: boolean | string | number | null; limit?: number | string | null }) {
+  const issueId = await resolveParentId(input.issue_id);
   if (!issueId) throw new Error(`Issue not found: ${input.issue_id}`);
   const includeResolved = booleanValue(input.include_resolved, false);
-  return db.prepare(`
+  return await adapter.all(`
     SELECT d.*, issue.identifier AS issue_identifier, issue.title AS issue_title,
       blocker.identifier AS blocker_identifier, blocker.title AS blocker_title
     FROM issue_dependencies d
@@ -1248,21 +1262,21 @@ export function listBlockingIssues(input: { issue_id: string; include_resolved?:
       AND (@include_resolved = 1 OR d.status = 'open')
     ORDER BY CASE d.status WHEN 'open' THEN 0 ELSE 1 END, d.updated_at DESC
     LIMIT @limit
-  `).all({ issue_id: issueId, include_resolved: includeResolved ? 1 : 0, limit: boundedNumber(input.limit, 50, 1, 250) });
+  `, { issue_id: issueId, include_resolved: includeResolved ? 1 : 0, limit: boundedNumber(input.limit, 50, 1, 250) });
 }
 
-export function saveIssueDependency(input: IssueDependencyInput) {
-  const issueId = resolveParentId(input.issue_id);
+export async function saveIssueDependency(input: IssueDependencyInput) {
+  const issueId = await resolveParentId(input.issue_id);
   if (!issueId) throw new Error(`Issue not found: ${input.issue_id}`);
-  const blockerIssueId = resolveParentId(input.blocker_issue_id);
+  const blockerIssueId = await resolveParentId(input.blocker_issue_id);
   if (!blockerIssueId) throw new Error(`Issue not found: ${input.blocker_issue_id}`);
   if (issueId === blockerIssueId) throw new Error("An issue cannot block itself");
-  const blocker = getClaimableIssue(blockerIssueId);
+  const blocker = await getClaimableIssue(blockerIssueId);
   const blockerStatus = inferStatusType(stringValue(blocker.status) ?? undefined) ?? knownStatusType(stringValue(blocker.status_type) ?? undefined);
   if (blockerStatus === "completed" || blockerStatus === "canceled") {
     throw new Error(`Completed or canceled issue ${issueLabel(blocker)} cannot be added as an open blocker`);
   }
-  if (dependencyWouldCycle(issueId, blockerIssueId)) {
+  if (await dependencyWouldCycle(issueId, blockerIssueId)) {
     throw new Error("Adding this blocker would create a dependency cycle");
   }
   const reason = optionalBoundedString(input.reason, "reason", 2000);
@@ -1280,7 +1294,7 @@ export function saveIssueDependency(input: IssueDependencyInput) {
     created_at: input.created_at ?? at,
     updated_at: input.updated_at ?? at,
   };
-  db.prepare(`
+  await adapter.run(`
     INSERT INTO issue_dependencies (id, external_id, issue_id, blocker_issue_id, reason, status, resolved_at, source, created_at, updated_at)
     VALUES (@id, @external_id, @issue_id, @blocker_issue_id, @reason, @status, @resolved_at, @source, @created_at, @updated_at)
     ON CONFLICT(external_id) DO UPDATE SET
@@ -1291,20 +1305,20 @@ export function saveIssueDependency(input: IssueDependencyInput) {
     ON CONFLICT(id) DO UPDATE SET
       external_id=excluded.external_id, issue_id=excluded.issue_id, blocker_issue_id=excluded.blocker_issue_id,
       reason=excluded.reason, status='open', resolved_at=NULL, source=excluded.source, updated_at=excluded.updated_at
-  `).run(row);
-  return getIssueDependency(row.id, issueId, blockerIssueId);
+  `, row);
+  return await getIssueDependency(row.id, issueId, blockerIssueId);
 }
 
-export function resolveIssueDependency(input: { dependency_id?: string; issue_id?: string; blocker_issue_id?: string }) {
-  const dependency = resolveIssueDependencyRow(input);
+export async function resolveIssueDependency(input: { dependency_id?: string; issue_id?: string; blocker_issue_id?: string }) {
+  const dependency = await resolveIssueDependencyRow(input);
   if (!dependency) throw new Error("Issue dependency not found");
   if (dependency.status === "resolved") return { resolved: false, dependency };
   const at = nowIso();
-  db.prepare("UPDATE issue_dependencies SET status='resolved', resolved_at=@at, updated_at=@at WHERE id=@id").run({ id: dependency.id, at });
-  return { resolved: true, dependency: getIssueDependency(String(dependency.id)) };
+  await adapter.run("UPDATE issue_dependencies SET status='resolved', resolved_at=@at, updated_at=@at WHERE id=@id", { id: dependency.id, at });
+  return { resolved: true, dependency: await getIssueDependency(String(dependency.id)) };
 }
 
-export function startAgentSession(input: AgentSessionInput) {
+export async function startAgentSession(input: AgentSessionInput) {
   if (!nonEmptyString(input.agent_name)) throw new Error("agent_name is required");
   const at = nowIso();
   const row = {
@@ -1318,7 +1332,7 @@ export function startAgentSession(input: AgentSessionInput) {
     ended_at: null,
     metadata: json(input.metadata ?? {}),
   };
-  db.prepare(`
+  await adapter.run(`
     INSERT INTO agent_sessions (id, agent_name, harness, status, started_at, last_heartbeat_at, expires_at, ended_at, metadata)
     VALUES (@id, @agent_name, @harness, @status, @started_at, @last_heartbeat_at, @expires_at, @ended_at, @metadata)
     ON CONFLICT(id) DO UPDATE SET
@@ -1329,87 +1343,86 @@ export function startAgentSession(input: AgentSessionInput) {
       expires_at=excluded.expires_at,
       ended_at=NULL,
       metadata=excluded.metadata
-  `).run(row);
-  return getAgentSession(row.id);
+  `, row);
+  return await getAgentSession(row.id);
 }
 
-export function heartbeatAgentSession(input: { session_id: string; ttl_minutes?: number }) {
-  const session = getAgentSession(input.session_id);
+export async function heartbeatAgentSession(input: { session_id: string; ttl_minutes?: number }) {
+  const session = await getAgentSession(input.session_id);
   if (!session) throw new Error(`Agent session not found: ${input.session_id}`);
   const at = nowIso();
-  db.prepare(`
+  await adapter.run(`
     UPDATE agent_sessions
     SET status='active', last_heartbeat_at=@last_heartbeat_at, expires_at=@expires_at, ended_at=NULL
     WHERE id=@id
-  `).run({ id: input.session_id, last_heartbeat_at: at, expires_at: addMinutes(at, ttlMinutes(input.ttl_minutes)) });
-  return getAgentSession(input.session_id);
+  `, { id: input.session_id, last_heartbeat_at: at, expires_at: addMinutes(at, ttlMinutes(input.ttl_minutes)) });
+  return await getAgentSession(input.session_id);
 }
 
-export function endAgentSession(input: { session_id: string; release_claims?: boolean | string | number | null }) {
-  const session = getAgentSession(input.session_id);
+export async function endAgentSession(input: { session_id: string; release_claims?: boolean | string | number | null }) {
+  const session = await getAgentSession(input.session_id);
   if (!session) throw new Error(`Agent session not found: ${input.session_id}`);
   const at = nowIso();
   const releaseClaims = booleanValue(input.release_claims, true);
-  const tx = db.transaction(() => {
+  await adapter.transaction(async () => {
     const claimedIssueIds = releaseClaims
-      ? db.prepare("SELECT DISTINCT issue_id FROM issue_claims WHERE session_id=@session_id AND released_at IS NULL AND status='active'").all({ session_id: input.session_id }) as { issue_id: string }[]
+      ? await adapter.all("SELECT DISTINCT issue_id FROM issue_claims WHERE session_id=@session_id AND released_at IS NULL AND status='active'", { session_id: input.session_id }) as { issue_id: string }[]
       : [];
-    db.prepare(`
+    await adapter.run(`
       UPDATE agent_sessions
       SET status='ended', ended_at=@ended_at, last_heartbeat_at=@ended_at, expires_at=@ended_at
       WHERE id=@id
-    `).run({ id: input.session_id, ended_at: at });
+    `, { id: input.session_id, ended_at: at });
     if (releaseClaims) {
-      db.prepare(`
+      await adapter.run(`
         UPDATE issue_claims
         SET status='released', released_at=@released_at
         WHERE session_id=@session_id AND released_at IS NULL
-      `).run({ session_id: input.session_id, released_at: at });
-      for (const claim of claimedIssueIds) settleIssueAfterClaimRelease(claim.issue_id, false, at);
+      `, { session_id: input.session_id, released_at: at });
+      for (const claim of claimedIssueIds) await settleIssueAfterClaimRelease(claim.issue_id, false, at);
     }
   });
-  tx();
-  return { session: getAgentSession(input.session_id), released_claims: releaseClaims ? listIssueClaims({ session_id: input.session_id, include_released: true }) : [] };
+  return { session: await getAgentSession(input.session_id), released_claims: releaseClaims ? await listIssueClaims({ session_id: input.session_id, include_released: true }) : [] };
 }
 
-export function listAgentSessions(input: { include_ended?: boolean | string | number | null; limit?: number } = {}) {
+export async function listAgentSessions(input: { include_ended?: boolean | string | number | null; limit?: number } = {}) {
   const now = nowIso();
   const where = booleanValue(input.include_ended, false) ? "" : "WHERE status = 'active' AND expires_at > @now";
-  return db.prepare(`
+  return (await adapter.all(`
     SELECT *
     FROM agent_sessions
     ${where}
     ORDER BY last_heartbeat_at DESC
     LIMIT @limit
-  `).all({ limit: boundedNumber(input.limit, 50, 1, 250), now }).map(hydrateAgentSession);
+  `, { limit: boundedNumber(input.limit, 50, 1, 250), now })).map(hydrateAgentSession);
 }
 
-export function claimIssue(input: ClaimIssueInput) {
+export async function claimIssue(input: ClaimIssueInput) {
   const at = nowIso();
-  const issueId = resolveParentId(input.issue_id);
+  const issueId = await resolveParentId(input.issue_id);
   if (!issueId) throw new Error(`Issue not found: ${input.issue_id}`);
-  const issue = getClaimableIssue(issueId);
+  const issue = await getClaimableIssue(issueId);
   assertIssueOpenForAgentWrite(issue, input.allow_closed, "claim");
-  if (!booleanValue(input.force, false) && issueIsBlocked(issueId, issue)) {
+  if (!booleanValue(input.force, false) && await issueIsBlocked(issueId, issue)) {
     throw new Error(`Issue ${issueLabel(issue)} is blocked; resolve its dependencies or explicit Blocked status before claiming it`);
   }
-  const session = getActiveAgentSession(input.session_id, at);
+  const session = await getActiveAgentSession(input.session_id, at);
   if (!session) throw new Error(`Active agent session not found: ${input.session_id}`);
-  heartbeatAgentSession({ session_id: input.session_id, ttl_minutes: input.ttl_minutes });
-  const expiredReleased = expireIssueClaims(issueId, at);
-  const activeClaims = activeIssueClaims(issueId, at);
+  await heartbeatAgentSession({ session_id: input.session_id, ttl_minutes: input.ttl_minutes });
+  const expiredReleased = await expireIssueClaims(issueId, at);
+  const activeClaims = await activeIssueClaims(issueId, at);
   const active = activeClaims[0];
   const expiresAt = addMinutes(at, ttlMinutes(input.ttl_minutes));
   const sameSessionActive = activeClaims.find((claim) => claim.session_id === input.session_id);
   if (sameSessionActive) {
-    supersedeOtherActiveIssueClaims(issueId, sameSessionActive.id, at);
-    db.prepare(`
+    await supersedeOtherActiveIssueClaims(issueId, sameSessionActive.id, at);
+    await adapter.run(`
       UPDATE issue_claims
       SET status='active', note=@note, heartbeat_at=@heartbeat_at, expires_at=@expires_at
       WHERE id=@id
-    `).run({ id: sameSessionActive.id, note: input.note ?? sameSessionActive.note ?? null, heartbeat_at: at, expires_at: expiresAt });
-    markIssueInProgress(issueId, at);
-    return { claim: getIssueClaim(sameSessionActive.id), idempotent: true, forced: false, expired_released: expiredReleased };
+    `, { id: sameSessionActive.id, note: input.note ?? sameSessionActive.note ?? null, heartbeat_at: at, expires_at: expiresAt });
+    await markIssueInProgress(issueId, at);
+    return { claim: await getIssueClaim(sameSessionActive.id), idempotent: true, forced: false, expired_released: expiredReleased };
   }
   let forced = false;
   if (active) {
@@ -1417,7 +1430,7 @@ export function claimIssue(input: ClaimIssueInput) {
       throw new Error(`Issue already claimed by ${active.agent_name} (${active.session_id}) until ${active.expires_at}`);
     }
     forced = true;
-    supersedeActiveIssueClaims(issueId, at);
+    await supersedeActiveIssueClaims(issueId, at);
   }
   const row = {
     id: makeId("claim"),
@@ -1432,27 +1445,27 @@ export function claimIssue(input: ClaimIssueInput) {
     released_at: null,
     force: forced ? 1 : 0,
   };
-  db.prepare(`
+  await adapter.run(`
     INSERT INTO issue_claims (id, issue_id, session_id, agent_name, status, note, claimed_at, heartbeat_at, expires_at, released_at, force)
     VALUES (@id, @issue_id, @session_id, @agent_name, @status, @note, @claimed_at, @heartbeat_at, @expires_at, @released_at, @force)
-  `).run(row);
-  markIssueInProgress(issueId, at);
-  return { claim: getIssueClaim(row.id), idempotent: false, forced, expired_released: expiredReleased };
+  `, row);
+  await markIssueInProgress(issueId, at);
+  return { claim: await getIssueClaim(row.id), idempotent: false, forced, expired_released: expiredReleased };
 }
 
-export function releaseIssueClaim(input: ReleaseIssueClaimInput) {
+export async function releaseIssueClaim(input: ReleaseIssueClaimInput) {
   const at = nowIso();
-  const claimById = input.claim_id ? getIssueClaim(input.claim_id) as HydratedIssueClaim | null : null;
+  const claimById = input.claim_id ? await getIssueClaim(input.claim_id) as HydratedIssueClaim | null : null;
   if (input.claim_id && !claimById) throw new Error(`Issue claim not found: ${input.claim_id}`);
-  const issueId = claimById?.issue_id ?? resolveParentId(input.issue_id);
+  const issueId = claimById?.issue_id ?? await resolveParentId(input.issue_id);
   if (!issueId) {
     if (input.claim_id) throw new Error(`Issue claim has no issue_id: ${input.claim_id}`);
     if (!input.issue_id) throw new Error("release_issue_claim requires either claim_id or issue_id");
     throw new Error(`Issue not found: ${input.issue_id}`);
   }
-  expireIssueClaims(issueId, at);
+  await expireIssueClaims(issueId, at);
   if (claimById) {
-    const refreshedClaim = getIssueClaim(claimById.id) as HydratedIssueClaim | null;
+    const refreshedClaim = await getIssueClaim(claimById.id) as HydratedIssueClaim | null;
     if (!refreshedClaim) throw new Error(`Issue claim not found: ${claimById.id}`);
     const forced = booleanValue(input.force, false);
     if (input.session_id && refreshedClaim.session_id !== input.session_id && !forced) {
@@ -1462,13 +1475,13 @@ export function releaseIssueClaim(input: ReleaseIssueClaimInput) {
       return { released: false, claim: refreshedClaim };
     }
     const status = input.status === "completed" ? "completed" : "released";
-    db.prepare("UPDATE issue_claims SET status=@status, released_at=@released_at WHERE id=@id").run({ id: refreshedClaim.id, status, released_at: at });
-    const supersededActiveDuplicates = supersedeOtherActiveIssueClaims(issueId, refreshedClaim.id, at);
-    settleIssueAfterClaimRelease(issueId, status === "completed", at);
-    return { released: true, claim: getIssueClaim(refreshedClaim.id), superseded_active_duplicates: supersededActiveDuplicates };
+    await adapter.run("UPDATE issue_claims SET status=@status, released_at=@released_at WHERE id=@id", { id: refreshedClaim.id, status, released_at: at });
+    const supersededActiveDuplicates = await supersedeOtherActiveIssueClaims(issueId, refreshedClaim.id, at);
+    await settleIssueAfterClaimRelease(issueId, status === "completed", at);
+    return { released: true, claim: await getIssueClaim(refreshedClaim.id), superseded_active_duplicates: supersededActiveDuplicates };
   }
   if (!input.session_id) throw new Error("release_issue_claim requires session_id when claim_id is not provided");
-  const activeClaims = activeIssueClaims(issueId, at);
+  const activeClaims = await activeIssueClaims(issueId, at);
   if (!activeClaims.length) return { released: false, claim: null };
   const forced = booleanValue(input.force, false);
   const claim = activeClaims.find((item) => item.session_id === input.session_id) ?? (forced ? activeClaims[0] : undefined);
@@ -1477,17 +1490,17 @@ export function releaseIssueClaim(input: ReleaseIssueClaimInput) {
     throw new Error(`Issue claim belongs to ${active.session_id}; release with that session_id or force=true`);
   }
   const status = input.status === "completed" ? "completed" : "released";
-  db.prepare("UPDATE issue_claims SET status=@status, released_at=@released_at WHERE id=@id").run({ id: claim.id, status, released_at: at });
-  const supersededActiveDuplicates = supersedeOtherActiveIssueClaims(issueId, claim.id, at);
-  settleIssueAfterClaimRelease(issueId, status === "completed", at);
-  return { released: true, claim: getIssueClaim(claim.id), superseded_active_duplicates: supersededActiveDuplicates };
+  await adapter.run("UPDATE issue_claims SET status=@status, released_at=@released_at WHERE id=@id", { id: claim.id, status, released_at: at });
+  const supersededActiveDuplicates = await supersedeOtherActiveIssueClaims(issueId, claim.id, at);
+  await settleIssueAfterClaimRelease(issueId, status === "completed", at);
+  return { released: true, claim: await getIssueClaim(claim.id), superseded_active_duplicates: supersededActiveDuplicates };
 }
 
-export function listIssueClaims(input: { issue_id?: string; session_id?: string; include_released?: boolean | string | number | null; limit?: number } = {}) {
+export async function listIssueClaims(input: { issue_id?: string; session_id?: string; include_released?: boolean | string | number | null; limit?: number } = {}) {
   const where: string[] = [];
   const params: Record<string, unknown> = { limit: boundedNumber(input.limit, 50, 1, 250), now: nowIso() };
   if (input.issue_id) {
-    const issueId = resolveParentId(input.issue_id);
+    const issueId = await resolveParentId(input.issue_id);
     if (!issueId) throw new Error(`Issue not found: ${input.issue_id}`);
     where.push("c.issue_id = @issue_id");
     params.issue_id = issueId;
@@ -1498,7 +1511,7 @@ export function listIssueClaims(input: { issue_id?: string; session_id?: string;
   }
   if (!booleanValue(input.include_released, false)) where.push("c.released_at IS NULL AND c.status='active' AND c.expires_at > @now");
   const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
-  return db.prepare(`
+  return (await adapter.all(`
     SELECT c.*, i.identifier, i.title, s.harness
     FROM issue_claims c
     JOIN issues i ON i.id = c.issue_id
@@ -1506,26 +1519,26 @@ export function listIssueClaims(input: { issue_id?: string; session_id?: string;
     ${whereSql}
     ORDER BY c.claimed_at DESC
     LIMIT @limit
-  `).all(params).map(hydrateIssueClaim);
+  `, params)).map(hydrateIssueClaim);
 }
 
-export function dashboard() {
-  ensureIssueIdentifiers();
-  const counts = db.prepare(`
+export async function dashboard() {
+  await ensureIssueIdentifiers();
+  const counts = await adapter.get(`
     SELECT
       (SELECT COUNT(*) FROM projects WHERE archived_at IS NULL) AS projects,
       (SELECT COUNT(*) FROM issues WHERE archived_at IS NULL) AS issues,
       (SELECT COUNT(*) FROM issues WHERE ${normalizedStatusTypeSql} = 'completed' AND archived_at IS NULL) AS done,
       (SELECT COUNT(*) FROM issues WHERE ${normalizedStatusTypeSql} IN ('started','unstarted','blocked','paused') AND archived_at IS NULL) AS active
-  `).get();
-  const byStatus = db.prepare("SELECT status, COUNT(*) AS count FROM issues WHERE archived_at IS NULL GROUP BY status ORDER BY count DESC").all();
-  const recent = listIssues({ limit: 12 });
+  `);
+  const byStatus = await adapter.all("SELECT status, COUNT(*) AS count FROM issues WHERE archived_at IS NULL GROUP BY status ORDER BY count DESC");
+  const recent = await listIssues({ limit: 12 });
   return { counts, byStatus, recent };
 }
 
-export function startSyncRun(source: string) {
+export async function startSyncRun(source: string) {
   const id = makeId("sync");
-  db.prepare("INSERT INTO sync_runs (id, source, status, started_at) VALUES (@id, @source, 'running', @started_at)").run({
+  await adapter.run("INSERT INTO sync_runs (id, source, status, started_at) VALUES (@id, @source, 'running', @started_at)", {
     id,
     source,
     started_at: nowIso(),
@@ -1533,13 +1546,13 @@ export function startSyncRun(source: string) {
   return id;
 }
 
-export function finishSyncRun(id: string, status: "completed" | "failed", stats: unknown, cursor?: string, error?: string) {
-  const run = db.prepare("SELECT source FROM sync_runs WHERE id = @id").get({ id }) as { source?: string } | undefined;
-  db.prepare(`
+export async function finishSyncRun(id: string, status: "completed" | "failed", stats: unknown, cursor?: string, error?: string) {
+  const run = await adapter.get("SELECT source FROM sync_runs WHERE id = @id", { id }) as { source?: string } | undefined;
+  await adapter.run(`
     UPDATE sync_runs
     SET status=@status, finished_at=@finished_at, stats=@stats, cursor=@cursor, error=@error
     WHERE id=@id
-  `).run({
+  `, {
     id,
     status,
     finished_at: nowIso(),
@@ -1548,23 +1561,23 @@ export function finishSyncRun(id: string, status: "completed" | "failed", stats:
     error: error ?? null,
   });
   if (status === "completed" && run?.source === "linear" && cursor) {
-    db.prepare(`
+    await adapter.run(`
       INSERT INTO sync_checkpoints (source, cursor, updated_at)
       VALUES (@source, @cursor, @updated_at)
       ON CONFLICT(source) DO UPDATE SET cursor=excluded.cursor, updated_at=excluded.updated_at
-    `).run({ source: run.source, cursor, updated_at: nowIso() });
+    `, { source: run.source, cursor, updated_at: nowIso() });
   }
 }
 
-export function recentSyncRuns(limit = 10) {
-  return db.prepare("SELECT * FROM sync_runs ORDER BY started_at DESC LIMIT @limit").all({ limit });
+export async function recentSyncRuns(limit = 10) {
+  return await adapter.all("SELECT * FROM sync_runs ORDER BY started_at DESC LIMIT @limit", { limit });
 }
 
-export function repairIssueInvariants() {
-  const rows = db.prepare(`
+export async function repairIssueInvariants() {
+  const rows = await adapter.all(`
     SELECT id, status, status_type, completed_at, updated_at, labels
     FROM issues
-  `).all() as {
+  `) as {
     id: string;
     status: string;
     status_type: string;
@@ -1579,14 +1592,17 @@ export function repairIssueInvariants() {
     labelsFixed: 0,
     issuesChanged: 0,
   };
-  const update = db.prepare(`
+  // Held as text rather than a prepared statement: the adapter owns statement
+  // preparation, and server/statement-cache.ts already keeps the compiled form
+  // so reusing it across the loop costs nothing.
+  const updateIssueSql = `
     UPDATE issues
     SET status_type = @status_type,
         completed_at = @completed_at,
         labels = @labels
     WHERE id = @id
-  `);
-  const tx = db.transaction(() => {
+  `;
+  await adapter.transaction(async () => {
     for (const row of rows) {
       const statusType = inferStatusType(row.status) ?? knownStatusType(row.status_type) ?? row.status_type;
       const completedAt = statusType === "completed" && !row.completed_at ? row.updated_at || nowIso() : row.completed_at;
@@ -1599,15 +1615,14 @@ export function repairIssueInvariants() {
       if (completedAtChanged) stats.completedAtFixed += 1;
       if (labelsChanged) stats.labelsFixed += 1;
       stats.issuesChanged += 1;
-      update.run({ id: row.id, status_type: statusType, completed_at: completedAt, labels });
+      await adapter.run(updateIssueSql, { id: row.id, status_type: statusType, completed_at: completedAt, labels });
     }
   });
-  tx();
   return stats;
 }
 
-export function getSyncCheckpoint(source: string) {
-  return db.prepare("SELECT * FROM sync_checkpoints WHERE source = @source").get({ source }) as { source: string; cursor: string | null; updated_at: string } | undefined;
+export async function getSyncCheckpoint(source: string) {
+  return await adapter.get("SELECT * FROM sync_checkpoints WHERE source = @source", { source }) as { source: string; cursor: string | null; updated_at: string } | undefined;
 }
 
 function hydrateIssue(row: unknown) {
@@ -1629,30 +1644,30 @@ function hydrateIssueClaim(row: unknown) {
   return { ...item, force: Boolean(item.force) };
 }
 
-function getAgentSession(id: string) {
-  const row = db.prepare("SELECT * FROM agent_sessions WHERE id = @id").get({ id });
+async function getAgentSession(id: string) {
+  const row = await adapter.get("SELECT * FROM agent_sessions WHERE id = @id", { id });
   return row ? hydrateAgentSession(row) : null;
 }
 
-function getActiveAgentSession(id: string, at = nowIso()) {
-  const session = getAgentSession(id) as { status?: string; expires_at?: string } | null;
+async function getActiveAgentSession(id: string, at = nowIso()) {
+  const session = await getAgentSession(id) as { status?: string; expires_at?: string } | null;
   if (!session || session.status !== "active" || !session.expires_at || session.expires_at <= at) return null;
   return session as Record<string, unknown> & { agent_name: string };
 }
 
-function getIssueClaim(id: string) {
-  const row = db.prepare(`
+async function getIssueClaim(id: string) {
+  const row = await adapter.get(`
     SELECT c.*, i.identifier, i.title, s.harness
     FROM issue_claims c
     JOIN issues i ON i.id = c.issue_id
     JOIN agent_sessions s ON s.id = c.session_id
     WHERE c.id = @id
-  `).get({ id });
+  `, { id });
   return row ? hydrateIssueClaim(row) : null;
 }
 
-function getClaimableIssue(issueId: string) {
-  return db.prepare("SELECT id, identifier, status, status_type, archived_at FROM issues WHERE id = @id").get({ id: issueId }) as Record<string, unknown>;
+async function getClaimableIssue(issueId: string) {
+  return await adapter.get("SELECT id, identifier, status, status_type, archived_at FROM issues WHERE id = @id", { id: issueId }) as Record<string, unknown>;
 }
 
 function assertIssueOpenForAgentWrite(issue: Record<string, unknown>, allowClosed: unknown, action: string) {
@@ -1667,8 +1682,8 @@ function assertIssueOpenForAgentWrite(issue: Record<string, unknown>, allowClose
   }
 }
 
-function activeIssueClaims(issueId: string, at = nowIso()) {
-  return db.prepare(`
+async function activeIssueClaims(issueId: string, at = nowIso()) {
+  return await adapter.all(`
     SELECT c.*, s.harness
     FROM issue_claims c
     JOIN agent_sessions s ON s.id = c.session_id
@@ -1679,77 +1694,77 @@ function activeIssueClaims(issueId: string, at = nowIso()) {
       AND s.status='active'
       AND s.expires_at > @at
     ORDER BY c.heartbeat_at DESC, c.claimed_at DESC
-  `).all({ issue_id: issueId, at }) as { id: string; session_id: string; agent_name: string; harness?: string | null; note: string | null; expires_at: string }[];
+  `, { issue_id: issueId, at }) as { id: string; session_id: string; agent_name: string; harness?: string | null; note: string | null; expires_at: string }[];
 }
 
-function issueIsBlocked(issueId: string, issue?: Record<string, unknown>) {
-  const stored = issue ?? getClaimableIssue(issueId);
+async function issueIsBlocked(issueId: string, issue?: Record<string, unknown>) {
+  const stored = issue ?? await getClaimableIssue(issueId);
   const statusType = inferStatusType(stringValue(stored.status) ?? undefined) ?? knownStatusType(stringValue(stored.status_type) ?? undefined);
   if (statusType === "blocked") return true;
-  const dependency = db.prepare("SELECT 1 FROM issue_dependencies WHERE issue_id=@issue_id AND status='open' LIMIT 1").get({ issue_id: issueId });
+  const dependency = await adapter.get("SELECT 1 FROM issue_dependencies WHERE issue_id=@issue_id AND status='open' LIMIT 1", { issue_id: issueId });
   return Boolean(dependency);
 }
 
-function markIssueInProgress(issueId: string, at = nowIso()) {
-  db.prepare(`
+async function markIssueInProgress(issueId: string, at = nowIso()) {
+  await adapter.run(`
     UPDATE issues
     SET status='In Progress', status_type='started', completed_at=NULL, updated_at=@at
     WHERE id=@issue_id
       AND ${normalizedStatusTypeSql} IN ('backlog', 'unstarted', 'paused')
-  `).run({ issue_id: issueId, at });
+  `, { issue_id: issueId, at });
 }
 
-function settleIssueAfterClaimRelease(issueId: string, completed: boolean, at = nowIso()) {
+async function settleIssueAfterClaimRelease(issueId: string, completed: boolean, at = nowIso()) {
   if (completed) {
-    db.prepare(`
+    await adapter.run(`
       UPDATE issues
       SET status='Done', status_type='completed', completed_at=coalesce(completed_at, @at), updated_at=@at
       WHERE id=@issue_id
-    `).run({ issue_id: issueId, at });
+    `, { issue_id: issueId, at });
     return;
   }
-  const active = activeIssueClaims(issueId, at);
+  const active = await activeIssueClaims(issueId, at);
   if (active.length) return;
-  db.prepare(`
+  await adapter.run(`
     UPDATE issues
     SET status='Todo', status_type='unstarted', completed_at=NULL, updated_at=@at
     WHERE id=@issue_id AND ${normalizedStatusTypeSql} = 'started'
-  `).run({ issue_id: issueId, at });
+  `, { issue_id: issueId, at });
 }
 
-function latestAcceptanceComment(issueId: string) {
-  return db.prepare(`
+async function latestAcceptanceComment(issueId: string) {
+  return await adapter.get(`
     SELECT *
     FROM comments
     WHERE issue_id = @issue_id
       AND ${acceptanceCommentSql("body")}
     ORDER BY created_at DESC
     LIMIT 1
-  `).get({ issue_id: issueId }) ?? null;
+  `, { issue_id: issueId }) ?? null;
 }
 
-function supersedeActiveIssueClaims(issueId: string, at = nowIso()) {
-  return db.prepare(`
+async function supersedeActiveIssueClaims(issueId: string, at = nowIso()) {
+  return (await adapter.run(`
     UPDATE issue_claims
     SET status='superseded', released_at=@released_at
     WHERE issue_id=@issue_id AND released_at IS NULL AND status='active' AND expires_at > @released_at
-  `).run({ issue_id: issueId, released_at: at }).changes;
+  `, { issue_id: issueId, released_at: at })).changes;
 }
 
-function supersedeOtherActiveIssueClaims(issueId: string, keepClaimId: string, at = nowIso()) {
-  return db.prepare(`
+async function supersedeOtherActiveIssueClaims(issueId: string, keepClaimId: string, at = nowIso()) {
+  return (await adapter.run(`
     UPDATE issue_claims
     SET status='superseded', released_at=@released_at
     WHERE issue_id=@issue_id AND id != @keep_claim_id AND released_at IS NULL AND status='active' AND expires_at > @released_at
-  `).run({ issue_id: issueId, keep_claim_id: keepClaimId, released_at: at }).changes;
+  `, { issue_id: issueId, keep_claim_id: keepClaimId, released_at: at })).changes;
 }
 
-function expireIssueClaims(issueId: string, at = nowIso()) {
-  const result = db.prepare(`
+async function expireIssueClaims(issueId: string, at = nowIso()) {
+  const result = await adapter.run(`
     UPDATE issue_claims
     SET status='expired', released_at=@released_at
     WHERE issue_id=@issue_id AND released_at IS NULL AND expires_at <= @released_at
-  `).run({ issue_id: issueId, released_at: at });
+  `, { issue_id: issueId, released_at: at });
   return result.changes;
 }
 
@@ -1781,10 +1796,10 @@ function knownStatusType(status?: string) {
   return undefined;
 }
 
-export function ensureIssueIdentifiers() {
+export async function ensureIssueIdentifiers() {
   if (issueIdentifiersChecked) return;
-  const tx = db.transaction(() => {
-    const rows = db.prepare(`
+  await adapter.transaction(async () => {
+    const rows = await adapter.all(`
       SELECT id, identifier
       FROM issues
       -- id, not rowid, as the tiebreaker: rowid is a SQLite implicit column that
@@ -1792,31 +1807,30 @@ export function ensureIssueIdentifiers() {
       -- created_at; what this ordering has to be is stable, so that assigning
       -- identifiers twice assigns the same ones.
       ORDER BY created_at, id
-    `).all() as { id: string; identifier: string | null }[];
+    `) as { id: string; identifier: string | null }[];
     const used = new Set(rows.map((row) => row.identifier).filter(isShortIssueIdentifier));
     let next = nextLocalIssueNumber(used);
-    const update = db.prepare("UPDATE issues SET identifier = @identifier WHERE id = @id");
+    const updateIdentifierSql = "UPDATE issues SET identifier = @identifier WHERE id = @id";
     for (const row of rows) {
       if (isShortIssueIdentifier(row.identifier)) continue;
       const identifier = formatLocalIssueIdentifier(next++);
       used.add(identifier);
-      update.run({ id: row.id, identifier });
+      await adapter.run(updateIdentifierSql, { id: row.id, identifier });
     }
   });
-  tx.immediate();
   issueIdentifiersChecked = true;
 }
 
-function resolveIssueIdentifier(input: IssueInput, existing?: Record<string, unknown>) {
+async function resolveIssueIdentifier(input: IssueInput, existing?: Record<string, unknown>) {
   const requested = hasOwn(input, "identifier") ? input.identifier ?? null : undefined;
   if (isShortIssueIdentifier(requested)) return requested;
   const current = stringValue(existing?.identifier);
   if (isShortIssueIdentifier(current)) return current;
-  return nextLocalIssueIdentifier();
+  return await nextLocalIssueIdentifier();
 }
 
-function nextLocalIssueIdentifier() {
-  const rows = db.prepare("SELECT identifier FROM issues WHERE identifier LIKE @prefix").all({ prefix: `${localIssuePrefix}-%` }) as { identifier: string | null }[];
+async function nextLocalIssueIdentifier() {
+  const rows = await adapter.all("SELECT identifier FROM issues WHERE identifier LIKE @prefix", { prefix: `${localIssuePrefix}-%` }) as { identifier: string | null }[];
   return formatLocalIssueIdentifier(nextLocalIssueNumber(new Set(rows.map((row) => row.identifier).filter(isShortIssueIdentifier))));
 }
 
@@ -1931,13 +1945,13 @@ function normalizeProjectHealth(value: unknown) {
   return normalized;
 }
 
-function resolveIssueForUpsert(input: IssueInput) {
+async function resolveIssueForUpsert(input: IssueInput) {
   if (hasOwn(input, "issue_id")) {
     const issueId = nonEmptyString(input.issue_id);
     if (!issueId) throw new Error(`Issue not found: ${stringValue(input.issue_id) ?? ""}`);
-    const existing = getIssueRowByLocator(issueId);
+    const existing = await getIssueRowByLocator(issueId);
     if (!existing) throw new Error(`Issue not found: ${issueId}`);
-    assertCompatibleIssueLocators(input, existing);
+    await assertCompatibleIssueLocators(input, existing);
     return existing;
   }
   // An explicitly supplied `id` decides whether this is a create or an update.
@@ -1957,37 +1971,37 @@ function resolveIssueForUpsert(input: IssueInput) {
   // whatever the identifier happened to match (tests/store-regression.mjs:417).
   if (hasOwn(input, "id")) {
     const id = nonEmptyString(input.id);
-    const existing = id ? getIssueRowByLocator(id) : undefined;
+    const existing = id ? await getIssueRowByLocator(id) : undefined;
     // A supplied id that does not resolve means "create". Say so plainly rather
     // than letting another locator take over.
-    if (existing) assertCompatibleIssueLocators(input, existing);
+    if (existing) await assertCompatibleIssueLocators(input, existing);
     return existing;
   }
 
   const lookupId = input.external_id ?? input.identifier;
-  const existing = lookupId ? getIssueRowByLocator(lookupId) : undefined;
-  if (existing) assertCompatibleIssueLocators(input, existing);
+  const existing = lookupId ? await getIssueRowByLocator(lookupId) : undefined;
+  if (existing) await assertCompatibleIssueLocators(input, existing);
   return existing;
 }
 
-function assertCompatibleIssueLocators(input: IssueInput, existing: Record<string, unknown>) {
+async function assertCompatibleIssueLocators(input: IssueInput, existing: Record<string, unknown>) {
   for (const field of ["id", "external_id", "identifier"] as const) {
     if (!hasOwn(input, field)) continue;
     const value = nonEmptyString(input[field]);
     if (!value) continue;
-    const resolved = getIssueRowByLocator(value);
+    const resolved = await getIssueRowByLocator(value);
     if (resolved && stringValue(resolved.id) !== stringValue(existing.id)) {
       throw new Error(`Conflicting issue locator ${field}: ${value} resolves to ${issueLabel(resolved)}, but issue_id resolves to ${issueLabel(existing)}`);
     }
   }
 }
 
-function getIssueRowByLocator(value: string) {
-  return db.prepare("SELECT * FROM issues WHERE id = @id OR external_id = @id OR identifier = @id").get({ id: value }) as Record<string, unknown> | undefined;
+async function getIssueRowByLocator(value: string) {
+  return await adapter.get("SELECT * FROM issues WHERE id = @id OR external_id = @id OR identifier = @id", { id: value }) as Record<string, unknown> | undefined;
 }
 
-function getIssueDependency(id: string, issueId?: string, blockerIssueId?: string) {
-  return db.prepare(`
+async function getIssueDependency(id: string, issueId?: string, blockerIssueId?: string) {
+  return await adapter.get(`
     SELECT d.*, issue.identifier AS issue_identifier, issue.title AS issue_title,
       blocker.identifier AS blocker_identifier, blocker.title AS blocker_title
     FROM issue_dependencies d
@@ -1997,20 +2011,20 @@ function getIssueDependency(id: string, issueId?: string, blockerIssueId?: strin
       OR (@issue_id IS NOT NULL AND @blocker_issue_id IS NOT NULL
         AND d.issue_id = @issue_id AND d.blocker_issue_id = @blocker_issue_id)
     LIMIT 1
-  `).get({ id, issue_id: issueId ?? null, blocker_issue_id: blockerIssueId ?? null }) as Record<string, unknown> | undefined;
+  `, { id, issue_id: issueId ?? null, blocker_issue_id: blockerIssueId ?? null }) as Record<string, unknown> | undefined;
 }
 
-function resolveIssueDependencyRow(input: { dependency_id?: string; issue_id?: string; blocker_issue_id?: string }) {
+async function resolveIssueDependencyRow(input: { dependency_id?: string; issue_id?: string; blocker_issue_id?: string }) {
   const dependencyId = nonEmptyString(input.dependency_id);
-  if (dependencyId) return getIssueDependency(dependencyId);
-  const issueId = resolveParentId(input.issue_id);
-  const blockerIssueId = resolveParentId(input.blocker_issue_id);
+  if (dependencyId) return await getIssueDependency(dependencyId);
+  const issueId = await resolveParentId(input.issue_id);
+  const blockerIssueId = await resolveParentId(input.blocker_issue_id);
   if (!issueId || !blockerIssueId) return undefined;
-  return getIssueDependency("", issueId, blockerIssueId);
+  return await getIssueDependency("", issueId, blockerIssueId);
 }
 
-function dependencyWouldCycle(issueId: string, blockerIssueId: string) {
-  const row = db.prepare(`
+async function dependencyWouldCycle(issueId: string, blockerIssueId: string) {
+  const row = await adapter.get(`
     WITH RECURSIVE blocker_chain(issue_id) AS (
       SELECT @blocker_issue_id
       UNION
@@ -2020,7 +2034,7 @@ function dependencyWouldCycle(issueId: string, blockerIssueId: string) {
       WHERE dependency.status = 'open'
     )
     SELECT 1 AS cycle FROM blocker_chain WHERE issue_id = @issue_id LIMIT 1
-  `).get({ issue_id: issueId, blocker_issue_id: blockerIssueId });
+  `, { issue_id: issueId, blocker_issue_id: blockerIssueId });
   return Boolean(row);
 }
 
@@ -2028,13 +2042,13 @@ function issueLabel(issue: Record<string, unknown>) {
   return stringValue(issue.identifier) ?? stringValue(issue.id) ?? "unknown issue";
 }
 
-function resolveIssueProjectId(input: IssueInput, existing?: Record<string, unknown>) {
+async function resolveIssueProjectId(input: IssueInput, existing?: Record<string, unknown>) {
   if (hasOwn(input, "project_id")) {
     if (input.project_id == null) {
       if (booleanValue(input.allow_no_project, false)) return null;
       throw new Error("project_id:null requires allow_no_project:true. Use list_projects and pass the owning project_id for normal issues.");
     }
-    const resolved = resolveProjectId(input.project_id);
+    const resolved = await resolveProjectId(input.project_id);
     if (!resolved) throw new Error(`Project not found: ${input.project_id}`);
     return resolved;
   }
@@ -2052,35 +2066,35 @@ function normalizeLabels(value: unknown): string[] {
   return [];
 }
 
-function resolveProjectId(value: string | null | undefined) {
-  const project = value ? db.prepare("SELECT id FROM projects WHERE id = @id OR external_id = @id").get({ id: value }) as { id: string } | undefined : undefined;
+async function resolveProjectId(value: string | null | undefined) {
+  const project = value ? await adapter.get("SELECT id FROM projects WHERE id = @id OR external_id = @id", { id: value }) as { id: string } | undefined : undefined;
   return project?.id ?? null;
 }
 
-function resolveTeamId(value: string | null | undefined) {
-  const team = value ? db.prepare("SELECT id FROM teams WHERE id = @id OR external_id = @id").get({ id: value }) as { id: string } | undefined : undefined;
+async function resolveTeamId(value: string | null | undefined) {
+  const team = value ? await adapter.get("SELECT id FROM teams WHERE id = @id OR external_id = @id", { id: value }) as { id: string } | undefined : undefined;
   return team?.id ?? null;
 }
 
-function resolveIssueTeamId(value: string | null | undefined) {
+async function resolveIssueTeamId(value: string | null | undefined) {
   if (value == null) return null;
-  const teamId = resolveTeamId(value);
+  const teamId = await resolveTeamId(value);
   if (!teamId) throw new Error(`Team not found: ${value}`);
   return teamId;
 }
 
-function defaultTeamId() {
-  return String((ensureDefaultTeam() as { id: string }).id);
+async function defaultTeamId() {
+  return String((await ensureDefaultTeam() as { id: string }).id);
 }
 
-function resolveParentId(value: string | null | undefined) {
-  const issue = value ? db.prepare("SELECT id FROM issues WHERE id = @id OR external_id = @id OR identifier = @id").get({ id: value }) as { id: string } | undefined : undefined;
+async function resolveParentId(value: string | null | undefined) {
+  const issue = value ? await adapter.get("SELECT id FROM issues WHERE id = @id OR external_id = @id OR identifier = @id", { id: value }) as { id: string } | undefined : undefined;
   return issue?.id ?? null;
 }
 
-function resolveIssueParentId(value: string | null | undefined) {
+async function resolveIssueParentId(value: string | null | undefined) {
   if (value == null) return null;
-  const parentId = resolveParentId(value);
+  const parentId = await resolveParentId(value);
   if (!parentId) throw new Error(`Parent issue not found: ${value}`);
   return parentId;
 }

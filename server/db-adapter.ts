@@ -109,26 +109,26 @@ export function createSqliteAdapter(database: SqliteLike): DbAdapter {
 
   return {
     kind: "sqlite",
-    all<T>(sql: string, params?: SqlParams) {
-      return exclusive.runSerialized(() => database.prepare(sql).all(...bindArgs(params)) as T[]);
+    async all<T>(sql: string, params?: SqlParams) {
+      return await exclusive.runSerialized(() => database.prepare(sql).all(...bindArgs(params)) as T[]);
     },
-    get<T>(sql: string, params?: SqlParams) {
-      return exclusive.runSerialized(
+    async get<T>(sql: string, params?: SqlParams) {
+      return await exclusive.runSerialized(
         () => (database.prepare(sql).get(...bindArgs(params)) ?? undefined) as T | undefined,
       );
     },
-    run(sql: string, params?: SqlParams) {
-      return exclusive.runSerialized(() => {
+    async run(sql: string, params?: SqlParams) {
+      return await exclusive.runSerialized(() => {
         const result = database.prepare(sql).run(...bindArgs(params));
         return { changes: Number(result.changes) };
       });
     },
-    exec(sql: string) {
-      return exclusive.runSerialized(() => {
+    async exec(sql: string) {
+      return await exclusive.runSerialized(() => {
         database.exec(sql);
       });
     },
-    transaction<T>(fn: () => Promise<T>) {
+    async transaction<T>(fn: () => Promise<T>) {
       // bun:sqlite's transaction() wraps a synchronous callback and cannot hold
       // an async one open, so BEGIN/COMMIT are issued directly. The exclusive
       // section is what makes that safe: no query from outside this callback can
@@ -141,9 +141,9 @@ export function createSqliteAdapter(database: SqliteLike): DbAdapter {
       // second BEGIN is an error ("cannot start a transaction within a
       // transaction") rather than a savepoint. Joining means the inner body
       // commits and rolls back with the outer one.
-      if (exclusive.current()) return fn();
+      if (exclusive.current()) return await fn();
 
-      return exclusive.runExclusive(SQLITE_IN_TRANSACTION, async () => {
+      return await exclusive.runExclusive(SQLITE_IN_TRANSACTION, async () => {
         database.exec("BEGIN IMMEDIATE");
         try {
           const result = await fn();
@@ -159,8 +159,8 @@ export function createSqliteAdapter(database: SqliteLike): DbAdapter {
         }
       });
     },
-    close() {
-      return exclusive.runSerialized(() => {
+    async close() {
+      return await exclusive.runSerialized(() => {
         database.close(false);
       });
     },
@@ -231,7 +231,7 @@ export function createPostgresAdapter(sql: PostgresSql): DbAdapter {
     async transaction<T>(fn: () => Promise<T>) {
       // Already inside one: join it rather than reserving a second connection,
       // which would deadlock against the locks the first transaction holds.
-      if (exclusive.current()) return fn();
+      if (exclusive.current()) return await fn();
 
       const connection = await sql.reserve();
       try {

@@ -117,10 +117,10 @@ const store = await import("../server/store.ts");
 
 dbModule.initializeDatabase(dbModule.db);
 dbModule.runMigrations(dbModule.db);
-store.ensureDefaultTeam();
+await store.ensureDefaultTeam();
 
-const project = store.upsertProject({ external_id: "cache-project", name: "Cache", summary: "Cache project" });
-const issue = store.upsertIssue({
+const project = await store.upsertProject({ external_id: "cache-project", name: "Cache", summary: "Cache project" });
+const issue = await store.upsertIssue({
   title: "Cache issue",
   identifier: "CTH-940001",
   status: "Todo",
@@ -129,8 +129,8 @@ const issue = store.upsertIssue({
 
 // Reading the same issue repeatedly must hit the cache and keep returning the
 // same row: a shared prepared statement must not carry state between runs.
-const first = store.getIssue(issue.id);
-const second = store.getIssue(issue.id);
+const first = await store.getIssue(issue.id);
+const second = await store.getIssue(issue.id);
 assert(first && second, "getIssue must return the seeded issue");
 assert(first.identifier === "CTH-940001", `unexpected identifier ${first.identifier}`);
 assert(JSON.stringify(first) === JSON.stringify(second), "repeated getIssue must return identical rows");
@@ -158,20 +158,20 @@ assert(dbModule.dbPath !== originalPath, "creating a managed database must chang
 dbModule.initializeDatabase(dbModule.db);
 dbModule.runMigrations(dbModule.db);
 assert(
-  !store.getIssue(issue.id),
+  !await store.getIssue(issue.id),
   "the activated database must not return the previous database's issue -- a cached statement outlived its handle",
 );
 
 // And it must be usable in its own right.
-store.ensureDefaultTeam();
-assert(store.listTeams().length > 0, "the activated database must be queryable after the swap");
+await store.ensureDefaultTeam();
+assert((await store.listTeams()).length > 0, "the activated database must be queryable after the swap");
 assert(statementCacheStats(dbModule.db).size > 0, "the activated handle must populate its own cache");
 
 // Now switch back with the explicit API, again over a populated cache, and
 // confirm the original database still holds the row written before the swap.
 dbModule.activateManagedDatabase(originalId);
 assert(dbModule.dbPath === originalPath, "activation must return to the original database path");
-const afterRoundTrip = store.getIssue(issue.id);
+const afterRoundTrip = await store.getIssue(issue.id);
 assert(afterRoundTrip?.identifier === "CTH-940001", "the original database must still hold its issue after a round trip");
 
 console.log("Statement cache regression passed");

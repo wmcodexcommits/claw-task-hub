@@ -129,9 +129,9 @@ if (mode === "plan") {
   process.exit(0);
 }
 
-upsertProject(expectedProject);
+await upsertProject(expectedProject);
 
-ensureIssueIdentifiers();
+await ensureIssueIdentifiers();
 let nextIdentifier = nextIssueNumber();
 let created = 0;
 let updated = 0;
@@ -142,7 +142,7 @@ for (const [index, requisition] of requisitions.entries()) {
   const identifier = typeof existing?.identifier === "string"
     ? existing.identifier
     : `CTH-${String(nextIdentifier++).padStart(3, "0")}`;
-  upsertIssue({
+  await upsertIssue({
     ...expected,
     identifier,
     project_id: projectId,
@@ -152,7 +152,7 @@ for (const [index, requisition] of requisitions.entries()) {
   else created += 1;
 
   if (expected.status_type === "completed") {
-    saveComment({
+    await saveComment({
       external_id: `${expected.external_id}:accounted`,
       issue_id: expected.external_id,
       body: `Acceptance: canonical ${requisition.kind} ${requisition.id} is represented by a stable Claw ticket. This accepts registry accounting only and does not claim implementation of the referenced target.`,
@@ -167,7 +167,7 @@ for (const [index, requisition] of requisitions.entries()) {
   }
 }
 
-saveProjectUpdate({
+await saveProjectUpdate({
   external_id: "top-level-requisitions:full-accounting",
   project_id: projectId,
   body: `Generated a stable task for every unowned top-level canon requisition: ${kindCounts.alias} aliases, ${kindCounts.clause} clauses, ${kindCounts.policy} policies, and ${kindCounts.source} sources. Alias and source records are Done because their accounting artifacts already exist in canon; clause and policy obligations are Todo. The 696 library-owned requirements remain in their existing algorithm and math projects.`,

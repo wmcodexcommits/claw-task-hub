@@ -155,12 +155,12 @@ function fullUrl(baseUrl: string, path: string) {
   return `${baseUrl.replace(/\/+$/g, "")}${path.startsWith("/") ? path : `/${path}`}`;
 }
 
-function ensureProject(options: CliOptions, cwd: string) {
+async function ensureProject(options: CliOptions, cwd: string) {
   if (options.projectId) return options.projectId;
   if (!options.createProject) return null;
   const name = options.projectName ?? basename(cwd) ?? "Codex Workspace";
   const slug = slugify(`${options.harness}-workspace-${name}`);
-  const project = upsertProject({
+  const project = await upsertProject({
     id: `project_${slug}_${shortHash(cwd)}`,
     external_id: `${options.harness}-workspace:${cwd}`,
     name,
@@ -173,8 +173,8 @@ function ensureProject(options: CliOptions, cwd: string) {
   return project.id;
 }
 
-function bindProject(options: CliOptions, cwd: string, contextKey: string, projectId: string) {
-  return upsertContextBinding({
+async function bindProject(options: CliOptions, cwd: string, contextKey: string, projectId: string) {
+  return await upsertContextBinding({
     context_key: contextKey,
     project_id: projectId,
     default_tab: options.tab,
@@ -192,8 +192,8 @@ function bindProject(options: CliOptions, cwd: string, contextKey: string, proje
   });
 }
 
-function resolveProject(options: CliOptions, cwd: string, contextKey: string): ContextResolution {
-  return resolveContextProject({
+async function resolveProject(options: CliOptions, cwd: string, contextKey: string): Promise<ContextResolution> {
+  return await resolveContextProject({
     context_key: contextKey,
     harness: options.harness,
     cwd,
@@ -239,11 +239,11 @@ try {
   const options = parseArgs(process.argv.slice(2));
   const cwd = normalizePath(options.cwd);
   const contextKey = options.contextKey ?? `${options.harness}:${cwd}`;
-  const projectId = ensureProject(options, cwd);
+  const projectId = await ensureProject(options, cwd);
   let binding: unknown = null;
-  if (projectId) binding = bindProject(options, cwd, contextKey, projectId);
+  if (projectId) binding = await bindProject(options, cwd, contextKey, projectId);
 
-  const resolution = resolveProject(options, cwd, contextKey);
+  const resolution = await resolveProject(options, cwd, contextKey);
   const project = resolution.project;
   if (!project?.id) {
     throw new Error(

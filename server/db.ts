@@ -5,6 +5,7 @@ import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path
 import { fileURLToPath } from "node:url";
 import { removePathWithRetries, waitSync } from "./filesystem.js";
 import { clearStatementCache, prepareCached } from "./statement-cache.js";
+import { createSqliteAdapter, type DbAdapter } from "./db-adapter.js";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const dataDir = join(root, "data");
@@ -110,6 +111,16 @@ const databaseRegistryPath = join(databaseDir, ".claw-task-hub-databases.json");
 export let dbPath = resolveInitialDbPath();
 mkdirSync(dirname(dbPath), { recursive: true });
 export let db = openDatabase(dbPath);
+
+// The async data interface store.ts reads and writes through.
+//
+// store.ts talks to this rather than to `db` directly so the engine underneath
+// can change without the data layer changing shape: a Postgres-backed hub swaps
+// this for createPostgresAdapter and every query in store.ts keeps working. It
+// is a mutable binding for the same reason `db` is -- activating another
+// database replaces the handle, and the adapter has to follow it or it would
+// keep writing to the database that was just closed.
+export let adapter: DbAdapter = createSqliteAdapter(db);
 
 export function listManagedDatabases(): { active: ManagedDatabase; databases: ManagedDatabase[] } {
   const databasePaths = new Set(
@@ -279,9 +290,11 @@ function activateOpenDatabase(nextDatabase: SqliteDatabase, nextPath: string) {
     renameSync(temporaryPointer, activeDatabasePointer);
     db = nextDatabase;
     dbPath = nextPath;
+    adapter = createSqliteAdapter(nextDatabase);
   } catch (error) {
     db = openDatabase(previousPath);
     dbPath = previousPath;
+    adapter = createSqliteAdapter(db);
     throw error;
   }
 }

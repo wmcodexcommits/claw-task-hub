@@ -39,7 +39,7 @@ import {
 } from "./store.js";
 import { APP_VERSION } from "./version.js";
 
-ensureDefaultTeam();
+await ensureDefaultTeam();
 
 const app = express();
 const execFileAsync = promisify(execFile);
@@ -188,7 +188,7 @@ app.post("/api/filesystem/database-path", async (req, res) => {
     databasePickerActive = false;
   }
 });
-app.post("/api/databases", (req, res) => {
+app.post("/api/databases", async (req, res) => {
   const schema = z.object({
     name: z.string().trim().min(1).max(80),
     path: z.string().trim().max(4096).optional(),
@@ -196,16 +196,16 @@ app.post("/api/databases", (req, res) => {
   try {
     const value = schema.parse(req.body);
     const catalogue = createManagedDatabase(value.name, value.path);
-    ensureDefaultTeam();
+    await ensureDefaultTeam();
     res.status(201).json(catalogue);
   } catch (error) {
     res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
   }
 });
-app.post("/api/databases/:id/activate", (req, res) => {
+app.post("/api/databases/:id/activate", async (req, res) => {
   try {
     const catalogue = activateManagedDatabase(req.params.id);
-    ensureDefaultTeam();
+    await ensureDefaultTeam();
     res.json(catalogue);
   } catch (error) {
     res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
@@ -276,16 +276,16 @@ app.delete("/api/db-connections/:id", (req, res) => {
   }
 });
 
-app.get("/api/snapshot", (req, res) => res.json(dataSnapshot(req.query)));
-app.post("/api/refresh", (req, res) => res.json(dataSnapshot(req.body)));
+app.get("/api/snapshot", async (req, res) => res.json(await dataSnapshot(req.query)));
+app.post("/api/refresh", async (req, res) => res.json(await dataSnapshot(req.body)));
 
-app.get("/api/dashboard", (_req, res) => res.json(dashboard()));
-app.get("/api/sync-runs", (_req, res) => res.json({ runs: recentSyncRuns() }));
-app.get("/api/teams", (_req, res) => res.json({ teams: listTeams() }));
-app.get("/api/projects", (_req, res) => res.json({ projects: listProjects() }));
-app.get("/api/context-bindings", (req, res) => {
+app.get("/api/dashboard", async (_req, res) => res.json(await dashboard()));
+app.get("/api/sync-runs", async (_req, res) => res.json({ runs: await recentSyncRuns() }));
+app.get("/api/teams", async (_req, res) => res.json({ teams: await listTeams() }));
+app.get("/api/projects", async (_req, res) => res.json({ projects: await listProjects() }));
+app.get("/api/context-bindings", async (req, res) => {
   res.json({
-    bindings: listContextBindings({
+    bindings: await listContextBindings({
       context_key: req.query.context_key as string | undefined,
       project_id: req.query.project_id as string | undefined,
       harness: req.query.harness as string | undefined,
@@ -297,8 +297,8 @@ app.get("/api/context-bindings", (req, res) => {
     }),
   });
 });
-app.get("/api/context-bindings/resolve", (req, res) => {
-  res.json(resolveContextProject({
+app.get("/api/context-bindings/resolve", async (req, res) => {
+  res.json(await resolveContextProject({
     context_key: req.query.context_key as string | undefined,
     project_id: req.query.project_id as string | undefined,
     harness: req.query.harness as string | undefined,
@@ -308,12 +308,12 @@ app.get("/api/context-bindings/resolve", (req, res) => {
     thread_id: req.query.thread_id as string | undefined,
   }));
 });
-app.get("/api/context-bindings/:id", (req, res) => {
-  const binding = getContextBinding(req.params.id);
+app.get("/api/context-bindings/:id", async (req, res) => {
+  const binding = await getContextBinding(req.params.id);
   if (!binding) return res.status(404).json({ error: "Context binding not found" });
   res.json({ binding });
 });
-app.post("/api/context-bindings", (req, res) => {
+app.post("/api/context-bindings", async (req, res) => {
   const schema = z.object({
     id: z.string().optional(),
     context_key: z.string().min(1),
@@ -329,58 +329,58 @@ app.post("/api/context-bindings", (req, res) => {
     source: z.string().optional(),
   });
   try {
-    res.json({ binding: upsertContextBinding(schema.parse(req.body)) });
+    res.json({ binding: await upsertContextBinding(schema.parse(req.body)) });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     res.status(400).json({ error: message });
   }
 });
-app.delete("/api/context-bindings/:id", (req, res) => res.json(deleteContextBinding({ id: req.params.id })));
-app.get("/api/projects/:id", (req, res) => {
-  const project = getProject(req.params.id, { issues_per_status: req.query.issues_per_status });
+app.delete("/api/context-bindings/:id", async (req, res) => res.json(await deleteContextBinding({ id: req.params.id })));
+app.get("/api/projects/:id", async (req, res) => {
+  const project = await getProject(req.params.id, { issues_per_status: req.query.issues_per_status });
   if (!project) return res.status(404).json({ error: "Project not found" });
   res.json(project);
 });
 
-app.post("/api/projects", (req, res) => {
+app.post("/api/projects", async (req, res) => {
   const schema = projectInputSchema.superRefine((value, ctx) => {
     if (!value.id && !value.external_id && !value.name) {
       ctx.addIssue({ code: "custom", path: ["name"], message: "name is required when creating a project" });
     }
   });
   try {
-    res.status(201).json({ project: upsertProject(schema.parse(req.body)) });
+    res.status(201).json({ project: await upsertProject(schema.parse(req.body)) });
   } catch (error) {
     res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
   }
 });
 
-app.patch("/api/projects/:id", (req, res) => {
+app.patch("/api/projects/:id", async (req, res) => {
   try {
     const value = projectInputSchema.parse(req.body);
     delete value.id;
-    res.json({ project: updateProject(req.params.id, value) });
+    res.json({ project: await updateProject(req.params.id, value) });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     res.status(message.startsWith("Project not found:") ? 404 : 400).json({ error: message });
   }
 });
 
-app.delete("/api/projects/:id", (req, res) => {
+app.delete("/api/projects/:id", async (req, res) => {
   const schema = z.object({ confirm: z.literal(true), delete_issues: z.boolean().optional(), force: z.boolean().optional() });
   try {
-    res.json(deleteProject({ id: req.params.id, ...schema.parse(req.body) }));
+    res.json(await deleteProject({ id: req.params.id, ...schema.parse(req.body) }));
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     res.status(message.startsWith("Project not found:") ? 404 : message.includes("active issue claim") || message.includes("has ") ? 409 : 400).json({ error: message });
   }
 });
 
-app.get("/api/projects/:id/updates", (req, res) => {
-  res.json({ updates: listProjectUpdates({ project_id: req.params.id, limit: req.query.limit as string | undefined }) });
+app.get("/api/projects/:id/updates", async (req, res) => {
+  res.json({ updates: await listProjectUpdates({ project_id: req.params.id, limit: req.query.limit as string | undefined }) });
 });
 
-app.post("/api/projects/:id/updates", (req, res) => {
+app.post("/api/projects/:id/updates", async (req, res) => {
   const schema = z.object({
     id: z.string().optional(),
     external_id: z.string().optional(),
@@ -388,10 +388,10 @@ app.post("/api/projects/:id/updates", (req, res) => {
     health: z.enum(["on_track", "at_risk", "off_track", "complete"]).optional(),
     author: z.string().optional(),
   });
-  res.json({ update: saveProjectUpdate({ ...schema.parse(req.body), project_id: req.params.id }) });
+  res.json({ update: await saveProjectUpdate({ ...schema.parse(req.body), project_id: req.params.id }) });
 });
 
-app.get("/api/issues", (req, res) => {
+app.get("/api/issues", async (req, res) => {
   const filters = {
     project: req.query.project as string | undefined,
     project_id: req.query.project_id as string | undefined,
@@ -407,7 +407,7 @@ app.get("/api/issues", (req, res) => {
   };
   if (req.query.per_status_limit) {
     const issueDisplayLimit = parseIssueDisplayLimit(req.query.per_status_limit);
-    const issueGroups = listIssueGroups(filters, issueDisplayLimit);
+    const issueGroups = await listIssueGroups(filters, issueDisplayLimit);
     res.json({
       issues: issueGroups.flatMap((group) => group.issues),
       issueGroups,
@@ -415,60 +415,60 @@ app.get("/api/issues", (req, res) => {
     });
     return;
   }
-  res.json({ issues: listIssues(filters) });
+  res.json({ issues: await listIssues(filters) });
 });
 
-app.get("/api/issues/:id", (req, res) => {
-  const issue = getIssue(req.params.id);
+app.get("/api/issues/:id", async (req, res) => {
+  const issue = await getIssue(req.params.id);
   if (!issue) return res.status(404).json({ error: "Issue not found" });
   res.json({ issue });
 });
 
-app.post("/api/issues", (req, res) => {
+app.post("/api/issues", async (req, res) => {
   const schema = issueInputSchema.superRefine((value, ctx) => {
     if (!value.id && !value.external_id && !value.identifier && !value.issue_id && !value.title) {
       ctx.addIssue({ code: "custom", path: ["title"], message: "title is required when creating an issue" });
     }
   });
   try {
-    res.json({ issue: upsertIssue(schema.parse(req.body)) });
+    res.json({ issue: await upsertIssue(schema.parse(req.body)) });
   } catch (error) {
     res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
   }
 });
 
-app.patch("/api/issues/:id", (req, res) => {
+app.patch("/api/issues/:id", async (req, res) => {
   try {
     const value = issueInputSchema.parse(req.body);
     delete value.id;
     delete value.issue_id;
-    res.json({ issue: updateIssue(req.params.id, value) });
+    res.json({ issue: await updateIssue(req.params.id, value) });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     res.status(message.startsWith("Issue not found:") ? 404 : 400).json({ error: message });
   }
 });
 
-app.delete("/api/issues/:id", (req, res) => {
+app.delete("/api/issues/:id", async (req, res) => {
   const schema = z.object({ confirm: z.literal(true), force: z.boolean().optional() });
   try {
-    res.json(deleteIssue({ id: req.params.id, ...schema.parse(req.body) }));
+    res.json(await deleteIssue({ id: req.params.id, ...schema.parse(req.body) }));
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     res.status(message.startsWith("Issue not found:") ? 404 : message.includes("active claim") ? 409 : 400).json({ error: message });
   }
 });
 
-app.post("/api/issues/:id/comments", (req, res) => {
-  const issue = getIssue(req.params.id);
+app.post("/api/issues/:id/comments", async (req, res) => {
+  const issue = await getIssue(req.params.id);
   if (!issue) return res.status(404).json({ error: "Issue not found" });
   const schema = z.object({ body: z.string().min(1), author: z.string().optional() });
-  res.json({ comment: saveComment({ ...schema.parse(req.body), issue_id: (issue as unknown as { id: string }).id }) });
+  res.json({ comment: await saveComment({ ...schema.parse(req.body), issue_id: (issue as unknown as { id: string }).id }) });
 });
 
-app.get("/api/issues/:id/dependencies", (req, res) => {
+app.get("/api/issues/:id/dependencies", async (req, res) => {
   res.json({
-    dependencies: listIssueDependencies({
+    dependencies: await listIssueDependencies({
       issue_id: req.params.id,
       include_resolved: req.query.include_resolved as string | undefined,
       limit: req.query.limit as string | undefined,
@@ -476,7 +476,7 @@ app.get("/api/issues/:id/dependencies", (req, res) => {
   });
 });
 
-app.post("/api/issues/:id/dependencies", (req, res) => {
+app.post("/api/issues/:id/dependencies", async (req, res) => {
   const schema = z.object({
     id: z.string().optional(),
     external_id: z.string().optional(),
@@ -484,15 +484,15 @@ app.post("/api/issues/:id/dependencies", (req, res) => {
     reason: z.string().max(2000).optional(),
   });
   try {
-    res.json({ dependency: saveIssueDependency({ ...schema.parse(req.body), issue_id: req.params.id }) });
+    res.json({ dependency: await saveIssueDependency({ ...schema.parse(req.body), issue_id: req.params.id }) });
   } catch (error) {
     res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
   }
 });
 
-app.post("/api/issue-dependencies/:id/resolve", (req, res) => {
+app.post("/api/issue-dependencies/:id/resolve", async (req, res) => {
   try {
-    res.json(resolveIssueDependency({ dependency_id: req.params.id }));
+    res.json(await resolveIssueDependency({ dependency_id: req.params.id }));
   } catch (error) {
     res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
   }

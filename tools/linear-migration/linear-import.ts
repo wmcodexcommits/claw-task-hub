@@ -162,20 +162,20 @@ async function hydrateIssueDescription(session: LinearMcpSession, issue: LinearI
   return { issue: { ...issue, ...fullIssue }, hydrated: true };
 }
 
-function saveLinearIssue(issue: LinearIssue) {
+async function saveLinearIssue(issue: LinearIssue) {
   if (issue.projectId && issue.project) {
-    upsertProject({
+    await upsertProject({
       external_id: issue.projectId,
       name: projectName(issue.project),
       source: "linear",
     });
   }
-  const existing = getIssue(issue.id ?? issue.identifier ?? "") as Record<string, unknown> | null;
+  const existing = await getIssue(issue.id ?? issue.identifier ?? "") as Record<string, unknown> | null;
   const existingDescription = typeof existing?.description === "string" ? existing.description : undefined;
   const incomingDescription = typeof issue.description === "string" ? issue.description : undefined;
   const description = !incomingDescription || isTruncatedLinearDescription(incomingDescription) ? existingDescription : incomingDescription;
 
-  return upsertIssue({
+  return await upsertIssue({
     external_id: issue.id,
     identifier: issue.id?.startsWith("SAV-") ? issue.id : issue.identifier,
     title: issue.title ?? issue.id ?? "Untitled Linear issue",
@@ -200,20 +200,20 @@ function saveLinearIssue(issue: LinearIssue) {
 
 export async function importLinear(limitPages = 1000) {
   assertLinearImportAllowed();
-  const runId = startSyncRun("linear");
+  const runId = await startSyncRun("linear");
   const stats = { teams: 0, projects: 0, issues: 0, hydratedDescriptions: 0, hydrateFailures: 0, projectPages: 0, issuePages: 0, mode: "bootstrap" };
   let cursor: string | undefined;
   let maxUpdatedAt: string | undefined;
   const session = new LinearMcpSession();
   try {
     await session.initialize();
-    const checkpoint = getSyncCheckpoint("linear");
+    const checkpoint = await getSyncCheckpoint("linear");
     const updatedAfter = checkpoint?.cursor && /^\d{4}-\d{2}-\d{2}T/.test(checkpoint.cursor) ? checkpoint.cursor : undefined;
     if (updatedAfter) stats.mode = "incremental";
 
     const teamsResult = await session.callTool("list_teams", { limit: 250 });
     for (const team of teamsResult.teams ?? []) {
-      upsertTeam({
+      await upsertTeam({
         external_id: team.id,
         name: team.name,
         key: team.key,
@@ -228,7 +228,7 @@ export async function importLinear(limitPages = 1000) {
     do {
       const projectsResult = await session.callTool("list_projects", { limit: 250, cursor: projectCursor });
       for (const project of projectsResult.projects ?? []) {
-        upsertProject({
+        await upsertProject({
           external_id: project.id,
           name: project.name,
           summary: project.summary,
@@ -262,17 +262,17 @@ export async function importLinear(limitPages = 1000) {
         }
         if (issueToSave.projectId && issueToSave.project) stats.projects += 1;
         if (issueToSave.updatedAt && (!maxUpdatedAt || issueToSave.updatedAt > maxUpdatedAt)) maxUpdatedAt = issueToSave.updatedAt;
-        saveLinearIssue(issueToSave);
+        await saveLinearIssue(issueToSave);
         stats.issues += 1;
       }
       stats.issuePages += 1;
       cursor = issuesResult.cursor;
       if (!issuesResult.hasNextPage || !cursor) break;
     }
-    finishSyncRun(runId, "completed", stats, maxUpdatedAt ?? updatedAfter);
+    await finishSyncRun(runId, "completed", stats, maxUpdatedAt ?? updatedAfter);
     return { runId, stats, cursor: maxUpdatedAt ?? updatedAfter };
   } catch (error) {
-    finishSyncRun(runId, "failed", stats, cursor, error instanceof Error ? error.message : String(error));
+    await finishSyncRun(runId, "failed", stats, cursor, error instanceof Error ? error.message : String(error));
     throw error;
   } finally {
     session.close();
@@ -281,8 +281,8 @@ export async function importLinear(limitPages = 1000) {
 
 export async function backfillLinearDescriptions(limit = 500) {
   assertLinearImportAllowed();
-  const runId = startSyncRun("linear-description-backfill");
-  const targets = listTruncatedLinearIssues(limit);
+  const runId = await startSyncRun("linear-description-backfill");
+  const targets = await listTruncatedLinearIssues(limit);
   const stats = { scanned: targets.length, repaired: 0, failed: 0, skipped: 0, failures: [] as { id: string; error: string }[] };
   const session = new LinearMcpSession();
   try {
@@ -295,17 +295,17 @@ export async function backfillLinearDescriptions(limit = 500) {
           stats.skipped += 1;
           continue;
         }
-        saveLinearIssue(fullIssue);
+        await saveLinearIssue(fullIssue);
         stats.repaired += 1;
       } catch (error) {
         stats.failed += 1;
         stats.failures.push({ id: linearId, error: error instanceof Error ? error.message : String(error) });
       }
     }
-    finishSyncRun(runId, "completed", stats);
+    await finishSyncRun(runId, "completed", stats);
     return { runId, stats };
   } catch (error) {
-    finishSyncRun(runId, "failed", stats, undefined, error instanceof Error ? error.message : String(error));
+    await finishSyncRun(runId, "failed", stats, undefined, error instanceof Error ? error.message : String(error));
     throw error;
   } finally {
     session.close();

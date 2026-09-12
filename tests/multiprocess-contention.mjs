@@ -113,11 +113,11 @@ if (process.env.CONTENTION_ROLE === "worker") {
     report.initializedAt = Date.now() - startAt;
     report.journalMode = dbModule.db.prepare("PRAGMA journal_mode").get()?.journal_mode ?? null;
 
-    store.ensureDefaultTeam();
+    await store.ensureDefaultTeam();
 
     // Every worker upserts the SAME external_id. Exactly one row must exist
     // afterwards no matter how the upserts interleave across processes.
-    const project = store.upsertProject({
+    const project = await store.upsertProject({
       external_id: SHARED_PROJECT,
       name: "Contention",
       summary: "Shared across workers",
@@ -126,7 +126,7 @@ if (process.env.CONTENTION_ROLE === "worker") {
     for (let sequence = 0; sequence < WRITES_PER_WORKER; sequence += 1) {
       const identifier = `CTH-93${String(index).padStart(2, "0")}${String(sequence).padStart(2, "0")}`;
       try {
-        store.upsertIssue({
+        await store.upsertIssue({
           title: `Contention worker ${index} write ${sequence}`,
           identifier,
           status: "Todo",
@@ -197,16 +197,40 @@ try {
 
   // --- every worker must have survived ------------------------------------
 
+  // A worker that fails reports the reason on stdout, inside its report, not on
+  // stderr -- so read that first. Showing only stderr made a real failure arrive
+  // as "stderr: (none)", which is worse than no diagnostic at all.
+  const readReport = (result) => {
+    const line = result.stdout.split("\n").find((candidate) => candidate.startsWith("__CONTENTION__"));
+    if (!line) return null;
+    try {
+      return JSON.parse(line.slice("__CONTENTION__".length));
+    } catch {
+      return null;
+    }
+  };
+
   const dead = results.filter((result) => result.code !== 0);
   assert(
     dead.length === 0,
     `${dead.length}/${WORKERS} workers died under contention:\n` +
       dead
-        .map(
-          (result) =>
+        .map((result) => {
+          const report = readReport(result);
+          const reason = report?.fatal ?? "(worker produced no report)";
+          const codes = report?.errors ? JSON.stringify(report.errors) : "{}";
+          const reached = report
+            ? `initialized=${report.initialized} acknowledged=${report.acknowledged?.length ?? 0}`
+            : "(unknown)";
+          const stderr = result.stderr.trim().split("\n").slice(-3).join("\n            ") || "(none)";
+          return (
             `  worker ${result.index} exit ${result.code}\n` +
-            `    stderr: ${result.stderr.trim().split("\n").slice(-3).join("\n            ") || "(none)"}`,
-        )
+            `    fatal:  ${reason}\n` +
+            `    errors: ${codes}\n` +
+            `    got to: ${reached}\n` +
+            `    stderr: ${stderr}`
+          );
+        })
         .join("\n"),
   );
 

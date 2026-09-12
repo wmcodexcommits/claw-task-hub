@@ -383,12 +383,12 @@ try {
   } finally {
     dependencySourceMigrationDb.close();
   }
-  ensureDefaultTeam();
-  const firstNullExternalTeam = upsertTeam({
+  await ensureDefaultTeam();
+  const firstNullExternalTeam = await upsertTeam({
     id: "team_null_external_first",
     name: "First Null External Team",
   });
-  const secondNullExternalTeam = upsertTeam({
+  const secondNullExternalTeam = await upsertTeam({
     id: "team_null_external_second",
     name: "Second Null External Team",
   });
@@ -396,18 +396,18 @@ try {
   assert(secondNullExternalTeam.id === "team_null_external_second", "second null-external-id team returned the wrong row");
   assert(secondNullExternalTeam.name === "Second Null External Team", "second null-external-id team returned the wrong name");
 
-  const firstNullExternalProject = upsertProject({
+  const firstNullExternalProject = await upsertProject({
     id: "project_null_external_first",
     name: "First Null External Project",
   });
-  const secondNullExternalProject = upsertProject({
+  const secondNullExternalProject = await upsertProject({
     id: "project_null_external_second",
     name: "Second Null External Project",
   });
   assert(firstNullExternalProject.id === "project_null_external_first", "first null-external-id project returned the wrong row");
   assert(secondNullExternalProject.id === "project_null_external_second", "second null-external-id project returned the wrong row");
   assert(secondNullExternalProject.name === "Second Null External Project", "second null-external-id project returned the wrong name");
-  const assignedExternalProject = upsertProject({
+  const assignedExternalProject = await upsertProject({
     id: "project_null_external_first",
     external_id: "project-first-external",
     summary: "Assigned through an internal-id partial update.",
@@ -416,7 +416,7 @@ try {
   assert(assignedExternalProject.external_id === "project-first-external", "save_project internal id update did not assign external_id");
   assert(assignedExternalProject.name === firstNullExternalProject.name, "save_project internal id update discarded the existing name");
 
-  const storeProject = upsertProject({
+  const storeProject = await upsertProject({
     id: "project_store_regression",
     external_id: "store-regression-project",
     name: "Store Regression Project",
@@ -427,11 +427,11 @@ try {
     source: "test",
   });
   assert(storeProject.target_date === "2026-12-15", "project target date did not persist");
-  const partiallyUpdatedStoreProject = upsertProject({ external_id: "store-regression-project", summary: "Configured project summary" });
+  const partiallyUpdatedStoreProject = await upsertProject({ external_id: "store-regression-project", summary: "Configured project summary" });
   assert(partiallyUpdatedStoreProject.target_date === "2026-12-15", "partial project update discarded the target date");
   assert(partiallyUpdatedStoreProject.lead === "Regression Agent", "partial project update discarded the lead");
   assert(partiallyUpdatedStoreProject.source === "test", "partial project update discarded the source");
-  const projectUpdate = saveProjectUpdate({
+  const projectUpdate = await saveProjectUpdate({
     id: "project_update_store_regression",
     external_id: "store-regression-update",
     project_id: storeProject.id,
@@ -440,22 +440,22 @@ try {
     author: "Regression Agent",
   });
   assert(projectUpdate.project_id === storeProject.id, "project update was routed to the wrong project");
-  const updatedProjectUpdate = saveProjectUpdate({
+  const updatedProjectUpdate = await saveProjectUpdate({
     external_id: "store-regression-update",
     project_id: storeProject.id,
     body: "Status and blocker tracking remain explicit.",
     health: "at_risk",
   });
   assert(updatedProjectUpdate.id === projectUpdate.id, "idempotent project update created a duplicate");
-  assert(listProjectUpdates({ project_id: storeProject.id }).length === 1, "project update listing returned the wrong rows");
-  const listedProject = listProjects().find((project) => project.id === storeProject.id);
+  assert((await listProjectUpdates({ project_id: storeProject.id })).length === 1, "project update listing returned the wrong rows");
+  const listedProject = (await listProjects()).find((project) => project.id === storeProject.id);
   assert(listedProject?.health === "at_risk", "project listing did not expose latest configured health");
   assert(listedProject?.latest_update_body === "Status and blocker tracking remain explicit.", "project listing did not expose the latest project update");
   assert(listedProject?.target_date === "2026-12-15", "project listing did not expose the target date");
 
-  const dependencyTarget = upsertIssue({ title: "Dependency target", identifier: "CTH-900030", status: "Todo", project_id: storeProject.id });
-  const dependencyBlocker = upsertIssue({ title: "Dependency blocker", identifier: "CTH-900031", status: "Todo", project_id: storeProject.id });
-  const dependency = saveIssueDependency({
+  const dependencyTarget = await upsertIssue({ title: "Dependency target", identifier: "CTH-900030", status: "Todo", project_id: storeProject.id });
+  const dependencyBlocker = await upsertIssue({ title: "Dependency blocker", identifier: "CTH-900031", status: "Todo", project_id: storeProject.id });
+  const dependency = await saveIssueDependency({
     external_id: "store-regression-dependency",
     issue_id: dependencyTarget.identifier,
     blocker_issue_id: dependencyBlocker.identifier,
@@ -463,24 +463,24 @@ try {
   });
   assert(dependency.issue_id === dependencyTarget.id, "dependency target did not resolve by visible identifier");
   assert(dependency.blocker_issue_id === dependencyBlocker.id, "dependency blocker did not resolve by visible identifier");
-  assert(getIssue(dependencyTarget.identifier)?.status_type === "blocked", "open dependency did not make the target effectively blocked");
-  assert(listIssueDependencies({ issue_id: dependencyTarget.identifier }).length === 1, "dependency listing missed the open blocker");
-  assert(listIssues({ project_id: storeProject.id, blocked: true }).some((issue) => issue.id === dependencyTarget.id), "blocked filter missed dependency-blocked issue");
-  assert(getProject(storeProject.id)?.counts.blockers === 1, "project blocker count did not use explicit dependencies");
+  assert((await getIssue(dependencyTarget.identifier))?.status_type === "blocked", "open dependency did not make the target effectively blocked");
+  assert((await listIssueDependencies({ issue_id: dependencyTarget.identifier })).length === 1, "dependency listing missed the open blocker");
+  assert((await listIssues({ project_id: storeProject.id, blocked: true })).some((issue) => issue.id === dependencyTarget.id), "blocked filter missed dependency-blocked issue");
+  assert((await getProject(storeProject.id))?.counts.blockers === 1, "project blocker count did not use explicit dependencies");
   let dependencyCycleMessage = "";
   try {
-    saveIssueDependency({ issue_id: dependencyBlocker.identifier, blocker_issue_id: dependencyTarget.identifier });
+    await saveIssueDependency({ issue_id: dependencyBlocker.identifier, blocker_issue_id: dependencyTarget.identifier });
   } catch (error) {
     dependencyCycleMessage = error instanceof Error ? error.message : String(error);
   }
   assert(dependencyCycleMessage.includes("cycle"), `dependency cycle was not rejected clearly: ${dependencyCycleMessage}`);
-  const resolvedDependency = resolveIssueDependency({ dependency_id: dependency.id });
+  const resolvedDependency = await resolveIssueDependency({ dependency_id: dependency.id });
   assert(resolvedDependency.resolved === true, "dependency resolve did not report a state transition");
-  assert(getIssue(dependencyTarget.identifier)?.status_type === "unstarted", "resolving the final dependency did not restore Todo state");
-  assert(getProject(storeProject.id)?.projectUpdates.length === 1, "project detail did not include first-class updates");
-  assert(getProject(storeProject.id)?.activity.some((event) => event.type === "project_update"), "project activity did not include project updates");
+  assert((await getIssue(dependencyTarget.identifier))?.status_type === "unstarted", "resolving the final dependency did not restore Todo state");
+  assert((await getProject(storeProject.id))?.projectUpdates.length === 1, "project detail did not include first-class updates");
+  assert((await getProject(storeProject.id))?.activity.some((event) => event.type === "project_update"), "project activity did not include project updates");
 
-  const contextBinding = upsertContextBinding({
+  const contextBinding = await upsertContextBinding({
     context_key: "codex:C:/work/claw-task-hub",
     project_id: storeProject.id,
     default_tab: "issues",
@@ -498,26 +498,26 @@ try {
   assert(contextBinding.url_path === `/projects/${encodeURIComponent(storeProject.id)}/issues`, `context binding URL path is wrong: ${contextBinding.url_path}`);
   assert(contextBinding.repo_remote === "https://example.com/Catfish-75/claw-task-hub.git", `context binding did not strip remote credentials: ${contextBinding.repo_remote}`);
   assert(contextBinding.metadata.reason === "store regression", "context binding metadata did not round-trip");
-  assert(getContextBinding(contextBinding.id)?.context_key === contextBinding.context_key, "getContextBinding(id) did not find the binding");
-  assert(getContextBinding(contextBinding.context_key)?.id === contextBinding.id, "getContextBinding(context_key) did not find the binding");
-  assert(listContextBindings({ harness: "codex" }).some((binding) => binding.id === contextBinding.id), "listContextBindings(harness) did not return the binding");
-  assert(resolveContextProject({ context_key: contextBinding.context_key }).project?.id === storeProject.id, "resolveContextProject(context_key) did not find the project");
-  assert(resolveContextProject({ thread_id: "thread-store-regression" }).binding?.id === contextBinding.id, "resolveContextProject(thread_id) did not find the binding");
-  assert(resolveContextProject({ cwd: "C:/work/claw-task-hub" }).binding?.id === contextBinding.id, "resolveContextProject(cwd) did not find the binding");
-  assert(resolveContextProject({ repo_remote: "https://other:credential@example.com/Catfish-75/claw-task-hub.git", branch: "main" }).binding?.id === contextBinding.id, "resolveContextProject(repo_remote+branch) did not find the binding");
-  const updatedContextBinding = upsertContextBinding({
+  assert((await getContextBinding(contextBinding.id))?.context_key === contextBinding.context_key, "getContextBinding(id) did not find the binding");
+  assert((await getContextBinding(contextBinding.context_key))?.id === contextBinding.id, "getContextBinding(context_key) did not find the binding");
+  assert((await listContextBindings({ harness: "codex" })).some((binding) => binding.id === contextBinding.id), "listContextBindings(harness) did not return the binding");
+  assert((await resolveContextProject({ context_key: contextBinding.context_key })).project?.id === storeProject.id, "resolveContextProject(context_key) did not find the project");
+  assert((await resolveContextProject({ thread_id: "thread-store-regression" })).binding?.id === contextBinding.id, "resolveContextProject(thread_id) did not find the binding");
+  assert((await resolveContextProject({ cwd: "C:/work/claw-task-hub" })).binding?.id === contextBinding.id, "resolveContextProject(cwd) did not find the binding");
+  assert((await resolveContextProject({ repo_remote: "https://other:credential@example.com/Catfish-75/claw-task-hub.git", branch: "main" })).binding?.id === contextBinding.id, "resolveContextProject(repo_remote+branch) did not find the binding");
+  const updatedContextBinding = await upsertContextBinding({
     context_key: contextBinding.context_key,
     project_id: storeProject.id,
     default_tab: "activity",
   });
   assert(updatedContextBinding.id === contextBinding.id, "upsertContextBinding(context_key) created a duplicate binding");
   assert(updatedContextBinding.default_tab === "activity", "upsertContextBinding(context_key) did not update the default tab");
-  const deletedContextBinding = deleteContextBinding({ context_key: contextBinding.context_key });
+  const deletedContextBinding = await deleteContextBinding({ context_key: contextBinding.context_key });
   assert(deletedContextBinding.deleted === true, "deleteContextBinding(context_key) did not delete the binding");
-  assert(getContextBinding(contextBinding.context_key) === null, "deleted context binding still resolves");
+  assert(await getContextBinding(contextBinding.context_key) === null, "deleted context binding still resolves");
   let missingContextProjectMessage = "";
   try {
-    upsertContextBinding({
+    await upsertContextBinding({
       context_key: "codex:missing-project",
       project_id: "missing-project",
     });
@@ -529,7 +529,7 @@ try {
   const rowCountBeforeMissingProject = db.prepare("SELECT COUNT(*) AS count FROM issues").get().count;
   let missingProjectMessage = "";
   try {
-    upsertIssue({ title: "Missing project must fail", status: "Todo" });
+    await upsertIssue({ title: "Missing project must fail", status: "Todo" });
   } catch (error) {
     missingProjectMessage = error instanceof Error ? error.message : String(error);
   }
@@ -537,7 +537,7 @@ try {
   assert(db.prepare("SELECT COUNT(*) AS count FROM issues").get().count === rowCountBeforeMissingProject, "missing project_id created an issue");
   let invalidProjectMessage = "";
   try {
-    upsertIssue({ title: "Invalid project must fail", status: "Todo", project_id: "project-does-not-exist" });
+    await upsertIssue({ title: "Invalid project must fail", status: "Todo", project_id: "project-does-not-exist" });
   } catch (error) {
     invalidProjectMessage = error instanceof Error ? error.message : String(error);
   }
@@ -545,7 +545,7 @@ try {
   assert(db.prepare("SELECT COUNT(*) AS count FROM issues").get().count === rowCountBeforeMissingProject, "invalid project_id created an issue");
   let invalidTeamMessage = "";
   try {
-    upsertIssue({ title: "Invalid team must fail", status: "Todo", project_id: storeProject.id, team_id: "team-does-not-exist" });
+    await upsertIssue({ title: "Invalid team must fail", status: "Todo", project_id: storeProject.id, team_id: "team-does-not-exist" });
   } catch (error) {
     invalidTeamMessage = error instanceof Error ? error.message : String(error);
   }
@@ -553,13 +553,13 @@ try {
   assert(db.prepare("SELECT COUNT(*) AS count FROM issues").get().count === rowCountBeforeMissingProject, "invalid team_id created an issue");
   let invalidParentMessage = "";
   try {
-    upsertIssue({ title: "Invalid parent must fail", status: "Todo", project_id: storeProject.id, parent_id: "CTH-DOES-NOT-EXIST" });
+    await upsertIssue({ title: "Invalid parent must fail", status: "Todo", project_id: storeProject.id, parent_id: "CTH-DOES-NOT-EXIST" });
   } catch (error) {
     invalidParentMessage = error instanceof Error ? error.message : String(error);
   }
   assert(invalidParentMessage === "Parent issue not found: CTH-DOES-NOT-EXIST", `invalid parent error was not clear: ${invalidParentMessage}`);
   assert(db.prepare("SELECT COUNT(*) AS count FROM issues").get().count === rowCountBeforeMissingProject, "invalid parent_id created an issue");
-  const explicitNullReferences = upsertIssue({
+  const explicitNullReferences = await upsertIssue({
     title: "Explicit null references are preserved",
     identifier: "CTH-900023",
     status: "Todo",
@@ -569,7 +569,7 @@ try {
   });
   assert(explicitNullReferences.team_id === null, "explicit null team_id was replaced");
   assert(explicitNullReferences.parent_id === null, "explicit null parent_id was replaced");
-  const deliberateUnassigned = upsertIssue({
+  const deliberateUnassigned = await upsertIssue({
     title: "Deliberate unassigned inbox issue",
     identifier: "CTH-900022",
     status: "Todo",
@@ -578,7 +578,7 @@ try {
   });
   assert(deliberateUnassigned.project_id === null, "allow_no_project:true did not permit an explicit unassigned issue");
 
-  const created = upsertIssue({
+  const created = await upsertIssue({
     title: "Identifier/id collision regression",
     identifier: "CTH-900001",
     status: "Todo",
@@ -586,7 +586,7 @@ try {
     project_id: storeProject.id,
   });
 
-  const updated = upsertIssue({
+  const updated = await upsertIssue({
     id: "CTH-900001",
     status: "Paused",
     description: "Updated through the visible identifier passed as id.",
@@ -597,11 +597,11 @@ try {
   assert(updated.status === "Paused", `status was not updated: ${updated.status}`);
   assert(updated.status_type === "paused", `status_type was not inferred from Paused: ${updated.status_type}`);
 
-  const fetched = getIssue("CTH-900001");
+  const fetched = await getIssue("CTH-900001");
   assert(fetched?.id === created.id, "getIssue(identifier) does not return the updated issue");
   assert(fetched.description === "Updated through the visible identifier passed as id.", "description was not updated");
 
-  const issueIdAliasTarget = upsertIssue({
+  const issueIdAliasTarget = await upsertIssue({
     title: "issue_id alias target",
     identifier: "CTH-900011",
     external_id: "issue-id-alias-external",
@@ -609,37 +609,37 @@ try {
     project_id: null,
     allow_no_project: true,
   });
-  const issueIdInternalUpdate = upsertIssue({
+  const issueIdInternalUpdate = await upsertIssue({
     issue_id: issueIdAliasTarget.id,
     status: "In Progress",
     description: "Updated through internal issue_id alias.",
   });
   assert(issueIdInternalUpdate.id === issueIdAliasTarget.id, "issue_id internal id alias updated the wrong row");
   assert(issueIdInternalUpdate.identifier === "CTH-900011", "issue_id internal id alias did not preserve identifier");
-  const issueIdVisibleUpdate = upsertIssue({
+  const issueIdVisibleUpdate = await upsertIssue({
     issue_id: "CTH-900011",
     priority: 1,
   });
   assert(issueIdVisibleUpdate.id === issueIdAliasTarget.id, "issue_id visible identifier alias updated the wrong row");
   assert(issueIdVisibleUpdate.priority === 1, "issue_id visible identifier alias did not update priority");
-  const issueIdExternalUpdate = upsertIssue({
+  const issueIdExternalUpdate = await upsertIssue({
     issue_id: "issue-id-alias-external",
     description: "Updated through external issue_id alias.",
   });
   assert(issueIdExternalUpdate.id === issueIdAliasTarget.id, "issue_id external id alias updated the wrong row");
   assert(issueIdExternalUpdate.description === "Updated through external issue_id alias.", "issue_id external id alias did not update description");
-  const issueIdExternalBackfill = upsertIssue({
+  const issueIdExternalBackfill = await upsertIssue({
     issue_id: "CTH-900011",
     external_id: "issue-id-alias-backfilled-external",
     description: "Backfilled external id through issue_id alias.",
   });
   assert(issueIdExternalBackfill.id === issueIdAliasTarget.id, "issue_id plus new external_id updated the wrong row");
   assert(issueIdExternalBackfill.external_id === "issue-id-alias-backfilled-external", "issue_id plus new external_id did not persist the external id");
-  assert(getIssue("issue-id-alias-backfilled-external")?.id === issueIdAliasTarget.id, "backfilled external id does not resolve to the target issue");
+  assert((await getIssue("issue-id-alias-backfilled-external"))?.id === issueIdAliasTarget.id, "backfilled external id does not resolve to the target issue");
   const rowCountBeforeBadIssueId = db.prepare("SELECT COUNT(*) AS count FROM issues").get().count;
   let badIssueIdMessage = "";
   try {
-    upsertIssue({
+    await upsertIssue({
       issue_id: "CTH-DOES-NOT-EXIST",
       title: "Wrong locator must not create a duplicate",
       status: "Todo",
@@ -650,7 +650,7 @@ try {
   const rowCountAfterBadIssueId = db.prepare("SELECT COUNT(*) AS count FROM issues").get().count;
   assert(badIssueIdMessage === "Issue not found: CTH-DOES-NOT-EXIST", `issue_id not-found error was not clear: ${badIssueIdMessage}`);
   assert(rowCountAfterBadIssueId === rowCountBeforeBadIssueId, "issue_id not-found created a duplicate row");
-  const conflictingLocator = upsertIssue({
+  const conflictingLocator = await upsertIssue({
     title: "Conflicting locator target",
     identifier: "CTH-900012",
     status: "Todo",
@@ -658,7 +658,7 @@ try {
   });
   let conflictingLocatorMessage = "";
   try {
-    upsertIssue({
+    await upsertIssue({
       issue_id: "CTH-900011",
       identifier: conflictingLocator.identifier,
       title: "Conflicting issue_id locator must fail",
@@ -670,7 +670,7 @@ try {
 
   // An input save_issue does not understand must not look like a write that worked.
   // {id, state: "Done"} used to return the full issue object, unchanged and status "Todo".
-  const unknownFieldSubject = upsertIssue({
+  const unknownFieldSubject = await upsertIssue({
     title: "Unknown field must not read as a successful write",
     identifier: "CTH-900012",
     status: "Todo",
@@ -680,7 +680,7 @@ try {
 
   let misspelledFieldMessage = "";
   try {
-    upsertIssue({ id: unknownFieldSubject.id, state: "Done" });
+    await upsertIssue({ id: unknownFieldSubject.id, state: "Done" });
   } catch (error) {
     misspelledFieldMessage = error instanceof Error ? error.message : String(error);
   }
@@ -690,25 +690,25 @@ try {
 
   // The refusal must be a REFUSAL, not a partial write. Everything else in the same call
   // is discarded too, or the guard would just be a differently-shaped silent corruption.
-  const afterRejection = getIssue(unknownFieldSubject.id);
+  const afterRejection = await getIssue(unknownFieldSubject.id);
   assert(afterRejection.status === "Todo", `rejected save_issue still changed the row: ${afterRejection.status}`);
 
   let derivedFieldMessage = "";
   try {
-    upsertIssue({ id: unknownFieldSubject.id, status: "Done", project_name: "anything" });
+    await upsertIssue({ id: unknownFieldSubject.id, status: "Done", project_name: "anything" });
   } catch (error) {
     derivedFieldMessage = error instanceof Error ? error.message : String(error);
   }
   assert(derivedFieldMessage.includes("project_name"), `save_issue accepted a derived read-only field: ${derivedFieldMessage}`);
   assert(derivedFieldMessage.includes("read-only"), `save_issue did not explain that project_name is derived: ${derivedFieldMessage}`);
-  assert(getIssue(unknownFieldSubject.id).status === "Todo", "a call rejected for a derived field still wrote the other fields");
+  assert((await getIssue(unknownFieldSubject.id)).status === "Todo", "a call rejected for a derived field still wrote the other fields");
 
   // The guard must not narrow what save_issue accepts: every declared field still writes.
-  const acceptedAfterGuard = upsertIssue({ id: unknownFieldSubject.id, status: "Done", assignee: "Agent", labels: ["guarded"] });
+  const acceptedAfterGuard = await upsertIssue({ id: unknownFieldSubject.id, status: "Done", assignee: "Agent", labels: ["guarded"] });
   assert(acceptedAfterGuard.status === "Done", `guard blocked a legitimate status write: ${acceptedAfterGuard.status}`);
   assert(acceptedAfterGuard.assignee === "Agent", "guard blocked a legitimate assignee write");
 
-  upsertIssue({
+  await upsertIssue({
     title: "Explicit identifier owner",
     identifier: "CTH-999998",
     status: "Todo",
@@ -717,7 +717,7 @@ try {
   let explicitConflictCode = "";
   let explicitConflictMessage = "";
   try {
-    upsertIssue({
+    await upsertIssue({
       id: "explicit-identifier-conflict-row",
       identifier: "CTH-999998",
       title: "Explicit identifier duplicate must fail",
@@ -730,20 +730,20 @@ try {
   }
   assert(explicitConflictCode === "SQLITE_CONSTRAINT_UNIQUE", `explicit duplicate identifier did not fail with a unique constraint: ${explicitConflictCode}`);
   assert(explicitConflictMessage.includes("issues.identifier"), `explicit duplicate identifier failed on the wrong constraint: ${explicitConflictMessage}`);
-  assert(!getIssue("explicit-identifier-conflict-row"), "explicit duplicate identifier created a second row");
+  assert(!await getIssue("explicit-identifier-conflict-row"), "explicit duplicate identifier created a second row");
 
-  const team = upsertTeam({
+  const team = await upsertTeam({
     id: "team_linear",
     external_id: "linear-team",
     name: "Linear Imported Team",
     key: "LIN",
   });
-  const project = upsertProject({
+  const project = await upsertProject({
     id: "project_linear",
     external_id: "linear-project",
     name: "Linear Imported Project",
   });
-  const migrated = upsertIssue({
+  const migrated = await upsertIssue({
     external_id: "linear-issue-1",
     identifier: "SAV-900001",
     title: "Migrated metadata survives partial updates",
@@ -756,7 +756,7 @@ try {
     url: "https://linear.app/example/issue/SAV-900001",
     labels: ["linear", "metadata"],
   });
-  const partial = upsertIssue({
+  const partial = await upsertIssue({
     id: "SAV-900001",
     status: "In Progress",
     description: "Only status and description changed.",
@@ -767,7 +767,7 @@ try {
   assert(partial.source === "linear", "partial save_issue update lost source");
   assert(partial.url === "https://linear.app/example/issue/SAV-900001", "partial save_issue update lost url");
 
-  const done = upsertIssue({
+  const done = await upsertIssue({
     title: "Done issue status and labels normalize",
     identifier: "CTH-900002",
     status: "Done",
@@ -778,19 +778,19 @@ try {
   assert(done.status_type === "completed", `Done issue stored wrong status_type: ${done.status_type}`);
   assert(Array.isArray(done.labels) && done.labels.join(",") === "theme,security", "labels were not normalized to an array");
 
-  const started = upsertIssue({ title: "Array filter started", identifier: "CTH-900003", status: "In Progress", project_id: storeProject.id });
-  const blocked = upsertIssue({ title: "Array filter blocked", identifier: "CTH-900004", status: "Blocked", project_id: storeProject.id });
-  const arrayFiltered = listIssues({ status_type: ["started", "blocked"], limit: 20 });
+  const started = await upsertIssue({ title: "Array filter started", identifier: "CTH-900003", status: "In Progress", project_id: storeProject.id });
+  const blocked = await upsertIssue({ title: "Array filter blocked", identifier: "CTH-900004", status: "Blocked", project_id: storeProject.id });
+  const arrayFiltered = await listIssues({ status_type: ["started", "blocked"], limit: 20 });
   const arrayFilteredIds = new Set(arrayFiltered.map((issue) => issue.identifier));
   assert(arrayFilteredIds.has(started.identifier), "listIssues array status_type missed started issue");
   assert(arrayFilteredIds.has(blocked.identifier), "listIssues array status_type missed blocked issue");
   assert(!arrayFilteredIds.has(done.identifier), "listIssues array status_type included completed issue unexpectedly");
 
-  const blockerSemanticsProject = upsertProject({
+  const blockerSemanticsProject = await upsertProject({
     id: "project_blocker_semantics",
     name: "Blocker Semantics Regression",
   });
-  const urgentTodo = upsertIssue({
+  const urgentTodo = await upsertIssue({
     title: "Urgent issue is not blocked",
     identifier: "CTH-900030",
     status: "Todo",
@@ -798,7 +798,7 @@ try {
     project_id: blockerSemanticsProject.id,
     updated_at: "2026-03-01T00:00:00.000Z",
   });
-  const blockedMedium = upsertIssue({
+  const blockedMedium = await upsertIssue({
     title: "Blocked issue at medium priority",
     identifier: "CTH-900031",
     status: "Blocked",
@@ -806,42 +806,42 @@ try {
     project_id: blockerSemanticsProject.id,
     updated_at: "2026-03-02T00:00:00.000Z",
   });
-  const blockerSemanticsDetail = getProject(blockerSemanticsProject.id);
+  const blockerSemanticsDetail = await getProject(blockerSemanticsProject.id);
   assert(blockerSemanticsDetail.counts.blockers === 1, `project blocker count used priority instead of status: ${blockerSemanticsDetail.counts.blockers}`);
   assert(blockerSemanticsDetail.activity.find((event) => event.id === blockedMedium.id)?.verb === "blocker", "blocked issue activity was not classified as blocker");
   assert(blockerSemanticsDetail.activity.find((event) => event.id === urgentTodo.id)?.verb !== "blocker", "urgent Todo activity was incorrectly classified as blocker");
 
-  const filterProject = upsertProject({
+  const filterProject = await upsertProject({
     id: "project_filter_regression",
     external_id: "project-filter-regression",
     name: "Filter Regression Project",
   });
-  const projectDone = upsertIssue({ title: "Project completed filter target", identifier: "CTH-900008", status: "Done", project_id: filterProject.id });
-  const projectStarted = upsertIssue({ title: "Project active filter target", identifier: "CTH-900009", status: "In Progress", project_id: filterProject.id });
-  const projectBacklog = upsertIssue({ title: "Project backlog filter target", identifier: "CTH-900010", status: "Backlog", project_id: filterProject.id });
-  const projectCanceled = upsertIssue({ title: "Project canceled filter target", identifier: "CTH-900018", status: "Canceled", project_id: filterProject.id });
-  const projectActiveOnly = listIssues({ project_id: filterProject.id, include_done: false, limit: 20 });
+  const projectDone = await upsertIssue({ title: "Project completed filter target", identifier: "CTH-900008", status: "Done", project_id: filterProject.id });
+  const projectStarted = await upsertIssue({ title: "Project active filter target", identifier: "CTH-900009", status: "In Progress", project_id: filterProject.id });
+  const projectBacklog = await upsertIssue({ title: "Project backlog filter target", identifier: "CTH-900010", status: "Backlog", project_id: filterProject.id });
+  const projectCanceled = await upsertIssue({ title: "Project canceled filter target", identifier: "CTH-900018", status: "Canceled", project_id: filterProject.id });
+  const projectActiveOnly = await listIssues({ project_id: filterProject.id, include_done: false, limit: 20 });
   const projectActiveIds = new Set(projectActiveOnly.map((issue) => issue.identifier));
   assert(projectActiveIds.has(projectStarted.identifier), "include_done:false missed a project active issue");
   assert(projectActiveIds.has(projectBacklog.identifier), "include_done:false missed a project backlog issue");
   assert(!projectActiveIds.has(projectDone.identifier), "include_done:false included a project completed issue");
   assert(!projectActiveIds.has(projectCanceled.identifier), "include_done:false included a project canceled issue");
   assert(projectActiveOnly.every((issue) => !["completed", "canceled"].includes(issue.status_type)), "include_done:false returned inactive status_type in project scope");
-  const globalActiveOnly = listIssues({ include_done: false, limit: 250 });
+  const globalActiveOnly = await listIssues({ include_done: false, limit: 250 });
   assert(globalActiveOnly.every((issue) => !["completed", "canceled"].includes(issue.status_type)), "include_done:false returned inactive status_type globally");
-  const mixedActiveOnly = listIssues({ project_id: filterProject.id, status_type: ["backlog", "started"], include_done: false, limit: 20 });
+  const mixedActiveOnly = await listIssues({ project_id: filterProject.id, status_type: ["backlog", "started"], include_done: false, limit: 20 });
   const mixedActiveIds = new Set(mixedActiveOnly.map((issue) => issue.identifier));
   assert(mixedActiveIds.has(projectStarted.identifier), "status_type array with include_done:false missed started issue");
   assert(mixedActiveIds.has(projectBacklog.identifier), "status_type array with include_done:false missed backlog issue");
   assert(!mixedActiveIds.has(projectDone.identifier), "status_type array with include_done:false included completed issue");
-  const noCompleted = listIssues({ project_id: filterProject.id, status_type: ["completed"], include_done: false, limit: 20 });
+  const noCompleted = await listIssues({ project_id: filterProject.id, status_type: ["completed"], include_done: false, limit: 20 });
   assert(noCompleted.length === 0, "include_done:false did not win over explicit completed status_type");
-  const noCanceled = listIssues({ project_id: filterProject.id, status_type: ["canceled"], include_done: false, limit: 20 });
+  const noCanceled = await listIssues({ project_id: filterProject.id, status_type: ["canceled"], include_done: false, limit: 20 });
   assert(noCanceled.length === 0, "include_done:false did not exclude explicit canceled status_type");
-  const canceledOnly = listIssues({ project_id: filterProject.id, status_type: ["canceled"], limit: 20 });
+  const canceledOnly = await listIssues({ project_id: filterProject.id, status_type: ["canceled"], limit: 20 });
   assert(canceledOnly.some((issue) => issue.id === projectCanceled.id), "canceled issues are not discoverable through explicit status_type filter");
 
-  const identifierSearchTarget = upsertIssue({
+  const identifierSearchTarget = await upsertIssue({
     title: "Identifier search exact target",
     identifier: "CTH-900024",
     description: "This issue should be found by its visible code.",
@@ -849,7 +849,7 @@ try {
     project_id: filterProject.id,
     updated_at: "2026-01-01T00:00:00.000Z",
   });
-  upsertIssue({
+  await upsertIssue({
     title: "Identifier search mention only",
     identifier: "CTH-900025",
     description: "This row mentions CTH-900024 in text, but should rank after the exact identifier match.",
@@ -857,16 +857,16 @@ try {
     project_id: filterProject.id,
     updated_at: "2026-02-01T00:00:00.000Z",
   });
-  const identifierSearch = listIssues({ project_id: filterProject.id, query: "CTH-900024", limit: 10 });
+  const identifierSearch = await listIssues({ project_id: filterProject.id, query: "CTH-900024", limit: 10 });
   assert(identifierSearch[0]?.id === identifierSearchTarget.id, `identifier search did not rank exact match first: ${identifierSearch[0]?.identifier}`);
   assert(identifierSearch.some((issue) => issue.id === identifierSearchTarget.id), "identifier search missed the exact issue");
 
-  const largeProject = upsertProject({
+  const largeProject = await upsertProject({
     id: "project_detail_limit_regression",
     external_id: "project-detail-limit-regression",
     name: "Project Detail Limit Regression",
   });
-  const olderPaused = upsertIssue({
+  const olderPaused = await upsertIssue({
     title: "Older paused project issue",
     identifier: "CTH-900026",
     description: "This issue should remain visible in project detail even after many newer issues.",
@@ -875,7 +875,7 @@ try {
     updated_at: "2026-01-01T00:00:00.000Z",
   });
   for (let index = 0; index < 120; index += 1) {
-    upsertIssue({
+    await upsertIssue({
       title: `Newer project filler ${index + 1}`,
       identifier: `CTH-${900100 + index}`,
       status: "Todo",
@@ -883,7 +883,7 @@ try {
       updated_at: `2026-02-${String((index % 28) + 1).padStart(2, "0")}T00:00:00.000Z`,
     });
   }
-  const largeProjectDetail = getProject(largeProject.id);
+  const largeProjectDetail = await getProject(largeProject.id);
   assert(largeProjectDetail.issues.some((issue) => issue.id === olderPaused.id), "project detail omitted an older paused issue beyond the first 80 rows");
   const largeTodoGroup = largeProjectDetail.issueGroups.find((group) => group.status_type === "unstarted");
   const largePausedGroup = largeProjectDetail.issueGroups.find((group) => group.status_type === "paused");
@@ -891,36 +891,36 @@ try {
   assert(largeTodoGroup.total === 120, `project detail Todo total is wrong: ${largeTodoGroup.total}`);
   assert(largeTodoGroup.truncated === true, "project detail Todo group did not report truncation");
   assert(largePausedGroup.returned === 1 && largePausedGroup.total === 1, "project detail per-status grouping hid the older paused issue");
-  const largeProjectGroups100 = listIssueGroups({ project_id: largeProject.id }, 100);
+  const largeProjectGroups100 = await listIssueGroups({ project_id: largeProject.id }, 100);
   const todo100 = largeProjectGroups100.find((group) => group.status_type === "unstarted");
   assert(todo100.returned === 100 && todo100.total === 120 && todo100.truncated === true, "100 per-status limit did not return 100 of 120 Todo issues");
-  const todoOnlyGroups = listIssueGroups({ project_id: largeProject.id, status_type: "unstarted" }, 50);
+  const todoOnlyGroups = await listIssueGroups({ project_id: largeProject.id, status_type: "unstarted" }, 50);
   assert(todoOnlyGroups.length === 1 && todoOnlyGroups[0].status_type === "unstarted", "grouped issue API ignored an explicit status_type filter");
-  const largeProjectGroups200 = listIssueGroups({ project_id: largeProject.id }, 200);
+  const largeProjectGroups200 = await listIssueGroups({ project_id: largeProject.id }, 200);
   const todo200 = largeProjectGroups200.find((group) => group.status_type === "unstarted");
   assert(todo200.returned === 120 && todo200.total === 120 && todo200.truncated === false, "200 per-status limit did not include all 120 Todo issues");
-  const largeProjectAll = getProject(largeProject.id, { issues_per_status: "all" });
+  const largeProjectAll = await getProject(largeProject.id, { issues_per_status: "all" });
   const allTodo = largeProjectAll.issueGroups.find((group) => group.status_type === "unstarted");
   assert(allTodo.returned === 120 && allTodo.truncated === false, "all per-status limit did not include every Todo issue");
 
-  const oldComment = saveComment({ issue_id: created.id, body: "Older null external id comment", author: "Test" });
-  const visibleComment = saveComment({ issue_id: "SAV-900001", body: "Visible identifier comment", author: "Agent" });
+  const oldComment = await saveComment({ issue_id: created.id, body: "Older null external id comment", author: "Test" });
+  const visibleComment = await saveComment({ issue_id: "SAV-900001", body: "Visible identifier comment", author: "Agent" });
   assert(visibleComment.id !== oldComment.id, "saveComment returned an unrelated null-external-id comment");
   assert(visibleComment.issue_id === migrated.id, "saveComment did not resolve a visible issue identifier");
-  const createdWithComments = getIssue(created.identifier);
-  const migratedWithComments = getIssue("SAV-900001");
+  const createdWithComments = await getIssue(created.identifier);
+  const migratedWithComments = await getIssue("SAV-900001");
   assert(createdWithComments.comments.length === 1, "getIssue returned comments from another issue");
   assert(createdWithComments.comments[0].id === oldComment.id, "getIssue returned the wrong comment for the original issue");
   assert(migratedWithComments.comments.length === 1, "getIssue missed the migrated issue comment or included extras");
   assert(migratedWithComments.comments[0].id === visibleComment.id, "getIssue returned the wrong comment for the migrated issue");
-  const firstExternalComment = saveComment({
+  const firstExternalComment = await saveComment({
     issue_id: "SAV-900001",
     external_id: "agent-run-comment-1",
     body: "First idempotent body",
     author: "Agent A",
     source: "test",
   });
-  const updatedExternalComment = saveComment({
+  const updatedExternalComment = await saveComment({
     issue_id: "SAV-900001",
     external_id: "agent-run-comment-1",
     body: "Updated idempotent body",
@@ -935,204 +935,204 @@ try {
   assert(updatedExternalComment.issue_id === migrated.id, "saveComment external_id did not stay attached to the resolved issue");
   let invalidIssueMessage = "";
   try {
-    saveComment({ issue_id: "CTH-DOES-NOT-EXIST", body: "Nope" });
+    await saveComment({ issue_id: "CTH-DOES-NOT-EXIST", body: "Nope" });
   } catch (error) {
     invalidIssueMessage = error instanceof Error ? error.message : String(error);
   }
   assert(invalidIssueMessage === "Issue not found: CTH-DOES-NOT-EXIST", `invalid issue error was not clear: ${invalidIssueMessage}`);
 
-  const claimTarget = upsertIssue({ title: "Agent claim target", identifier: "CTH-900006", status: "Todo", project_id: storeProject.id });
-  const sessionA = startAgentSession({ id: "session-agent-a", agent_name: "Agent A", harness: "Codex", ttl_minutes: 30, metadata: { thread: "alpha" } });
+  const claimTarget = await upsertIssue({ title: "Agent claim target", identifier: "CTH-900006", status: "Todo", project_id: storeProject.id });
+  const sessionA = await startAgentSession({ id: "session-agent-a", agent_name: "Agent A", harness: "Codex", ttl_minutes: 30, metadata: { thread: "alpha" } });
   assert(sessionA.id === "session-agent-a", "startAgentSession did not preserve requested id");
   assert(sessionA.metadata.thread === "alpha", "startAgentSession did not hydrate metadata");
-  const heartbeat = heartbeatAgentSession({ session_id: "session-agent-a", ttl_minutes: 45 });
+  const heartbeat = await heartbeatAgentSession({ session_id: "session-agent-a", ttl_minutes: 45 });
   assert(heartbeat.expires_at >= sessionA.expires_at, "heartbeatAgentSession did not renew the session");
-  const firstClaim = claimIssue({ issue_id: "CTH-900006", session_id: "session-agent-a", note: "first pass", ttl_minutes: 30 });
+  const firstClaim = await claimIssue({ issue_id: "CTH-900006", session_id: "session-agent-a", note: "first pass", ttl_minutes: 30 });
   assert(firstClaim.claim.issue_id === claimTarget.id, "claimIssue did not resolve visible issue identifier");
   assert(firstClaim.idempotent === false, "first claim should not be idempotent");
-  assert(getIssue(claimTarget.identifier)?.status_type === "started", "claiming Todo work did not move it to In Progress");
-  const renewedClaim = claimIssue({ issue_id: "CTH-900006", session_id: "session-agent-a", note: "renewed", ttl_minutes: 30 });
+  assert((await getIssue(claimTarget.identifier))?.status_type === "started", "claiming Todo work did not move it to In Progress");
+  const renewedClaim = await claimIssue({ issue_id: "CTH-900006", session_id: "session-agent-a", note: "renewed", ttl_minutes: 30 });
   assert(renewedClaim.claim.id === firstClaim.claim.id, "claimIssue did not renew the existing claim for the same session");
   assert(renewedClaim.idempotent === true, "same-session claim should be idempotent");
   assert(renewedClaim.claim.note === "renewed", "same-session claim did not update the note");
-  startAgentSession({ id: "session-agent-b", agent_name: "Agent B", harness: "Claude Code", ttl_minutes: 30 });
+  await startAgentSession({ id: "session-agent-b", agent_name: "Agent B", harness: "Claude Code", ttl_minutes: 30 });
   let conflictMessage = "";
   try {
-    claimIssue({ issue_id: "CTH-900006", session_id: "session-agent-b" });
+    await claimIssue({ issue_id: "CTH-900006", session_id: "session-agent-b" });
   } catch (error) {
     conflictMessage = error instanceof Error ? error.message : String(error);
   }
   assert(conflictMessage.includes("Issue already claimed by Agent A"), `claim conflict was not clear: ${conflictMessage}`);
-  const forcedClaim = claimIssue({ issue_id: "CTH-900006", session_id: "session-agent-b", force: true, note: "takeover" });
+  const forcedClaim = await claimIssue({ issue_id: "CTH-900006", session_id: "session-agent-b", force: true, note: "takeover" });
   assert(forcedClaim.forced === true, "force claim did not report forced takeover");
   assert(forcedClaim.claim.agent_name === "Agent B", "force claim did not move ownership to Agent B");
-  const acceptanceComment = saveComment({
+  const acceptanceComment = await saveComment({
     issue_id: "CTH-900006",
     body: "Acceptance reached for agent claim state visibility in API payloads.",
     author: "Agent B",
     created_at: "2026-01-02T00:00:00.000Z",
     updated_at: "2026-01-02T00:00:00.000Z",
   });
-  saveComment({
+  await saveComment({
     issue_id: "CTH-900006",
     body: "Progress: the UI mentions an acceptance comment field, but this is not an acceptance decision.",
     author: "Agent B",
     created_at: "2026-01-02T00:00:01.000Z",
     updated_at: "2026-01-02T00:00:01.000Z",
   });
-  const listedClaimTarget = listIssues({ limit: 250 }).find((issue) => issue.identifier === "CTH-900006");
+  const listedClaimTarget = (await listIssues({ limit: 250 })).find((issue) => issue.identifier === "CTH-900006");
   assert(listedClaimTarget, "listIssues did not return the agent claim target");
   assert(Number(listedClaimTarget.active_claim_count) === 1, `listIssues active_claim_count was wrong: ${listedClaimTarget.active_claim_count}`);
   assert(listedClaimTarget.active_claim_agent === "Agent B", `listIssues active_claim_agent was wrong: ${listedClaimTarget.active_claim_agent}`);
   assert(listedClaimTarget.active_claim_harness === "Claude Code", `listIssues active_claim_harness was wrong: ${listedClaimTarget.active_claim_harness}`);
   assert(listedClaimTarget.last_acceptance_at === acceptanceComment.created_at, "listIssues did not expose latest acceptance timestamp");
-  const detailedClaimTarget = getIssue("CTH-900006");
+  const detailedClaimTarget = await getIssue("CTH-900006");
   assert(detailedClaimTarget.active_claim_count === 1, `getIssue active_claim_count was wrong: ${detailedClaimTarget.active_claim_count}`);
   assert(detailedClaimTarget.active_claims.length === 1, "getIssue did not expose active claims");
   assert(detailedClaimTarget.active_claims[0].agent_name === "Agent B", "getIssue active claim agent was wrong");
   assert(detailedClaimTarget.active_claims[0].harness === "Claude Code", "getIssue active claim harness was wrong");
   assert(detailedClaimTarget.last_acceptance_comment.id === acceptanceComment.id, "getIssue did not expose latest acceptance comment");
-  assert(listIssueClaims({ issue_id: "CTH-900006" }).length === 1, "listIssueClaims should show only one active claim");
-  const completedClaim = releaseIssueClaim({ issue_id: "CTH-900006", session_id: "session-agent-b", status: "completed" });
+  assert((await listIssueClaims({ issue_id: "CTH-900006" })).length === 1, "listIssueClaims should show only one active claim");
+  const completedClaim = await releaseIssueClaim({ issue_id: "CTH-900006", session_id: "session-agent-b", status: "completed" });
   assert(completedClaim.released === true, "releaseIssueClaim did not release active claim");
   assert(completedClaim.claim.status === "completed", "releaseIssueClaim did not store completed status");
-  assert(getIssue(claimTarget.identifier)?.status_type === "completed", "completing a claim did not move the issue to Done");
-  const listedAfterRelease = listIssues({ limit: 250 }).find((issue) => issue.identifier === "CTH-900006");
+  assert((await getIssue(claimTarget.identifier))?.status_type === "completed", "completing a claim did not move the issue to Done");
+  const listedAfterRelease = (await listIssues({ limit: 250 })).find((issue) => issue.identifier === "CTH-900006");
   assert(Number(listedAfterRelease.active_claim_count) === 0, "released claim remained visible in listIssues agent state");
-  assert(listIssueClaims({ issue_id: "CTH-900006" }).length === 0, "default listIssueClaims returned a completed claim as active by issue");
-  assert(!listIssueClaims({ session_id: "session-agent-b" }).some((claim) => claim.id === completedClaim.claim.id), "default listIssueClaims returned a completed claim as active by session");
-  assert(!listIssueClaims().some((claim) => claim.id === completedClaim.claim.id), "default listIssueClaims returned a completed claim as active globally");
+  assert((await listIssueClaims({ issue_id: "CTH-900006" })).length === 0, "default listIssueClaims returned a completed claim as active by issue");
+  assert(!(await listIssueClaims({ session_id: "session-agent-b" })).some((claim) => claim.id === completedClaim.claim.id), "default listIssueClaims returned a completed claim as active by session");
+  assert(!(await listIssueClaims()).some((claim) => claim.id === completedClaim.claim.id), "default listIssueClaims returned a completed claim as active globally");
   assert(
-    !listIssueClaims({ issue_id: "CTH-900006", include_released: "false" }).some((claim) => claim.id === completedClaim.claim.id),
+    !(await listIssueClaims({ issue_id: "CTH-900006", include_released: "false" })).some((claim) => claim.id === completedClaim.claim.id),
     "include_released:\"false\" returned a completed claim as active",
   );
   assert(
-    listIssueClaims({ issue_id: "CTH-900006", include_released: "true" }).some((claim) => claim.id === completedClaim.claim.id && claim.status === "completed" && claim.released_at),
+    (await listIssueClaims({ issue_id: "CTH-900006", include_released: "true" })).some((claim) => claim.id === completedClaim.claim.id && claim.status === "completed" && claim.released_at),
     "include_released:\"true\" did not show completed claim history",
   );
 
-  const closedClaimTarget = upsertIssue({ title: "Closed claim guard target", identifier: "CTH-900023", status: "Done", project_id: storeProject.id });
+  const closedClaimTarget = await upsertIssue({ title: "Closed claim guard target", identifier: "CTH-900023", status: "Done", project_id: storeProject.id });
   let closedClaimMessage = "";
   try {
-    claimIssue({ issue_id: closedClaimTarget.identifier, session_id: "session-agent-a" });
+    await claimIssue({ issue_id: closedClaimTarget.identifier, session_id: "session-agent-a" });
   } catch (error) {
     closedClaimMessage = error instanceof Error ? error.message : String(error);
   }
   assert(closedClaimMessage.includes("Issue CTH-900023 is completed"), `closed issue claim did not fail clearly: ${closedClaimMessage}`);
-  assert(listIssueClaims({ issue_id: closedClaimTarget.identifier, include_released: true }).length === 0, "closed issue claim guard still wrote a claim");
+  assert((await listIssueClaims({ issue_id: closedClaimTarget.identifier, include_released: true })).length === 0, "closed issue claim guard still wrote a claim");
   let closedCommentMessage = "";
   try {
-    saveComment({ issue_id: closedClaimTarget.identifier, body: "Wrong task journal entry" });
+    await saveComment({ issue_id: closedClaimTarget.identifier, body: "Wrong task journal entry" });
   } catch (error) {
     closedCommentMessage = error instanceof Error ? error.message : String(error);
   }
   assert(closedCommentMessage.includes("Issue CTH-900023 is completed"), `closed issue comment did not fail clearly: ${closedCommentMessage}`);
-  const allowedClosedComment = saveComment({ issue_id: closedClaimTarget.identifier, body: "Deliberate historical note", allow_closed: true });
+  const allowedClosedComment = await saveComment({ issue_id: closedClaimTarget.identifier, body: "Deliberate historical note", allow_closed: true });
   assert(allowedClosedComment.issue_id === closedClaimTarget.id, "allow_closed comment did not target the closed issue");
-  const allowedClosedClaim = claimIssue({ issue_id: closedClaimTarget.identifier, session_id: "session-agent-a", allow_closed: true, ttl_minutes: 30 });
+  const allowedClosedClaim = await claimIssue({ issue_id: closedClaimTarget.identifier, session_id: "session-agent-a", allow_closed: true, ttl_minutes: 30 });
   assert(allowedClosedClaim.claim.issue_id === closedClaimTarget.id, "allow_closed claim did not target the closed issue");
-  releaseIssueClaim({ claim_id: allowedClosedClaim.claim.id, status: "released" });
+  await releaseIssueClaim({ claim_id: allowedClosedClaim.claim.id, status: "released" });
 
-  const claimIdReleaseTarget = upsertIssue({ title: "Claim id release target", identifier: "CTH-900016", status: "Todo", project_id: storeProject.id });
-  const claimIdClaim = claimIssue({ issue_id: claimIdReleaseTarget.identifier, session_id: "session-agent-a", ttl_minutes: 30 });
-  const claimIdRelease = releaseIssueClaim({ claim_id: claimIdClaim.claim.id, status: "completed" });
+  const claimIdReleaseTarget = await upsertIssue({ title: "Claim id release target", identifier: "CTH-900016", status: "Todo", project_id: storeProject.id });
+  const claimIdClaim = await claimIssue({ issue_id: claimIdReleaseTarget.identifier, session_id: "session-agent-a", ttl_minutes: 30 });
+  const claimIdRelease = await releaseIssueClaim({ claim_id: claimIdClaim.claim.id, status: "completed" });
   assert(claimIdRelease.released === true, "releaseIssueClaim did not release by claim_id");
   assert(claimIdRelease.claim.id === claimIdClaim.claim.id, "releaseIssueClaim by claim_id released the wrong claim");
   assert(claimIdRelease.claim.status === "completed", "releaseIssueClaim by claim_id did not store completed status");
-  assert(listIssueClaims({ issue_id: claimIdReleaseTarget.identifier }).length === 0, "releaseIssueClaim by claim_id left an active claim visible");
+  assert((await listIssueClaims({ issue_id: claimIdReleaseTarget.identifier })).length === 0, "releaseIssueClaim by claim_id left an active claim visible");
 
-  const wrongClaimSessionTarget = upsertIssue({ title: "Wrong claim id session target", identifier: "CTH-900017", status: "Todo", project_id: storeProject.id });
-  const wrongClaimSession = claimIssue({ issue_id: wrongClaimSessionTarget.identifier, session_id: "session-agent-a", ttl_minutes: 30 });
+  const wrongClaimSessionTarget = await upsertIssue({ title: "Wrong claim id session target", identifier: "CTH-900017", status: "Todo", project_id: storeProject.id });
+  const wrongClaimSession = await claimIssue({ issue_id: wrongClaimSessionTarget.identifier, session_id: "session-agent-a", ttl_minutes: 30 });
   let wrongClaimSessionMessage = "";
   try {
-    releaseIssueClaim({ claim_id: wrongClaimSession.claim.id, session_id: "session-agent-b" });
+    await releaseIssueClaim({ claim_id: wrongClaimSession.claim.id, session_id: "session-agent-b" });
   } catch (error) {
     wrongClaimSessionMessage = error instanceof Error ? error.message : String(error);
   }
   assert(wrongClaimSessionMessage.includes("Issue claim belongs to session-agent-a"), `wrong claim_id session release did not fail clearly: ${wrongClaimSessionMessage}`);
-  assert(listIssueClaims({ issue_id: wrongClaimSessionTarget.identifier }).length === 1, "wrong claim_id session release mutated the active claim without force");
-  const forcedClaimIdRelease = releaseIssueClaim({ claim_id: wrongClaimSession.claim.id, session_id: "session-agent-b", force: "true" });
+  assert((await listIssueClaims({ issue_id: wrongClaimSessionTarget.identifier })).length === 1, "wrong claim_id session release mutated the active claim without force");
+  const forcedClaimIdRelease = await releaseIssueClaim({ claim_id: wrongClaimSession.claim.id, session_id: "session-agent-b", force: "true" });
   assert(forcedClaimIdRelease.released === true, "force release by claim_id did not release the active claim");
-  assert(listIssueClaims({ issue_id: wrongClaimSessionTarget.identifier }).length === 0, "force release by claim_id left active claims visible");
-  assert(getIssue(wrongClaimSessionTarget.identifier)?.status_type === "unstarted", "unfinished claim release did not return work to Todo");
+  assert((await listIssueClaims({ issue_id: wrongClaimSessionTarget.identifier })).length === 0, "force release by claim_id left active claims visible");
+  assert((await getIssue(wrongClaimSessionTarget.identifier))?.status_type === "unstarted", "unfinished claim release did not return work to Todo");
 
-  const staleReleaseTarget = upsertIssue({ title: "Stale newest claim release target", identifier: "CTH-900013", status: "Todo", project_id: storeProject.id });
+  const staleReleaseTarget = await upsertIssue({ title: "Stale newest claim release target", identifier: "CTH-900013", status: "Todo", project_id: storeProject.id });
   db.prepare(`
     INSERT INTO issue_claims (id, issue_id, session_id, agent_name, status, note, claimed_at, heartbeat_at, expires_at, released_at, force)
     VALUES
       ('claim-real-active-release', @issue_id, 'session-agent-a', 'Agent A', 'active', NULL, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z', '2999-01-01T00:00:00.000Z', NULL, 0),
       ('claim-stale-newest-release', @issue_id, 'session-agent-b', 'Agent B', 'active', NULL, '2999-01-01T00:00:00.000Z', '2999-01-01T00:00:00.000Z', '2000-01-01T00:00:00.000Z', NULL, 0)
   `).run({ issue_id: staleReleaseTarget.id });
-  const staleRelease = releaseIssueClaim({ issue_id: staleReleaseTarget.identifier, session_id: "session-agent-a", status: "completed" });
+  const staleRelease = await releaseIssueClaim({ issue_id: staleReleaseTarget.identifier, session_id: "session-agent-a", status: "completed" });
   assert(staleRelease.claim.id === "claim-real-active-release", "releaseIssueClaim released stale newest row instead of the live active row");
-  assert(listIssueClaims({ issue_id: staleReleaseTarget.identifier }).length === 0, "releaseIssueClaim left a stale release target active");
+  assert((await listIssueClaims({ issue_id: staleReleaseTarget.identifier })).length === 0, "releaseIssueClaim left a stale release target active");
   assert(
-    listIssueClaims({ issue_id: staleReleaseTarget.identifier, include_released: true }).some((claim) => claim.id === "claim-stale-newest-release" && claim.status === "expired"),
+    (await listIssueClaims({ issue_id: staleReleaseTarget.identifier, include_released: true })).some((claim) => claim.id === "claim-stale-newest-release" && claim.status === "expired"),
     "releaseIssueClaim did not expire stale unreleased rows before release",
   );
 
-  const wrongSessionTarget = upsertIssue({ title: "Wrong session release target", identifier: "CTH-900014", status: "Todo", project_id: storeProject.id });
-  claimIssue({ issue_id: wrongSessionTarget.identifier, session_id: "session-agent-a", ttl_minutes: 30 });
+  const wrongSessionTarget = await upsertIssue({ title: "Wrong session release target", identifier: "CTH-900014", status: "Todo", project_id: storeProject.id });
+  await claimIssue({ issue_id: wrongSessionTarget.identifier, session_id: "session-agent-a", ttl_minutes: 30 });
   let wrongSessionMessage = "";
   try {
-    releaseIssueClaim({ issue_id: wrongSessionTarget.identifier, session_id: "session-agent-b", force: "false" });
+    await releaseIssueClaim({ issue_id: wrongSessionTarget.identifier, session_id: "session-agent-b", force: "false" });
   } catch (error) {
     wrongSessionMessage = error instanceof Error ? error.message : String(error);
   }
   assert(wrongSessionMessage.includes("Issue claim belongs to session-agent-a"), `wrong-session release did not fail clearly: ${wrongSessionMessage}`);
-  assert(listIssueClaims({ issue_id: wrongSessionTarget.identifier }).length === 1, "wrong-session release mutated the active claim without force");
-  const forcedWrongSessionRelease = releaseIssueClaim({ issue_id: wrongSessionTarget.identifier, session_id: "session-agent-b", force: "true" });
+  assert((await listIssueClaims({ issue_id: wrongSessionTarget.identifier })).length === 1, "wrong-session release mutated the active claim without force");
+  const forcedWrongSessionRelease = await releaseIssueClaim({ issue_id: wrongSessionTarget.identifier, session_id: "session-agent-b", force: "true" });
   assert(forcedWrongSessionRelease.released === true, "force release did not release the active claim");
-  assert(listIssueClaims({ issue_id: wrongSessionTarget.identifier }).length === 0, "force release left active claims visible");
+  assert((await listIssueClaims({ issue_id: wrongSessionTarget.identifier })).length === 0, "force release left active claims visible");
 
-  const duplicateActiveTarget = upsertIssue({ title: "Duplicate active claim release target", identifier: "CTH-900015", status: "Todo", project_id: storeProject.id });
+  const duplicateActiveTarget = await upsertIssue({ title: "Duplicate active claim release target", identifier: "CTH-900015", status: "Todo", project_id: storeProject.id });
   db.prepare(`
     INSERT INTO issue_claims (id, issue_id, session_id, agent_name, status, note, claimed_at, heartbeat_at, expires_at, released_at, force)
     VALUES
       ('claim-duplicate-active-a', @issue_id, 'session-agent-a', 'Agent A', 'active', NULL, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z', '2999-01-01T00:00:00.000Z', NULL, 0),
       ('claim-duplicate-active-b', @issue_id, 'session-agent-b', 'Agent B', 'active', NULL, '2026-01-01T00:00:01.000Z', '2026-01-01T00:00:01.000Z', '2999-01-01T00:00:00.000Z', NULL, 0)
   `).run({ issue_id: duplicateActiveTarget.id });
-  const duplicateRelease = releaseIssueClaim({ issue_id: duplicateActiveTarget.identifier, session_id: "session-agent-a", status: "completed" });
+  const duplicateRelease = await releaseIssueClaim({ issue_id: duplicateActiveTarget.identifier, session_id: "session-agent-a", status: "completed" });
   assert(duplicateRelease.claim.id === "claim-duplicate-active-a", "duplicate-active release did not release the intended session");
   assert(duplicateRelease.superseded_active_duplicates === 1, "duplicate-active release did not report repairing the duplicate");
-  assert(listIssueClaims({ issue_id: duplicateActiveTarget.identifier }).length === 0, "duplicate-active release left another active claim visible");
+  assert((await listIssueClaims({ issue_id: duplicateActiveTarget.identifier })).length === 0, "duplicate-active release left another active claim visible");
   assert(
-    listIssueClaims({ issue_id: duplicateActiveTarget.identifier, include_released: true }).some((claim) => claim.id === "claim-duplicate-active-b" && claim.status === "superseded"),
+    (await listIssueClaims({ issue_id: duplicateActiveTarget.identifier, include_released: true })).some((claim) => claim.id === "claim-duplicate-active-b" && claim.status === "superseded"),
     "duplicate-active release did not supersede the duplicate active claim",
   );
 
-  const expiryTarget = upsertIssue({ title: "Expired claim target", identifier: "CTH-900007", status: "Todo", project_id: storeProject.id });
-  const expiringClaim = claimIssue({ issue_id: expiryTarget.identifier, session_id: "session-agent-a", ttl_minutes: 30 });
+  const expiryTarget = await upsertIssue({ title: "Expired claim target", identifier: "CTH-900007", status: "Todo", project_id: storeProject.id });
+  const expiringClaim = await claimIssue({ issue_id: expiryTarget.identifier, session_id: "session-agent-a", ttl_minutes: 30 });
   db.prepare("UPDATE issue_claims SET expires_at = '2000-01-01T00:00:00.000Z' WHERE id = @id").run({ id: expiringClaim.claim.id });
-  assert(listIssueClaims({ issue_id: expiryTarget.identifier }).length === 0, "default listIssueClaims returned an expired claim as active");
+  assert((await listIssueClaims({ issue_id: expiryTarget.identifier })).length === 0, "default listIssueClaims returned an expired claim as active");
   assert(
-    listIssueClaims({ issue_id: expiryTarget.identifier, include_released: true }).some((claim) => claim.id === expiringClaim.claim.id),
+    (await listIssueClaims({ issue_id: expiryTarget.identifier, include_released: true })).some((claim) => claim.id === expiringClaim.claim.id),
     "historical listIssueClaims did not include the manually expired claim",
   );
-  const afterExpiry = claimIssue({ issue_id: expiryTarget.identifier, session_id: "session-agent-b" });
+  const afterExpiry = await claimIssue({ issue_id: expiryTarget.identifier, session_id: "session-agent-b" });
   assert(afterExpiry.expired_released === 1, "claimIssue did not expire the stale claim before taking over");
   db.prepare("UPDATE agent_sessions SET expires_at = '2000-01-01T00:00:00.000Z' WHERE id = 'session-agent-a'").run();
-  assert(!listAgentSessions().some((session) => session.id === "session-agent-a"), "default listAgentSessions returned an expired session as active");
-  assert(listAgentSessions({ include_ended: true }).some((session) => session.id === "session-agent-a"), "historical listAgentSessions did not include expired session");
-  const endedSessionStateTarget = upsertIssue({ title: "Ended session state target", identifier: "CTH-900020", status: "Todo", project_id: storeProject.id });
-  startAgentSession({ id: "session-agent-c", agent_name: "Agent C", harness: "OpenClaw", ttl_minutes: 30 });
-  claimIssue({ issue_id: endedSessionStateTarget.identifier, session_id: "session-agent-c", ttl_minutes: 30 });
+  assert(!(await listAgentSessions()).some((session) => session.id === "session-agent-a"), "default listAgentSessions returned an expired session as active");
+  assert((await listAgentSessions({ include_ended: true })).some((session) => session.id === "session-agent-a"), "historical listAgentSessions did not include expired session");
+  const endedSessionStateTarget = await upsertIssue({ title: "Ended session state target", identifier: "CTH-900020", status: "Todo", project_id: storeProject.id });
+  await startAgentSession({ id: "session-agent-c", agent_name: "Agent C", harness: "OpenClaw", ttl_minutes: 30 });
+  await claimIssue({ issue_id: endedSessionStateTarget.identifier, session_id: "session-agent-c", ttl_minutes: 30 });
   db.prepare("UPDATE agent_sessions SET status = 'ended', ended_at = '2026-05-20T00:00:00.000Z', expires_at = '2999-01-01T00:00:00.000Z' WHERE id = 'session-agent-c'").run();
-  const endedSessionDetail = getIssue(endedSessionStateTarget.identifier);
+  const endedSessionDetail = await getIssue(endedSessionStateTarget.identifier);
   assert(endedSessionDetail.active_claim_count === 0, "getIssue showed a claim from an ended session as active");
-  const endedSessionListed = listIssues({ limit: 250 }).find((issue) => issue.identifier === endedSessionStateTarget.identifier);
+  const endedSessionListed = (await listIssues({ limit: 250 })).find((issue) => issue.identifier === endedSessionStateTarget.identifier);
   assert(Number(endedSessionListed.active_claim_count) === 0, "listIssues showed a claim from an ended session as active");
-  const expiredSessionStateTarget = upsertIssue({ title: "Expired session state target", identifier: "CTH-900021", status: "Todo", project_id: storeProject.id });
-  startAgentSession({ id: "session-agent-d", agent_name: "Agent D", harness: "Hermes", ttl_minutes: 30 });
-  claimIssue({ issue_id: expiredSessionStateTarget.identifier, session_id: "session-agent-d", ttl_minutes: 30 });
+  const expiredSessionStateTarget = await upsertIssue({ title: "Expired session state target", identifier: "CTH-900021", status: "Todo", project_id: storeProject.id });
+  await startAgentSession({ id: "session-agent-d", agent_name: "Agent D", harness: "Hermes", ttl_minutes: 30 });
+  await claimIssue({ issue_id: expiredSessionStateTarget.identifier, session_id: "session-agent-d", ttl_minutes: 30 });
   db.prepare("UPDATE agent_sessions SET expires_at = '2000-01-01T00:00:00.000Z' WHERE id = 'session-agent-d'").run();
-  const expiredSessionDetail = getIssue(expiredSessionStateTarget.identifier);
+  const expiredSessionDetail = await getIssue(expiredSessionStateTarget.identifier);
   assert(expiredSessionDetail.active_claim_count === 0, "getIssue showed a claim from an expired session as active");
-  const expiredSessionListed = listIssues({ limit: 250 }).find((issue) => issue.identifier === expiredSessionStateTarget.identifier);
+  const expiredSessionListed = (await listIssues({ limit: 250 })).find((issue) => issue.identifier === expiredSessionStateTarget.identifier);
   assert(Number(expiredSessionListed.active_claim_count) === 0, "listIssues showed a claim from an expired session as active");
-  endAgentSession({ session_id: "session-agent-b" });
-  assert(listIssueClaims({ session_id: "session-agent-b" }).length === 0, "endAgentSession did not release active claims by default");
-  assert(listAgentSessions({ include_ended: true }).some((session) => session.id === "session-agent-b" && session.status === "ended"), "ended session was not listed");
+  await endAgentSession({ session_id: "session-agent-b" });
+  assert((await listIssueClaims({ session_id: "session-agent-b" })).length === 0, "endAgentSession did not release active claims by default");
+  assert((await listAgentSessions({ include_ended: true })).some((session) => session.id === "session-agent-b" && session.status === "ended"), "ended session was not listed");
 
   const dirtyUpdatedAt = "2026-05-14T10:00:00.000Z";
   db.prepare(`
@@ -1152,7 +1152,7 @@ try {
     created_at: dirtyUpdatedAt,
     updated_at: dirtyUpdatedAt,
   });
-  const repair = repairIssueInvariants();
+  const repair = await repairIssueInvariants();
   assert(repair.issuesChecked >= 1, "repair did not scan issues");
   assert(repair.statusTypeFixed >= 1, "repair did not fix stale status_type");
   assert(repair.completedAtFixed >= 1, "repair did not set completed_at");
@@ -1162,7 +1162,7 @@ try {
   assert(rawDirty.status_type === "completed", `raw status_type was not repaired: ${rawDirty.status_type}`);
   assert(rawDirty.completed_at === dirtyUpdatedAt, `completed_at should use updated_at as historical proxy: ${rawDirty.completed_at}`);
   assert(rawDirty.labels === JSON.stringify(["theme", "security"]), `raw labels were not canonicalized: ${rawDirty.labels}`);
-  const secondRepair = repairIssueInvariants();
+  const secondRepair = await repairIssueInvariants();
   assert(secondRepair.statusTypeFixed === 0, "repair is not idempotent for status_type");
   assert(secondRepair.completedAtFixed === 0, "repair is not idempotent for completed_at");
   assert(secondRepair.labelsFixed === 0, "repair is not idempotent for labels");
