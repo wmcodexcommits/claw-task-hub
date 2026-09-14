@@ -7,7 +7,8 @@ import { removePathWithRetries, waitSync } from "./filesystem.js";
 import { clearStatementCache, prepareCached } from "./statement-cache.js";
 import { createPostgresAdapter, createSqliteAdapter, postgresNumericTypes, type DbAdapter, type PostgresClient } from "./db-adapter.js";
 import { resolveExternalConnection, type ExternalConnectionSummary } from "./db-connections.js";
-import { postgresSchemaSql } from "./db-schema-postgres.js";
+import { postgresChangeNotificationSql, postgresSchemaSql } from "./db-schema-postgres.js";
+import type { ListenerClient } from "./data-change-relay.js";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const dataDir = join(root, "data");
@@ -136,6 +137,29 @@ export let adapter: DbAdapter = localAdapter;
 // `db` stays open as this process's local fallback.
 type ActiveExternalConnection = { summary: ExternalConnectionSummary; adapter: DbAdapter };
 let activeExternal: ActiveExternalConnection | null = null;
+
+// Code that has to follow the active database, such as the API server's live
+// refresh relay, subscribes here rather than polling activeExternalConnectionId().
+const activeDatabaseListeners = new Set<() => void>();
+
+/** Call `listener` whenever this process's active external connection changes. */
+export function onActiveDatabaseChange(listener: () => void) {
+  activeDatabaseListeners.add(listener);
+  return () => {
+    activeDatabaseListeners.delete(listener);
+  };
+}
+
+function announceActiveDatabaseChange() {
+  for (const listener of activeDatabaseListeners) {
+    try {
+      listener();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      process.stderr.write(`claw-task-hub: an active-database listener failed: ${message}\n`);
+    }
+  }
+}
 
 export function listManagedDatabases(): { active: ManagedDatabase; databases: ManagedDatabase[] } {
   const databasePaths = new Set(
@@ -390,6 +414,7 @@ export async function closeActiveDatabase() {
   if (!external) return;
   activeExternal = null;
   adapter = localAdapter;
+  announceActiveDatabaseChange();
   await external.adapter.close();
 }
 
@@ -412,6 +437,7 @@ async function activateExternalConnection(connectionId: string, options: { persi
     // connection that cannot be opened leaves the current database live rather
     // than half-activating one that fails on the first read.
     await nextAdapter.exec(postgresSchemaSql);
+    await installChangeNotifications(nextAdapter, target.summary.name);
     if (options.persist) {
       writeActivePointer(`${externalDatabasePrefix}${target.summary.id}\n${resolve(dbPath)}\n`);
     }
@@ -422,12 +448,46 @@ async function activateExternalConnection(connectionId: string, options: { persi
   releaseExternalConnection();
   activeExternal = { summary: target.summary, adapter: nextAdapter };
   adapter = nextAdapter;
+  announceActiveDatabaseChange();
+}
+
+// Live refresh is an addition, not a requirement: a Postgres-wire server without
+// triggers or NOTIFY still works as a hub, so a failure here is reported and the
+// activation goes ahead. See postgresChangeNotificationSql.
+async function installChangeNotifications(target: DbAdapter, name: string) {
+  try {
+    await target.exec(postgresChangeNotificationSql);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(
+      `claw-task-hub: could not install change notifications on ${name}: ${message}\n` +
+      "claw-task-hub: UIs in other processes and on other machines will need a manual refresh to see changes\n",
+    );
+  }
+}
+
+/**
+ * Open a dedicated client for LISTEN on an external connection. It stays out of
+ * the query pool so a long-lived listening connection never holds a slot that a
+ * request needs. The caller owns the client and must end() it.
+ */
+export async function openExternalListenerClient(connectionId: string): Promise<ListenerClient> {
+  const target = resolveExternalConnection(connectionId);
+  const { default: postgres } = await import("postgres");
+  const client = postgres(target.connectionString, {
+    ssl: target.ssl ? "require" : false,
+    max: 1,
+    connect_timeout: 10,
+    onnotice: () => undefined,
+  });
+  return client as unknown as ListenerClient;
 }
 
 function releaseExternalConnection() {
   const previous = activeExternal;
   activeExternal = null;
   if (!previous) return;
+  announceActiveDatabaseChange();
   // end() lets queries already running on the pool finish before it closes.
   void previous.adapter.close().catch((error: unknown) => {
     const message = error instanceof Error ? error.message : String(error);

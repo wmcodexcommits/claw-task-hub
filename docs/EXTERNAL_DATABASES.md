@@ -41,6 +41,36 @@ are then read and written in that Postgres database.
   from the local database. Seed or import into it the same way as any other
   Claw Task Hub database.
 
+## Live refresh across processes and machines
+
+Several hubs, on one machine or several, can share one Postgres database, and
+an open UI refreshes when any of them writes. You don't need to reload the page.
+
+- **How it works.** Activation installs statement-level triggers on the hub
+  tables (`postgresChangeNotificationSql` in `server/db-schema-postgres.ts`).
+  Each trigger sends a `NOTIFY claw_task_hub_data_changed` with the table name.
+  Every API server using the connection listens on that channel and sends its
+  UIs the same `data-refresh` event its own writes do. A write from any client
+  counts: the UI, MCP, the hub CLI, an operator tool, or a hub on another machine.
+- **Timing.** Postgres delivers a notification when the writing transaction
+  commits, and a rolled-back write sends nothing. Open UIs refresh within about
+  100 ms of the commit, because signals for the same change are merged into one
+  refresh.
+- **Recovery.** Each API server sends a health ping on the channel every 30
+  seconds. If a ping doesn't come back, the server replaces its listener and
+  retries every 5 seconds. After reconnecting, it refreshes its UIs once to pick
+  up any writes it missed.
+- **Upgrading.** An API server that is already running keeps its old code.
+  Restart it on every machine to start listening.
+- **Connection requirements.** `LISTEN` needs a session-level connection. Use a
+  direct connection or a session-mode pooler, such as Supabase's **Session
+  pooler**. A transaction-mode pooler (Supabase port 6543, or PgBouncer in
+  transaction mode) accepts the connection but never delivers notifications.
+- **Servers without triggers or NOTIFY.** Some Postgres-compatible servers, such
+  as CockroachDB, don't support them. There, activation prints a warning and
+  goes ahead: the hub works normally, but UIs need a manual refresh to see
+  changes from other hubs.
+
 Postgres-specific notes:
 
 - Issue search uses a generated `tsvector` column with

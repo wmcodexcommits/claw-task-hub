@@ -211,3 +211,78 @@ CREATE INDEX IF NOT EXISTS idx_issue_dependencies_blocker_status ON issue_depend
 export const searchIssuesClausePostgres = "i.search_vector @@ websearch_to_tsquery('english', @query)";
 
 export const searchIssuesClauseSqlite = "i.rowid IN (SELECT rowid FROM issue_fts WHERE issue_fts MATCH @query)";
+
+/** The LISTEN/NOTIFY channel every hub table announces its changes on. */
+export const dataChangeChannel = "claw_task_hub_data_changed";
+
+/** Tables whose writes are visible to a UI, so each one announces changes. */
+export const dataChangeTables = [
+  "teams",
+  "projects",
+  "issues",
+  "comments",
+  "documents",
+  "sync_runs",
+  "sync_checkpoints",
+  "agent_sessions",
+  "issue_claims",
+  "context_bindings",
+  "project_updates",
+  "issue_dependencies",
+] as const;
+
+// Change announcements for UIs served by OTHER processes and machines.
+//
+// A UI refreshes when its own API server tells it to, and that server only
+// hears about writes it made itself or that a local MCP process posted to it.
+// Two hubs sharing one Postgres database would otherwise never see each other's
+// writes. The triggers live in the database rather than in store.ts so that
+// every writer announces its changes -- a hub on another machine, an older hub
+// build, the CLI, or an operator tool -- without having to opt in.
+//
+// Statement-level triggers keep this cheap: one notification per statement, not
+// per row. Postgres delivers a notification only when its transaction commits
+// (a rolled-back write announces nothing), and collapses identical channel and
+// payload pairs within one transaction, so a bulk import produces one event per
+// table. The payload is only the table name; listeners re-read what they need.
+//
+// Applied separately from postgresSchemaSql because not every Postgres-wire
+// server supports triggers or NOTIFY. A server that rejects this still works as
+// a hub; it just cannot push live refreshes.
+//
+// Existence is checked before each CREATE TRIGGER instead of dropping and
+// recreating the triggers: every process that opens the connection runs this,
+// and DROP TRIGGER takes an exclusive lock on the table each time. The
+// duplicate_object handler covers two processes creating the same trigger at once.
+export const postgresChangeNotificationSql = `
+CREATE OR REPLACE FUNCTION claw_task_hub_notify_change() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM pg_notify('${dataChangeChannel}', TG_TABLE_NAME);
+  RETURN NULL;
+END;
+$$;
+
+DO $$
+DECLARE
+  hub_table text;
+BEGIN
+  FOREACH hub_table IN ARRAY ARRAY[${dataChangeTables.map((table) => `'${table}'`).join(", ")}] LOOP
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_trigger
+      WHERE tgname = 'claw_task_hub_notify_change' AND tgrelid = to_regclass(hub_table)
+    ) THEN
+      BEGIN
+        EXECUTE format(
+          'CREATE TRIGGER claw_task_hub_notify_change AFTER INSERT OR UPDATE OR DELETE OR TRUNCATE ON %I '
+          'FOR EACH STATEMENT EXECUTE FUNCTION claw_task_hub_notify_change()',
+          hub_table
+        );
+      EXCEPTION WHEN duplicate_object THEN
+        NULL;
+      END;
+    END IF;
+  END LOOP;
+END;
+$$;
+`;
