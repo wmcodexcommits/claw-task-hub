@@ -1,3 +1,4 @@
+import { closeActiveDatabase } from "./db.js";
 import { callHubTool, hubToolNames } from "./tool-dispatch.js";
 
 const [, , mode, ...args] = process.argv;
@@ -53,3 +54,8 @@ try {
   console.error(`Error: ${message}`);
   process.exit(1);
 }
+
+// A Postgres pool keeps sockets open, and an open socket keeps this process alive
+// after the command has printed its result. Close whatever is active so a
+// one-shot call exits as soon as it is done.
+await closeActiveDatabase();

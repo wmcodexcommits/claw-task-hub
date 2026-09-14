@@ -16,6 +16,13 @@ dist-ssr
 release
 *.local
 data
+
+# Real secrets go here (Postgres/Supabase connection strings referenced by
+# name from a registered external connection, etc.). Only .env.example,
+# which holds no secrets, is meant to be tracked.
+.env
+.env.*
+!.env.example
 test-results
 playwright-report
 .playwright-cli
@@ -23,6 +30,13 @@ playwright-report
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+
+# Claude Code local configuration. launch.json records absolute paths to
+# executables on this machine, and settings.local.json is per-machine by
+# convention. Scoped to those two rather than all of .claude/, so project
+# config that is meant to be shared can still be tracked.
+.claude/launch.json
+.claude/settings.local.json
 
 # Editor directories and files
 .vscode/*
