@@ -15,21 +15,67 @@ anything else that speaks the Postgres wire protocol.
 - Each registered database is independent. Creating one does not copy or
   migrate data from another; that is intentional, not a missing feature.
 
-## What this is not
+## Using a connection as the live database
 
-Registering a Postgres/Supabase connection does **not** make it the live
-application database. `server/store.ts` is the data-access layer behind every
-issue, project, comment, and session in the app, and it is close to 100
-synchronous calls through `bun:sqlite`. A Postgres client is asynchronous by
-nature. Pointing the app's live reads and writes at Postgres/Supabase requires
-porting that layer to an async, dialect-neutral store -- a larger, separate
-piece of work that has not been done. There is deliberately no `/activate`
-route for an external connection; see the comment in `server/db-connections.ts`
-and `server/index.ts`.
+A registered connection can be made the **active database**, exactly like a
+local SQLite file: choose it under **External connections** in the database
+menu (or call `activate_database` / `POST /api/databases/:id/activate` with the
+id `external:<connection id>`). Projects, issues, comments, sessions, and claims
+are then read and written in that Postgres database.
 
-Until that port happens, a registered connection is a place you can verify
-Claw Task Hub can *reach* your database. Applying schema and running your own
-migrations against it is on you, same as any other Postgres database.
+- **Schema.** Activation connects first and applies the Claw Task Hub schema
+  (`server/db-schema-postgres.ts`, `CREATE ... IF NOT EXISTS`). A connection that
+  cannot be reached is not activated; the current database stays live.
+- **One active database for every client.** The selection is stored in the same
+  active-database pointer as SQLite selections, so the UI server, the hub CLI,
+  and the MCP server all use the selected connection. Processes that were
+  already running pick it up when they restart; the one that performed the
+  activation switches immediately.
+- **Startup fallback.** A process that starts while a connection is selected but
+  cannot reach it uses the local database it was selected from, and prints that
+  on stderr. The selection is kept, so the next start tries the connection again.
+- **Deletion.** The active connection cannot be deleted from the menu or the API;
+  activate another database first. The local database it was selected from
+  stays open as the fallback and cannot be deleted while it is open.
+- **Independent data.** Activating a connection does not copy or migrate data
+  from the local database. Seed or import into it the same way as any other
+  Claw Task Hub database.
+
+Postgres-specific notes:
+
+- Issue search uses a generated `tsvector` column with
+  `websearch_to_tsquery`, where SQLite uses fts5.
+- Upserts that SQLite resolves with several `ON CONFLICT` clauses in one
+  statement run on Postgres as a lookup of the matching key followed by a
+  single-key upsert.
+- Supabase's direct database host is IPv6-only. On an IPv4-only network use the
+  **Session pooler** connection string instead.
+
+## Moving an existing SQLite hub into a connection
+
+`tools/migrate-sqlite-to-postgres.ts` is a standalone operator tool (not part
+of the API, MCP server, or hub CLI) that copies a hub's SQLite history into a
+registered connection:
+
+```bash
+bun run migrate:postgres -- --from path/to/claw-task-hub.sqlite --to <connection id or name> --dry-run
+bun run migrate:postgres -- --from path/to/claw-task-hub.sqlite --to <connection id or name>
+```
+
+- The copy is one Postgres transaction covering schema, rows, and verification:
+  it lands completely or not at all. `--dry-run` performs all of it, including
+  verification, and rolls back.
+- Every table is verified by row count and a content digest before commit.
+- It refuses a target that already has rows, source rows that violate a foreign
+  key, source columns the target has no column for, and non-empty source tables
+  it does not know how to place.
+- `--enable-row-level-security` enables RLS on every hub table inside the same
+  transaction. Use it whenever the target schema is exposed over an HTTP API --
+  Supabase publishes `public` to anyone with the project's anon key. With no
+  policies, only the owning role (the one the hub connects as) can read or write.
+- The source is opened read-only and read from one snapshot. Stop writers to it
+  (or make sure the hub is not using it) before migrating, then activate the
+  connection.
 
 ## Registering a connection
 

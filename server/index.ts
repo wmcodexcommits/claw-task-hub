@@ -5,7 +5,7 @@ import { existsSync } from "node:fs";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
-import { activateManagedDatabase, createManagedDatabase, databaseIdFromName, dbPath, deleteManagedDatabase, getManagedDatabase, listManagedDatabases } from "./db.js";
+import { activateDatabase, activeDatabaseLabel, activeExternalConnectionId, createManagedDatabase, databaseIdFromName, dbPath, deleteManagedDatabase, getManagedDatabase, listManagedDatabases } from "./db.js";
 import { deleteExternalConnection, listExternalConnections, registerExternalConnection, testExternalConnection } from "./db-connections.js";
 import { dataSnapshot } from "./data-snapshot.js";
 import {
@@ -159,7 +159,7 @@ const issueInputSchema = z.object({
 }).passthrough();
 
 app.get("/api/health", (_req, res) => {
-  res.json({ ok: true, dbPath, mode: "local", host, version: APP_VERSION });
+  res.json({ ok: true, dbPath, database: activeDatabaseLabel(), mode: "local", host, version: APP_VERSION });
 });
 
 app.get("/api/databases", (_req, res) => res.json(listManagedDatabases()));
@@ -204,18 +204,18 @@ app.post("/api/databases", async (req, res) => {
 });
 app.post("/api/databases/:id/activate", async (req, res) => {
   try {
-    const catalogue = activateManagedDatabase(req.params.id);
+    const catalogue = await activateDatabase(req.params.id);
     await ensureDefaultTeam();
     res.json(catalogue);
   } catch (error) {
     res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
   }
 });
-app.patch("/api/databases/:id", (req, res) => {
+app.patch("/api/databases/:id", async (req, res) => {
   const schema = z.object({ active: z.literal(true) });
   try {
     schema.parse(req.body);
-    res.json(activateManagedDatabase(req.params.id));
+    res.json(await activateDatabase(req.params.id));
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     res.status(message.startsWith("Database not found:") ? 404 : 400).json({ error: message });
@@ -233,11 +233,10 @@ app.delete("/api/databases/:id", (req, res) => {
   }
 });
 
-// External (Postgres/Supabase) connections are registered and testable, but
-// intentionally have no /activate route: the store layer below still talks to
-// SQLite synchronously, so pointing "active" at one of these would silently
-// break every read and write instead of doing what it looks like it does.
-// See server/db-connections.ts for the full reasoning.
+// External (Postgres/Supabase) connections are registered and testable here.
+// Activation goes through the same /api/databases/:id/activate route as SQLite,
+// with the id "external:<connection id>", so there is one activation path and
+// one notion of "active" for every client.
 app.get("/api/db-connections", (_req, res) => res.json({ connections: listExternalConnections() }));
 app.post("/api/db-connections", (req, res) => {
   const schema = z.object({
@@ -268,6 +267,9 @@ app.delete("/api/db-connections/:id", (req, res) => {
   const schema = z.object({ confirm: z.literal(true) });
   try {
     const value = schema.parse(req.body);
+    if (activeExternalConnectionId() === req.params.id) {
+      return res.status(409).json({ error: "The active database cannot be deleted. Activate another database first." });
+    }
     res.json({ connections: deleteExternalConnection(req.params.id, value.confirm) });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -561,10 +563,10 @@ async function reportStartupFailure(error: NodeJS.ErrnoException) {
     const response = await fetch(`http://${host}:${port}/api/health`, {
       signal: AbortSignal.timeout(2000),
     });
-    const health = (await response.json()) as { ok?: boolean; dbPath?: string };
+    const health = (await response.json()) as { ok?: boolean; dbPath?: string; database?: string };
     if (health?.ok) {
       console.error(
-        `A Claw Task Hub instance is already running there, serving ${health.dbPath}.`);
+        `A Claw Task Hub instance is already running there, serving ${health.database ?? health.dbPath}.`);
       console.error(
         "If it is the systemd user service, restart it rather than starting a second one:");
       console.error("  systemctl --user restart claw-task-hub.service");

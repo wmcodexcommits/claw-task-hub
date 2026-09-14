@@ -1,5 +1,5 @@
 import {
-  activateManagedDatabase,
+  activateDatabase,
   createManagedDatabase,
   deleteManagedDatabase,
   getManagedDatabase,
@@ -133,7 +133,7 @@ async function dispatchHubTool(name: HubToolName, args: Record<string, unknown>)
   }
   if (name === "update_database" || name === "activate_database") {
     if (name === "update_database" && args.active !== true) throw new Error("update_database currently requires active=true");
-    const catalogue = activateManagedDatabase(requiredString(args, "id", name));
+    const catalogue = await activateDatabase(requiredString(args, "id", name));
     await ensureDefaultTeam();
     return catalogue;
   }

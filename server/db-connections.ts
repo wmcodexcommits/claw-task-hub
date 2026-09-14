@@ -1,22 +1,24 @@
 // External (Postgres/Supabase) database connections.
 //
-// This registry is deliberately separate from the managed SQLite databases in
-// db.ts. An entry here can be registered and test-pinged, but it can never
-// become the process's active `db` export: store.ts is ~100 synchronous
-// bun:sqlite calls, and a Postgres client is async. Wiring an external
-// connection into the same activation path as SQLite would not migrate the
-// query layer -- it would just make every read and write throw. Until the
-// store layer is ported to a dialect-neutral, async data access layer, an
-// external connection stays a registered, independently testable target that
-// the operator connects application code to themselves.
+// This registry holds connection TARGETS, never a live handle. An entry can be
+// registered and test-pinged here, and server/db.ts can make one the active data
+// layer (activateDatabase("external:<id>")), after which store.ts reads and
+// writes it through the Postgres adapter. The registry stays free of any
+// database handle so that listing, testing, or deleting an entry can never
+// disturb whichever database is active -- that guard lives with the handle, in
+// db.ts and the routes.
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const dataDir = join(root, "data");
-const connectionsRegistryPath = join(dataDir, ".claw-task-hub-connections.json");
+// Overridable so tests can register connections without touching the operator's
+// real registry.
+const connectionsRegistryPath = process.env.CLAW_TASK_HUB_CONNECTIONS_FILE
+  ? resolve(process.env.CLAW_TASK_HUB_CONNECTIONS_FILE)
+  : join(dataDir, ".claw-task-hub-connections.json");
 
 export type ExternalDatabaseKind = "postgres" | "supabase";
 
@@ -82,7 +84,7 @@ function readRegistry(): StoredConnection[] {
 }
 
 function writeRegistry(entries: StoredConnection[]) {
-  mkdirSync(dataDir, { recursive: true });
+  mkdirSync(dirname(connectionsRegistryPath), { recursive: true });
   const temporaryRegistry = `${connectionsRegistryPath}.${process.pid}.tmp`;
   writeFileSync(temporaryRegistry, `${JSON.stringify(entries, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
   renameSync(temporaryRegistry, connectionsRegistryPath);
@@ -188,6 +190,19 @@ export function deleteExternalConnection(id: string, confirm = false): ExternalC
   if (!existing.some((entry) => entry.id === id)) throw new Error(`Connection not found: ${id}`);
   writeRegistry(existing.filter((entry) => entry.id !== id));
   return listExternalConnections();
+}
+
+export type ExternalConnectionTarget = {
+  summary: ExternalConnectionSummary;
+  connectionString: string;
+  ssl: boolean;
+};
+
+/** The credential-bearing view of one entry, for opening it. Never serialize it. */
+export function resolveExternalConnection(id: string): ExternalConnectionTarget {
+  const entry = readRegistry().find((item) => item.id === id);
+  if (!entry) throw new Error(`Connection not found: ${id}`);
+  return { summary: toSummary(entry), connectionString: resolveConnectionString(entry), ssl: entry.ssl };
 }
 
 function resolveConnectionString(entry: StoredConnection): string {

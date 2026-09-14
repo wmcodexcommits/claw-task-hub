@@ -205,6 +205,7 @@ type ManagedDatabase = {
   fileName: string;
   path: string;
   active: boolean;
+  engine?: "sqlite" | "postgres";
 };
 
 type DatabaseCatalogue = {
@@ -1312,6 +1313,7 @@ function TopChrome({
               <>
                 <strong>External connections</strong>
                 {externalConnections.map((connection) => {
+                  const active = catalogue?.active.id === `external:${connection.id}`;
                   const statusLabel = connection.lastTestStatus === "ok"
                     ? "last test: ok"
                     : connection.lastTestStatus === "error"
@@ -1321,10 +1323,15 @@ function TopChrome({
                     <div className="database-menu-row" key={connection.id} role="presentation">
                       <button
                         className="database-select"
-                        role="menuitem"
-                        disabled
+                        role="menuitemradio"
+                        aria-checked={active}
+                        disabled={active}
                         title={`${connection.kind} — ${connection.target} — ${statusLabel}`}
-                      >{connection.name} ({connection.kind}{connection.lastTestStatus ? `, ${connection.lastTestStatus}` : ""})</button>
+                        onClick={() => {
+                          setMenuOpen(false);
+                          void onActivateDatabase(`external:${connection.id}`);
+                        }}
+                      >{connection.name} ({connection.kind}{connection.lastTestStatus ? `, ${connection.lastTestStatus}` : ""}){active ? " (active)" : ""}</button>
                       <button
                         className="database-test"
                         role="menuitem"
@@ -1333,16 +1340,18 @@ function TopChrome({
                         disabled={externalConnectionTestingId === connection.id}
                         onClick={() => onTestExternalConnection(connection.id)}
                       ><RefreshCw className={externalConnectionTestingId === connection.id ? "refresh-spin" : undefined} size={14} /></button>
-                      <button
-                        className="database-delete"
-                        role="menuitem"
-                        aria-label={`Delete ${connection.name}`}
-                        title={`Delete ${connection.name}`}
-                        onClick={() => {
-                          setMenuOpen(false);
-                          onDeleteExternalConnection(connection);
-                        }}
-                      ><Trash2 size={14} /></button>
+                      {!active ? (
+                        <button
+                          className="database-delete"
+                          role="menuitem"
+                          aria-label={`Delete ${connection.name}`}
+                          title={`Delete ${connection.name}`}
+                          onClick={() => {
+                            setMenuOpen(false);
+                            onDeleteExternalConnection(connection);
+                          }}
+                        ><Trash2 size={14} /></button>
+                      ) : null}
                     </div>
                   );
                 })}

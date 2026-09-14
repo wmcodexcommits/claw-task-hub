@@ -1,5 +1,6 @@
 import { customAlphabet } from "nanoid";
 import { adapter, json, nowIso, parseJson } from "./db.js";
+import { searchIssuesClausePostgres, searchIssuesClauseSqlite } from "./db-schema-postgres.js";
 
 const nanoid = customAlphabet("0123456789abcdefghijklmnopqrstuvwxyz", 12);
 const localIssuePrefix = "CTH";
@@ -288,6 +289,48 @@ const issueStatusGroups = [
 const issueDisplayLimitChoices = new Set(["50", "100", "200", "all"]);
 const groupedIssueAllLimit = 100000;
 
+type UpsertConflict = {
+  /** A unique key, as column names. */
+  target: string[];
+  /** The DO UPDATE SET list applied when the row collides on that key. */
+  set: string;
+};
+
+/**
+ * INSERT ... ON CONFLICT against more than one unique key.
+ *
+ * SQLite accepts several ON CONFLICT clauses on one INSERT and applies the first
+ * whose key the row collides with, atomically. Postgres allows exactly one. The
+ * clause list passed here is the single definition, and each engine renders it:
+ *
+ *   sqlite    the stacked statement it always ran, so its cross-process
+ *             atomicity -- which tests/multiprocess-contention.mjs relies on --
+ *             is unchanged.
+ *   postgres  the first key that already has a row decides, and the upsert runs
+ *             on that key alone. With no existing row, the first key the row
+ *             carries values for is used, so two concurrent creates of the same
+ *             external_id still meet in ON CONFLICT rather than in a unique
+ *             violation.
+ */
+async function upsertWithConflicts(table: string, columns: string[], row: Record<string, unknown>, conflicts: UpsertConflict[]) {
+  const insert = `INSERT INTO ${table} (${columns.join(", ")}) VALUES (${columns.map((column) => `@${column}`).join(", ")})`;
+  const clause = (conflict: UpsertConflict) => `ON CONFLICT(${conflict.target.join(", ")}) DO UPDATE SET ${conflict.set}`;
+  if (adapter.kind !== "postgres") {
+    return await adapter.run(`${insert}\n${conflicts.map(clause).join("\n")}`, row);
+  }
+  const keyed = conflicts.filter((conflict) => conflict.target.every((column) => row[column] != null));
+  let chosen: UpsertConflict | undefined;
+  for (const conflict of keyed) {
+    const match = conflict.target.map((column) => `${column} = @${column}`).join(" AND ");
+    if (await adapter.get(`SELECT 1 AS present FROM ${table} WHERE ${match} LIMIT 1`, row)) {
+      chosen = conflict;
+      break;
+    }
+  }
+  chosen ??= keyed[0] ?? conflicts[conflicts.length - 1];
+  return await adapter.run(`${insert}\n${clause(chosen)}`, row);
+}
+
 export function makeId(prefix: string) {
   return `${prefix}_${nanoid()}`;
 }
@@ -339,7 +382,11 @@ export async function upsertTeam(input: { id?: string; external_id?: string; nam
 
 export async function listProjects() {
   await ensureIssueIdentifiers();
+  // Wrapped so the ORDER BY can use latest_update_at inside COALESCE: SQLite
+  // resolves an output alias inside an ORDER BY expression, Postgres only
+  // resolves a bare alias there.
   return await adapter.all(`
+    SELECT * FROM (
     SELECT
       p.*,
       COUNT(i.id) AS issue_count,
@@ -371,7 +418,8 @@ export async function listProjects() {
     LEFT JOIN issues i ON i.project_id = p.id AND i.archived_at IS NULL
     WHERE p.archived_at IS NULL
     GROUP BY p.id
-    ORDER BY COALESCE(latest_update_at, p.updated_at) DESC
+    ) listed
+    ORDER BY COALESCE(listed.latest_update_at, listed.updated_at) DESC
   `);
 }
 
@@ -534,8 +582,9 @@ export async function upsertProject(input: ProjectInput) {
   const existing = internalId || externalId
     ? await adapter.get(`
         SELECT * FROM projects
-        WHERE (@id IS NOT NULL AND id = @id)
-           OR (@external_id IS NOT NULL AND external_id = @external_id)
+        -- CAST: Postgres cannot infer a parameter's type from IS NOT NULL.
+        WHERE (CAST(@id AS TEXT) IS NOT NULL AND id = @id)
+           OR (CAST(@external_id AS TEXT) IS NOT NULL AND external_id = @external_id)
         ORDER BY CASE WHEN id = @id THEN 0 ELSE 1 END
         LIMIT 1
       `, { id: internalId ?? null, external_id: externalId ?? null }) as Record<string, unknown> | undefined
@@ -556,19 +605,17 @@ export async function upsertProject(input: ProjectInput) {
     created_at: input.created_at ?? stringValue(existing?.created_at) ?? at,
     updated_at: input.updated_at ?? at,
   };
-  await adapter.run(`
-    INSERT INTO projects (id, external_id, name, summary, description, status, priority, lead, target_date, source, archived_at, created_at, updated_at)
-    VALUES (@id, @external_id, @name, @summary, @description, @status, @priority, @lead, @target_date, @source, @archived_at, @created_at, @updated_at)
-    ON CONFLICT(external_id) DO UPDATE SET
+  await upsertWithConflicts("projects", ["id", "external_id", "name", "summary", "description", "status", "priority", "lead", "target_date", "source", "archived_at", "created_at", "updated_at"], row, [
+    { target: ["external_id"], set: `
       name=excluded.name, summary=excluded.summary, description=excluded.description, status=excluded.status,
       priority=excluded.priority, lead=excluded.lead, target_date=excluded.target_date,
-      source=excluded.source, archived_at=excluded.archived_at, updated_at=excluded.updated_at
-    ON CONFLICT(id) DO UPDATE SET
+      source=excluded.source, archived_at=excluded.archived_at, updated_at=excluded.updated_at` },
+    { target: ["id"], set: `
       external_id=excluded.external_id, name=excluded.name, summary=excluded.summary, description=excluded.description,
       status=excluded.status, priority=excluded.priority, lead=excluded.lead, target_date=excluded.target_date,
       source=excluded.source, archived_at=excluded.archived_at,
-      updated_at=excluded.updated_at
-  `, row);
+      updated_at=excluded.updated_at` },
+  ]);
   if (row.external_id) return await adapter.get("SELECT * FROM projects WHERE external_id = @external_id", row);
   return await adapter.get("SELECT * FROM projects WHERE id = @id", row);
 }
@@ -642,20 +689,18 @@ export async function saveProjectUpdate(input: ProjectUpdateInput) {
     created_at: input.created_at ?? at,
     updated_at: input.updated_at ?? at,
   };
-  await adapter.run(`
-    INSERT INTO project_updates (id, external_id, project_id, body, health, author, source, created_at, updated_at)
-    VALUES (@id, @external_id, @project_id, @body, @health, @author, @source, @created_at, @updated_at)
-    ON CONFLICT(external_id) DO UPDATE SET
+  await upsertWithConflicts("project_updates", ["id", "external_id", "project_id", "body", "health", "author", "source", "created_at", "updated_at"], row, [
+    { target: ["external_id"], set: `
       project_id=excluded.project_id, body=excluded.body, health=excluded.health,
-      author=excluded.author, source=excluded.source, updated_at=excluded.updated_at
-    ON CONFLICT(id) DO UPDATE SET
+      author=excluded.author, source=excluded.source, updated_at=excluded.updated_at` },
+    { target: ["id"], set: `
       external_id=excluded.external_id, project_id=excluded.project_id, body=excluded.body,
-      health=excluded.health, author=excluded.author, source=excluded.source, updated_at=excluded.updated_at
-  `, row);
+      health=excluded.health, author=excluded.author, source=excluded.source, updated_at=excluded.updated_at` },
+  ]);
   return await adapter.get(`
     SELECT u.*, p.name AS project_name
     FROM project_updates u JOIN projects p ON p.id = u.project_id
-    WHERE u.id = @id OR (@external_id IS NOT NULL AND u.external_id = @external_id)
+    WHERE u.id = @id OR (CAST(@external_id AS TEXT) IS NOT NULL AND u.external_id = @external_id)
     ORDER BY CASE WHEN u.id = @id THEN 0 ELSE 1 END
     LIMIT 1
   `, { id: row.id, external_id: externalId });
@@ -1006,12 +1051,14 @@ function issueQueryParts(filters: ListIssueFilters) {
   let orderBy = "i.updated_at DESC";
   if (query) {
     where.push(`(
-      i.rowid IN (SELECT rowid FROM issue_fts WHERE issue_fts MATCH @query)
+      ${adapter.kind === "postgres" ? searchIssuesClausePostgres : searchIssuesClauseSqlite}
       OR lower(coalesce(i.identifier, '')) LIKE @query_like ESCAPE '\\'
       OR lower(coalesce(i.external_id, '')) LIKE @query_like ESCAPE '\\'
       OR lower(i.id) LIKE @query_like ESCAPE '\\'
     )`);
-    params.query = ftsQuery(query);
+    // fts5 needs its query quoted token by token; websearch_to_tsquery takes the
+    // user's text as typed and never raises on stray operators.
+    params.query = adapter.kind === "postgres" ? query : ftsQuery(query);
     params.query_exact = query;
     params.query_like = `%${escapeLike(query.toLowerCase())}%`;
     orderBy = `
@@ -1186,20 +1233,18 @@ async function upsertIssueLocked(input: IssueInput) {
     created_at: input.created_at ?? stringValue(existing?.created_at) ?? at,
     updated_at: input.updated_at ?? at,
   };
-  await adapter.run(`
-    INSERT INTO issues (id, external_id, identifier, title, description, status, status_type, priority, project_id, team_id, parent_id, assignee, labels, source, url, archived_at, completed_at, created_at, updated_at)
-    VALUES (@id, @external_id, @identifier, @title, @description, @status, @status_type, @priority, @project_id, @team_id, @parent_id, @assignee, @labels, @source, @url, @archived_at, @completed_at, @created_at, @updated_at)
-    ON CONFLICT(external_id) DO UPDATE SET
+  await upsertWithConflicts("issues", ["id", "external_id", "identifier", "title", "description", "status", "status_type", "priority", "project_id", "team_id", "parent_id", "assignee", "labels", "source", "url", "archived_at", "completed_at", "created_at", "updated_at"], row, [
+    { target: ["external_id"], set: `
       identifier=excluded.identifier, title=excluded.title, description=excluded.description, status=excluded.status,
       status_type=excluded.status_type, priority=excluded.priority, project_id=excluded.project_id, team_id=excluded.team_id,
       parent_id=excluded.parent_id, assignee=excluded.assignee, labels=excluded.labels, url=excluded.url,
-      archived_at=excluded.archived_at, completed_at=excluded.completed_at, updated_at=excluded.updated_at
-    ON CONFLICT(id) DO UPDATE SET
+      archived_at=excluded.archived_at, completed_at=excluded.completed_at, updated_at=excluded.updated_at` },
+    { target: ["id"], set: `
       external_id=excluded.external_id, identifier=excluded.identifier, title=excluded.title, description=excluded.description, status=excluded.status,
       status_type=excluded.status_type, priority=excluded.priority, project_id=excluded.project_id, team_id=excluded.team_id,
       parent_id=excluded.parent_id, assignee=excluded.assignee, labels=excluded.labels, url=excluded.url,
-      archived_at=excluded.archived_at, completed_at=excluded.completed_at, updated_at=excluded.updated_at
-  `, row);
+      archived_at=excluded.archived_at, completed_at=excluded.completed_at, updated_at=excluded.updated_at` },
+  ]);
   return row.id;
 }
 
@@ -1294,18 +1339,16 @@ export async function saveIssueDependency(input: IssueDependencyInput) {
     created_at: input.created_at ?? at,
     updated_at: input.updated_at ?? at,
   };
-  await adapter.run(`
-    INSERT INTO issue_dependencies (id, external_id, issue_id, blocker_issue_id, reason, status, resolved_at, source, created_at, updated_at)
-    VALUES (@id, @external_id, @issue_id, @blocker_issue_id, @reason, @status, @resolved_at, @source, @created_at, @updated_at)
-    ON CONFLICT(external_id) DO UPDATE SET
+  await upsertWithConflicts("issue_dependencies", ["id", "external_id", "issue_id", "blocker_issue_id", "reason", "status", "resolved_at", "source", "created_at", "updated_at"], row, [
+    { target: ["external_id"], set: `
       issue_id=excluded.issue_id, blocker_issue_id=excluded.blocker_issue_id, reason=excluded.reason,
-      status='open', resolved_at=NULL, source=excluded.source, updated_at=excluded.updated_at
-    ON CONFLICT(issue_id, blocker_issue_id) DO UPDATE SET
-      reason=excluded.reason, status='open', resolved_at=NULL, source=excluded.source, updated_at=excluded.updated_at
-    ON CONFLICT(id) DO UPDATE SET
+      status='open', resolved_at=NULL, source=excluded.source, updated_at=excluded.updated_at` },
+    { target: ["issue_id", "blocker_issue_id"], set: `
+      reason=excluded.reason, status='open', resolved_at=NULL, source=excluded.source, updated_at=excluded.updated_at` },
+    { target: ["id"], set: `
       external_id=excluded.external_id, issue_id=excluded.issue_id, blocker_issue_id=excluded.blocker_issue_id,
-      reason=excluded.reason, status='open', resolved_at=NULL, source=excluded.source, updated_at=excluded.updated_at
-  `, row);
+      reason=excluded.reason, status='open', resolved_at=NULL, source=excluded.source, updated_at=excluded.updated_at` },
+  ]);
   return await getIssueDependency(row.id, issueId, blockerIssueId);
 }
 
@@ -2008,7 +2051,7 @@ async function getIssueDependency(id: string, issueId?: string, blockerIssueId?:
     JOIN issues issue ON issue.id = d.issue_id
     JOIN issues blocker ON blocker.id = d.blocker_issue_id
     WHERE d.id = @id
-      OR (@issue_id IS NOT NULL AND @blocker_issue_id IS NOT NULL
+      OR (CAST(@issue_id AS TEXT) IS NOT NULL AND CAST(@blocker_issue_id AS TEXT) IS NOT NULL
         AND d.issue_id = @issue_id AND d.blocker_issue_id = @blocker_issue_id)
     LIMIT 1
   `, { id, issue_id: issueId ?? null, blocker_issue_id: blockerIssueId ?? null }) as Record<string, unknown> | undefined;
@@ -2026,7 +2069,7 @@ async function resolveIssueDependencyRow(input: { dependency_id?: string; issue_
 async function dependencyWouldCycle(issueId: string, blockerIssueId: string) {
   const row = await adapter.get(`
     WITH RECURSIVE blocker_chain(issue_id) AS (
-      SELECT @blocker_issue_id
+      SELECT CAST(@blocker_issue_id AS TEXT)
       UNION
       SELECT dependency.blocker_issue_id
       FROM issue_dependencies dependency

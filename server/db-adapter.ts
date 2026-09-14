@@ -178,6 +178,22 @@ type PostgresReserved = {
   release: () => void;
 };
 
+/**
+ * postgres.js type options that hand back the value shapes bun:sqlite does.
+ *
+ * COUNT(*) and SUM() over integers are bigint in Postgres, and postgres.js
+ * returns bigint and numeric as strings to avoid losing precision -- so an issue
+ * count arrives as "2" rather than 2, and any arithmetic on it concatenates.
+ * Every count and sum in this schema stays far below 2^53, so parsing them as
+ * JS numbers is exact here.
+ */
+export const postgresNumericTypes = {
+  int8: { to: 20, from: [20], serialize: (value: unknown) => String(value), parse: (value: string) => Number(value) },
+  numeric: { to: 1700, from: [1700], serialize: (value: unknown) => String(value), parse: (value: string) => Number(value) },
+};
+
+export type PostgresClient = PostgresSql;
+
 export function createPostgresAdapter(sql: PostgresSql): DbAdapter {
   // Postgres has no ambient current statement the way a SQLite handle does, so
   // an open transaction has to pin one connection: every statement inside it
@@ -208,7 +224,11 @@ export function createPostgresAdapter(sql: PostgresSql): DbAdapter {
 
   async function query(text: string, params: SqlParams) {
     const positional = toPositional(text, params);
-    const rows = await runner().unsafe(positional.text, positional.values);
+    // bun:sqlite binds true/false as 1/0, and the schema stores flags as
+    // INTEGER. postgres.js types a JS boolean as boolean, and Postgres has no
+    // `boolean = integer` operator, so flags are bound the way SQLite binds them.
+    const values = positional.values.map((value) => (typeof value === "boolean" ? Number(value) : value));
+    const rows = await runner().unsafe(positional.text, values);
     return rows as unknown[] & { count?: number };
   }
 

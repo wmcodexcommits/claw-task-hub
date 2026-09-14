@@ -382,4 +382,37 @@ async function overlappingTransactions(adapter) {
   assert(pg.outstanding.size === 0, "a failed rollback must still release the connection");
 }
 
+// --------------------------------------------------------------------------
+// Value shapes: booleans bind the way bun:sqlite binds them
+// --------------------------------------------------------------------------
+
+{
+  // The schema stores flags as INTEGER and bun:sqlite binds true/false as 1/0.
+  // postgres.js would type a JS boolean as boolean, and Postgres has no
+  // `boolean = integer` operator -- verified against a live server -- so the
+  // adapter must hand Postgres the same 1/0 SQLite receives.
+  const bound = [];
+  const sql = {
+    unsafe: (_text, values) => {
+      bound.push(values);
+      const rows = [];
+      rows.count = 0;
+      return Promise.resolve(rows);
+    },
+    reserve: async () => { throw new Error("not used"); },
+    end: async () => undefined,
+  };
+  const adapter = createPostgresAdapter(sql);
+  await adapter.run("UPDATE t SET force = @force WHERE open = @open AND name = @name AND n = @n", {
+    force: true,
+    open: false,
+    name: "x",
+    n: 3,
+  });
+  assert(
+    JSON.stringify(bound[0]) === JSON.stringify([1, 0, "x", 3]),
+    `booleans must bind as 1/0 and other values unchanged, saw ${JSON.stringify(bound[0])}`,
+  );
+}
+
 console.log("Postgres adapter regression passed");
