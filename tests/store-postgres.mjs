@@ -16,11 +16,33 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { createServer } from "node:net";
 import { removeTemporaryDirectory } from "./temp-dir.mjs";
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function waitFor(predicate, message, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error(`timed out: ${message}`);
+    await sleep(20);
+  }
+}
+
+function freePort() {
+  return new Promise((resolve, reject) => {
+    const server = createServer();
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const { port } = server.address();
+      server.close(() => resolve(port));
+    });
+  });
 }
 
 const testUrl = process.env.CLAW_TASK_HUB_PG_TEST_URL?.trim();
@@ -94,6 +116,100 @@ try {
   });
   assert(cli.status === 0, `hub CLI did not exit cleanly on the external connection (status ${cli.status}, signal ${cli.signal}):\n${cli.stderr}`);
   assert(JSON.parse(cli.stdout).active.id === externalId, "hub CLI did not report the selected external connection as active");
+
+  // --- live refresh: triggers, NOTIFY, and the API relay -------------------
+  //
+  // Another hub is simulated by separate processes that share only the
+  // database. Their direct notification to an API server is pointed at a closed
+  // port, so the only route from the writer to the test API's UI stream is
+  // Postgres.
+
+  const schema = await import("../server/db-schema-postgres.ts");
+  const triggerRows = await dbModule.adapter.all(
+    "SELECT c.relname AS table_name FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid WHERE t.tgname = 'claw_task_hub_notify_change' AND NOT t.tgisinternal",
+  );
+  const triggerTables = triggerRows.map((row) => row.table_name).sort();
+  assert(
+    JSON.stringify(triggerTables) === JSON.stringify([...schema.dataChangeTables].sort()),
+    `after three processes activated the connection, each hub table needs exactly one change trigger, saw ${JSON.stringify(triggerTables)}`,
+  );
+
+  const otherHubEnv = { ...process.env, CLAW_TASK_HUB_QUIET_DB: "1", CLAW_TASK_HUB_API_BASE: "http://127.0.0.1:9/api" };
+  const payloads = [];
+  const listener = await dbModule.openExternalListenerClient(registered.id);
+  try {
+    await listener.listen(schema.dataChangeChannel, (payload) => payloads.push(payload));
+
+    // A rolled-back write must announce nothing. The committed write after it
+    // is a fence: notifications arrive in commit order, so by the time the
+    // fence is heard, a notification from the rollback would already be here.
+    let rollbackMessage = "";
+    try {
+      await dbModule.adapter.transaction(async () => {
+        await dbModule.adapter.run(
+          "INSERT INTO sync_checkpoints (source, cursor, updated_at) VALUES (@source, NULL, @updated_at)",
+          { source: "pg-rollback", updated_at: new Date().toISOString() },
+        );
+        throw new Error("rollback on purpose");
+      });
+    } catch (error) {
+      rollbackMessage = error instanceof Error ? error.message : String(error);
+    }
+    assert(rollbackMessage === "rollback on purpose", `the rollback probe failed for another reason: ${rollbackMessage}`);
+    await store.upsertProject({ id: "pg_notify_fence", name: "Notification fence" });
+    await waitFor(() => payloads.includes("projects"), "a committed project write was not announced");
+    assert(!payloads.includes("sync_checkpoints"), `a rolled-back write was announced: ${JSON.stringify(payloads)}`);
+
+    // A real API server relays another process's write to its open UI stream.
+    const apiPort = await freePort();
+    const api = spawn(process.execPath, ["server/index.ts"], {
+      cwd: process.cwd(),
+      env: { ...process.env, PORT: String(apiPort), CLAW_TASK_HUB_QUIET_DB: "1" },
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    });
+    let apiOutput = "";
+    api.stdout.on("data", (chunk) => (apiOutput += chunk));
+    api.stderr.on("data", (chunk) => (apiOutput += chunk));
+    try {
+      await waitFor(() => apiOutput.includes("live refresh listening"), `the API server did not start relaying:\n${apiOutput}`, 30_000);
+
+      const events = await fetch(`http://127.0.0.1:${apiPort}/api/events`);
+      assert(events.ok, `the UI event stream did not open: ${events.status}`);
+      const reader = events.body.getReader();
+      const decoder = new TextDecoder();
+      let stream = "";
+      void (async () => {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) return;
+          stream += decoder.decode(value, { stream: true });
+        }
+      })().catch(() => undefined);
+      const refreshCount = () => stream.split("event: data-refresh").length - 1;
+
+      await waitFor(() => stream.includes("event: connected"), "the UI event stream never connected");
+      // Let any startup refresh drain so the next one is attributable to the write.
+      await sleep(500);
+      const refreshesBefore = refreshCount();
+
+      const writer = spawnSync(
+        process.execPath,
+        ["server/hub-cli.ts", "tools/call", "update_project", JSON.stringify({ id: "pg_notify_fence", summary: "Written by another hub" })],
+        { cwd: process.cwd(), env: otherHubEnv, encoding: "utf8", timeout: 60_000 },
+      );
+      assert(writer.status === 0, `the other hub's write failed (status ${writer.status}):\n${writer.stderr}`);
+      await waitFor(
+        () => refreshCount() > refreshesBefore,
+        `the API server did not relay another process's write to its UI stream:\n${apiOutput}`,
+      );
+      await reader.cancel().catch(() => undefined);
+    } finally {
+      api.kill();
+    }
+  } finally {
+    await listener.end({ timeout: 1 });
+  }
 
   // --- teams and projects: multi-key upserts ------------------------------
 

@@ -5,8 +5,9 @@ import { existsSync } from "node:fs";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
-import { activateDatabase, activeDatabaseLabel, activeExternalConnectionId, createManagedDatabase, databaseIdFromName, dbPath, deleteManagedDatabase, getManagedDatabase, listManagedDatabases } from "./db.js";
+import { activateDatabase, activeDatabaseLabel, activeExternalConnectionId, createManagedDatabase, databaseIdFromName, dbPath, deleteManagedDatabase, getManagedDatabase, listManagedDatabases, onActiveDatabaseChange, openExternalListenerClient } from "./db.js";
 import { deleteExternalConnection, listExternalConnections, registerExternalConnection, testExternalConnection } from "./db-connections.js";
+import { createDataChangeRelay, type DataChangeRelay } from "./data-change-relay.js";
 import { dataSnapshot } from "./data-snapshot.js";
 import {
   dashboard,
@@ -86,9 +87,45 @@ app.use(express.json({ limit: "5mb" }));
 
 const refreshClients = new Set<express.Response>();
 
+// One change often arrives as several signals: this API's own mutation, an MCP
+// process posting to /events/refresh, and the Postgres notification for the same
+// commit. They are coalesced so a UI re-reads once per burst instead of once per
+// signal. The window bounds the added latency and is never extended, so a steady
+// stream of writes cannot postpone a refresh indefinitely.
+const refreshCoalesceMs = 100;
+let pendingRefresh: ReturnType<typeof setTimeout> | null = null;
+
 function broadcastRefresh() {
-  for (const client of refreshClients) client.write("event: data-refresh\ndata: {}\n\n");
+  if (pendingRefresh) return;
+  pendingRefresh = setTimeout(() => {
+    pendingRefresh = null;
+    for (const client of refreshClients) client.write("event: data-refresh\ndata: {}\n\n");
+  }, refreshCoalesceMs);
 }
+
+// Writes made by hubs in other processes or on other machines reach this
+// server's UIs through Postgres notifications (server/data-change-relay.ts).
+// The relay follows whichever external connection is active; a SQLite database
+// has no other writers to hear from, so none runs then.
+let dataChangeRelay: { connectionId: string; relay: DataChangeRelay } | null = null;
+
+function followActiveDatabase() {
+  const connectionId = activeExternalConnectionId();
+  if (dataChangeRelay?.connectionId === connectionId) return;
+  void dataChangeRelay?.relay.stop();
+  dataChangeRelay = null;
+  if (!connectionId) return;
+  dataChangeRelay = {
+    connectionId,
+    relay: createDataChangeRelay({
+      connect: () => openExternalListenerClient(connectionId),
+      onChange: broadcastRefresh,
+    }),
+  };
+}
+
+onActiveDatabaseChange(followActiveDatabase);
+followActiveDatabase();
 
 app.get("/api/events", (req, res) => {
   res.set({
