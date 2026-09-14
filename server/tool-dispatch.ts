@@ -6,6 +6,57 @@ import {
   listManagedDatabases,
 } from "./db.js";
 import { dataSnapshot } from "./data-snapshot.js";
+import { listExecutionAdapters } from "./execution-adapters.js";
+import {
+  getExecutionAttempt,
+  listExecutionAttempts,
+  transitionExecutionAttempt,
+} from "./execution-attempts.js";
+import {
+  decideExecutionConflict,
+  declareExecutionPaths,
+  detectExecutionConflicts,
+  getConflictPolicy,
+  getExecutionConflict,
+  getExecutionPathDeclaration,
+  listExecutionConflicts,
+  saveConflictPolicy,
+} from "./execution-conflicts.js";
+import {
+  acceptExecutionAttempt,
+  getAcceptancePolicy,
+  getExecutionAcceptance,
+  listExecutionAcceptances,
+  rejectExecutionAttempt,
+  saveAcceptancePolicy,
+} from "./execution-acceptance.js";
+import { listExecutionProviders } from "./execution-providers.js";
+import {
+  getReconciliationRun,
+  listReconciliationRuns,
+  quarantineExecutionAttempt,
+  reconcileExecution,
+} from "./execution-reconciliation.js";
+import {
+  captureExecutionDiff,
+  getExecutionEvidence,
+  getVerificationPolicy,
+  listExecutionEvidence,
+  recordExecutionEvidence,
+  saveVerificationPolicy,
+  verifyExecutionAttempt,
+} from "./execution-evidence.js";
+import { launchExecutionAttempt } from "./execution-runs.js";
+import {
+  getExecutionWorkspace,
+  listExecutionWorkspaces,
+  planExecutionWorkspace,
+  provisionExecutionWorkspace,
+  releaseExecutionWorkspace,
+  renewExecutionWorkspace,
+  startExecutionAttempt,
+} from "./execution-workspaces.js";
+import { listRunnableIssues } from "./issue-runnability.js";
 import { notifyOpenUis } from "./refresh-notifier.js";
 import {
   claimIssue,
@@ -78,6 +129,7 @@ export const hubToolNames = [
   "claim_issue",
   "release_issue_claim",
   "list_issue_claims",
+  "list_runnable_issues",
   "repair_issue_invariants",
   "save_context_binding",
   "upsert_context_binding",
@@ -85,6 +137,44 @@ export const hubToolNames = [
   "list_context_bindings",
   "resolve_context_project",
   "delete_context_binding",
+  "create_execution_attempt",
+  "get_execution_attempt",
+  "list_execution_attempts",
+  "transition_execution_attempt",
+  "plan_execution_workspace",
+  "provision_execution_workspace",
+  "get_execution_workspace",
+  "list_execution_workspaces",
+  "renew_execution_workspace",
+  "release_execution_workspace",
+  "list_execution_adapters",
+  "launch_execution_attempt",
+  "save_verification_policy",
+  "get_verification_policy",
+  "capture_execution_diff",
+  "record_execution_evidence",
+  "list_execution_evidence",
+  "get_execution_evidence",
+  "verify_execution_attempt",
+  "declare_execution_paths",
+  "get_execution_path_declaration",
+  "save_conflict_policy",
+  "get_conflict_policy",
+  "detect_execution_conflicts",
+  "list_execution_conflicts",
+  "get_execution_conflict",
+  "decide_execution_conflict",
+  "list_execution_providers",
+  "save_acceptance_policy",
+  "get_acceptance_policy",
+  "accept_execution_attempt",
+  "reject_execution_attempt",
+  "list_execution_acceptances",
+  "get_execution_acceptance",
+  "reconcile_execution",
+  "list_reconciliation_runs",
+  "get_reconciliation_run",
+  "quarantine_execution_attempt",
 ] as const;
 
 export type HubToolName = (typeof hubToolNames)[number];
@@ -97,6 +187,13 @@ const hubWriteTools = new Set<HubToolName>([
   "save_issue_dependency", "resolve_issue_dependency",
   "start_agent_session", "heartbeat_agent_session", "end_agent_session", "claim_issue", "release_issue_claim", "repair_issue_invariants",
   "save_context_binding", "upsert_context_binding", "delete_context_binding",
+  "create_execution_attempt", "transition_execution_attempt",
+  "provision_execution_workspace", "renew_execution_workspace", "release_execution_workspace",
+  "launch_execution_attempt",
+  "save_verification_policy", "capture_execution_diff", "record_execution_evidence", "verify_execution_attempt",
+  "declare_execution_paths", "save_conflict_policy", "detect_execution_conflicts", "decide_execution_conflict",
+  "save_acceptance_policy", "accept_execution_attempt", "reject_execution_attempt",
+  "reconcile_execution", "quarantine_execution_attempt",
 ]);
 
 function requiredString(input: Record<string, unknown>, key: string, tool: string) {
@@ -195,6 +292,7 @@ async function dispatchHubTool(name: HubToolName, args: Record<string, unknown>)
   if (name === "claim_issue") return await claimIssue(args as { issue_id: string; session_id: string });
   if (name === "release_issue_claim") return await releaseIssueClaim(args as Parameters<typeof releaseIssueClaim>[0]);
   if (name === "list_issue_claims") return { claims: await listIssueClaims(args) };
+  if (name === "list_runnable_issues") return await listRunnableIssues(args);
   if (name === "repair_issue_invariants") return await repairIssueInvariants();
 
   if (name === "save_context_binding" || name === "upsert_context_binding") {
@@ -208,5 +306,67 @@ async function dispatchHubTool(name: HubToolName, args: Record<string, unknown>)
   if (name === "list_context_bindings") return { bindings: await listContextBindings(args) };
   if (name === "resolve_context_project") return await resolveContextProject(args);
   if (name === "delete_context_binding") return await deleteContextBinding(args as { id?: string; context_key?: string });
+
+  if (name === "create_execution_attempt") return await startExecutionAttempt(args);
+  if (name === "get_execution_attempt") {
+    const locator = typeof args.id === "string" && args.id ? args.id : args.attempt_id;
+    if (typeof locator !== "string" || !locator) throw new Error("get_execution_attempt requires id");
+    return { attempt: await getExecutionAttempt(locator) };
+  }
+  if (name === "list_execution_attempts") return { attempts: await listExecutionAttempts(args) };
+  if (name === "transition_execution_attempt") return await transitionExecutionAttempt(args);
+
+  if (name === "plan_execution_workspace") return { plan: await planExecutionWorkspace(args) };
+  if (name === "provision_execution_workspace") return await provisionExecutionWorkspace(args);
+  if (name === "get_execution_workspace") return { workspace: await getExecutionWorkspace(requiredString(args, "id", name)) };
+  if (name === "list_execution_workspaces") return { workspaces: await listExecutionWorkspaces(args) };
+  if (name === "renew_execution_workspace") return { workspace: await renewExecutionWorkspace(args) };
+  if (name === "release_execution_workspace") return await releaseExecutionWorkspace(args);
+
+  if (name === "list_execution_adapters") return { adapters: listExecutionAdapters() };
+  if (name === "launch_execution_attempt") return await launchAndReport(args);
+
+  if (name === "save_verification_policy") return await saveVerificationPolicy(args);
+  if (name === "get_verification_policy") return await getVerificationPolicy(args);
+  if (name === "capture_execution_diff") return await captureExecutionDiff(args);
+  if (name === "record_execution_evidence") return await recordExecutionEvidence(args);
+  if (name === "list_execution_evidence") return { evidence: await listExecutionEvidence(args) };
+  if (name === "get_execution_evidence") return { evidence: await getExecutionEvidence(requiredString(args, "id", name)) };
+  if (name === "verify_execution_attempt") return await verifyExecutionAttempt(args);
+
+  if (name === "declare_execution_paths") return await declareExecutionPaths(args);
+  if (name === "get_execution_path_declaration") return await getExecutionPathDeclaration(args);
+  if (name === "save_conflict_policy") return await saveConflictPolicy(args);
+  if (name === "get_conflict_policy") return await getConflictPolicy(args);
+  if (name === "detect_execution_conflicts") return await detectExecutionConflicts(args);
+  if (name === "list_execution_conflicts") return { conflicts: await listExecutionConflicts(args) };
+  if (name === "get_execution_conflict") return { conflict: await getExecutionConflict(requiredString(args, "id", name)) };
+  if (name === "decide_execution_conflict") return await decideExecutionConflict(args);
+
+  if (name === "list_execution_providers") return { providers: listExecutionProviders() };
+  if (name === "save_acceptance_policy") return await saveAcceptancePolicy(args);
+  if (name === "get_acceptance_policy") return await getAcceptancePolicy(args);
+  if (name === "accept_execution_attempt") return await acceptExecutionAttempt(args);
+  if (name === "reject_execution_attempt") return await rejectExecutionAttempt(args);
+  if (name === "list_execution_acceptances") return { acceptances: await listExecutionAcceptances(args) };
+  if (name === "get_execution_acceptance") return { acceptance: await getExecutionAcceptance(requiredString(args, "id", name)) };
+
+  if (name === "reconcile_execution") return await reconcileExecution({ ...args, trigger: "manual" });
+  if (name === "list_reconciliation_runs") return { runs: await listReconciliationRuns(args) };
+  if (name === "get_reconciliation_run") return { run: await getReconciliationRun(requiredString(args, "id", name)) };
+  if (name === "quarantine_execution_attempt") return await quarantineExecutionAttempt(args);
   throw new Error(`Unknown tool: ${name}`);
+}
+
+// A launched run keeps supervising its harness after the call returns unless the
+// caller waits for it. The process that launched it keeps the harness's pipes
+// open, so even a one-shot CLI call stays alive until the run finishes and
+// records its outcome.
+export async function launchAndReport(args: Record<string, unknown>) {
+  const { completion, ...started } = await launchExecutionAttempt(args);
+  if (args.wait === true) return { ...started, outcome: await completion };
+  void completion.catch((error: unknown) => {
+    process.stderr.write(`claw-task-hub: execution run for ${started.attempt.id} did not finish cleanly: ${error instanceof Error ? error.message : String(error)}\n`);
+  });
+  return started;
 }
