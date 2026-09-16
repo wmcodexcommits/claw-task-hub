@@ -4,6 +4,12 @@ import { createHash } from "node:crypto";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { removePathWithRetries, waitSync } from "./filesystem.js";
+import { clearStatementCache, prepareCached } from "./statement-cache.js";
+import { createPostgresAdapter, createSqliteAdapter, postgresNumericTypes, type DbAdapter, type PostgresClient } from "./db-adapter.js";
+import { resolveExternalConnection, type ExternalConnectionSummary } from "./db-connections.js";
+import { postgresChangeNotificationSql, postgresSchemaSql } from "./db-schema-postgres.js";
+import { executionAttemptsSchemaSql } from "./execution-attempts-schema.js";
+import type { ListenerClient } from "./data-change-relay.js";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const dataDir = join(root, "data");
@@ -654,6 +660,7 @@ CREATE INDEX IF NOT EXISTS idx_context_bindings_lookup ON context_bindings(harne
 CREATE INDEX IF NOT EXISTS idx_project_updates_project_created ON project_updates(project_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_issue_dependencies_issue_status ON issue_dependencies(issue_id, status);
 CREATE INDEX IF NOT EXISTS idx_issue_dependencies_blocker_status ON issue_dependencies(blocker_issue_id, status);
+${executionAttemptsSchemaSql}
 `);
 }
 
@@ -756,6 +763,13 @@ const migrations: {
       if (!columns.some((column) => column.name === "source")) {
         database.exec("ALTER TABLE issue_dependencies ADD COLUMN source TEXT NOT NULL DEFAULT 'local'");
       }
+    },
+  },
+  {
+    id: "0007_execution_attempts",
+    description: "Add durable execution attempts, their transition ledger, and workspace leases",
+    up: (database) => {
+      database.exec(executionAttemptsSchemaSql);
     },
   },
 ];

@@ -38,6 +38,61 @@ import {
   upsertIssue,
   upsertProject,
 } from "./store.js";
+import { ExecutionAttemptError, getExecutionAttempt, listExecutionAttempts, transitionExecutionAttempt } from "./execution-attempts.js";
+import {
+  decideExecutionConflict,
+  declareExecutionPaths,
+  detectExecutionConflicts,
+  ExecutionConflictError,
+  getConflictPolicy,
+  getExecutionConflict,
+  getExecutionPathDeclaration,
+  listExecutionConflicts,
+  saveConflictPolicy,
+} from "./execution-conflicts.js";
+import {
+  acceptExecutionAttempt,
+  ExecutionAcceptanceError,
+  getAcceptancePolicy,
+  getExecutionAcceptance,
+  listExecutionAcceptances,
+  rejectExecutionAttempt,
+  saveAcceptancePolicy,
+} from "./execution-acceptance.js";
+import { listExecutionProviders } from "./execution-providers.js";
+import {
+  ExecutionReconciliationError,
+  getReconciliationRun,
+  listReconciliationRuns,
+  quarantineExecutionAttempt,
+  reconcileExecution,
+  startReconciliationLoop,
+} from "./execution-reconciliation.js";
+import { ExecutionContractError } from "./execution-contract.js";
+import {
+  captureExecutionDiff,
+  ExecutionEvidenceError,
+  getExecutionEvidence,
+  getVerificationPolicy,
+  listExecutionEvidence,
+  recordExecutionEvidence,
+  saveVerificationPolicy,
+  verifyExecutionAttempt,
+} from "./execution-evidence.js";
+import {
+  ExecutionWorkspaceError,
+  getExecutionWorkspace,
+  listExecutionWorkspaces,
+  planExecutionWorkspace,
+  provisionExecutionWorkspace,
+  releaseExecutionWorkspace,
+  renewExecutionWorkspace,
+  startExecutionAttempt,
+} from "./execution-workspaces.js";
+import { listExecutionAdapters } from "./execution-adapters.js";
+import { IssueRunnabilityError, listRunnableIssues } from "./issue-runnability.js";
+import { ExecutionRunError } from "./execution-runs.js";
+import { launchAndReport } from "./tool-dispatch.js";
 import { APP_VERSION } from "./version.js";
 
 await ensureDefaultTeam();
@@ -494,7 +549,8 @@ app.delete("/api/issues/:id", async (req, res) => {
     res.json(await deleteIssue({ id: req.params.id, ...schema.parse(req.body) }));
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    res.status(message.startsWith("Issue not found:") ? 404 : message.includes("active claim") ? 409 : 400).json({ error: message });
+    const guarded = message.includes("active claim") || message.includes("live execution attempt");
+    res.status(message.startsWith("Issue not found:") ? 404 : guarded ? 409 : 400).json({ error: message });
   }
 });
 
@@ -537,6 +593,420 @@ app.post("/api/issue-dependencies/:id/resolve", async (req, res) => {
   }
 });
 
+// Execution attempts and workspaces. Typed failures carry their code and details
+// in the body, so HTTP callers branch on the same codes CLI and MCP callers read
+// from the message.
+const executionNotFoundCodes = new Set([
+  "issue_not_found",
+  "attempt_not_found",
+  "lease_not_found",
+  "policy_not_found",
+  "evidence_not_found",
+  "project_not_found",
+  "team_not_found",
+  "conflict_not_found",
+  "acceptance_not_found",
+  "run_not_found",
+]);
+const executionConflictCodes = new Set([
+  "live_attempt_exists",
+  "idempotency_conflict",
+  "resource_conflict",
+  "revision_conflict",
+  "terminal_state",
+  "attempt_not_provisioning",
+  "attempt_terminal",
+  "branch_exists",
+  "worktree_path_exists",
+  "lease_conflict",
+  "lease_expired",
+  "lease_not_active",
+  "base_drift",
+  "workspace_inconsistent",
+  "attempt_not_launchable",
+  "attempt_not_verifying",
+  "workspace_not_ready",
+  "policy_conflict",
+  "conflict_blocked",
+  "invalid_decision",
+  "attempt_not_reviewable",
+  "acceptance_in_progress",
+  "verification_missing",
+  "verification_stale",
+  "nothing_to_commit",
+  "merge_target_missing",
+  "merge_target_checked_out",
+  "merge_target_moved",
+  "reconciliation_in_progress",
+]);
+
+function executionFailureStatus(code: string) {
+  if (executionNotFoundCodes.has(code) || code === "adapter_unknown") return 404;
+  if (code === "unauthorized_actor") return 403;
+  if (executionConflictCodes.has(code)) return 409;
+  if (code === "adapter_unavailable" || code === "provider_unavailable") return 503;
+  if (code === "push_rejected" || code === "provider_failed") return 502;
+  if (code === "git_failed" || code === "launch_failed") return 500;
+  return 400;
+}
+
+function sendExecutionFailure(res: express.Response, error: unknown) {
+  if (
+    error instanceof ExecutionAttemptError
+    || error instanceof ExecutionContractError
+    || error instanceof ExecutionWorkspaceError
+    || error instanceof ExecutionRunError
+    || error instanceof ExecutionEvidenceError
+    || error instanceof IssueRunnabilityError
+    || error instanceof ExecutionConflictError
+    || error instanceof ExecutionAcceptanceError
+    || error instanceof ExecutionReconciliationError
+  ) {
+    res.status(executionFailureStatus(error.code)).json({ error: error.message, code: error.code, details: error.details });
+    return;
+  }
+  res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+}
+
+app.get("/api/execution-providers", (_req, res) => {
+  res.json({ providers: listExecutionProviders() });
+});
+
+app.get("/api/acceptance-policies", async (req, res) => {
+  try {
+    res.json(await getAcceptancePolicy(req.query));
+  } catch (error) {
+    sendExecutionFailure(res, error);
+  }
+});
+
+app.post("/api/acceptance-policies", async (req, res) => {
+  try {
+    res.status(201).json(await saveAcceptancePolicy(req.body ?? {}));
+  } catch (error) {
+    sendExecutionFailure(res, error);
+  }
+});
+
+app.post("/api/execution-attempts/:id/accept", async (req, res) => {
+  try {
+    res.json(await acceptExecutionAttempt({ ...(req.body ?? {}), attempt_id: req.params.id }));
+  } catch (error) {
+    sendExecutionFailure(res, error);
+  }
+});
+
+app.post("/api/execution-attempts/:id/reject", async (req, res) => {
+  try {
+    res.json(await rejectExecutionAttempt({ ...(req.body ?? {}), attempt_id: req.params.id }));
+  } catch (error) {
+    sendExecutionFailure(res, error);
+  }
+});
+
+app.get("/api/execution-attempts/:id/acceptances", async (req, res) => {
+  try {
+    res.json({ acceptances: await listExecutionAcceptances({ attempt_id: req.params.id }) });
+  } catch (error) {
+    sendExecutionFailure(res, error);
+  }
+});
+
+app.get("/api/execution-acceptances/:id", async (req, res) => {
+  try {
+    const found = await getExecutionAcceptance(req.params.id);
+    if (!found) {
+      res.status(404).json({ error: `acceptance_not_found: Acceptance not found: ${req.params.id}`, code: "acceptance_not_found", details: { acceptance_id: req.params.id } });
+      return;
+    }
+    res.json({ acceptance: found });
+  } catch (error) {
+    sendExecutionFailure(res, error);
+  }
+});
+
+app.post("/api/execution-reconciliation", async (req, res) => {
+  try {
+    res.json({ run: await reconcileExecution({ ...(req.body ?? {}), trigger: "manual" }) });
+  } catch (error) {
+    sendExecutionFailure(res, error);
+  }
+});
+
+app.get("/api/execution-reconciliation/runs", async (req, res) => {
+  try {
+    res.json({ runs: await listReconciliationRuns(req.query) });
+  } catch (error) {
+    sendExecutionFailure(res, error);
+  }
+});
+
+app.get("/api/execution-reconciliation/runs/:id", async (req, res) => {
+  try {
+    res.json({ run: await getReconciliationRun(req.params.id) });
+  } catch (error) {
+    sendExecutionFailure(res, error);
+  }
+});
+
+app.post("/api/execution-attempts/:id/quarantine", async (req, res) => {
+  try {
+    res.json(await quarantineExecutionAttempt({ ...(req.body ?? {}), attempt_id: req.params.id }));
+  } catch (error) {
+    sendExecutionFailure(res, error);
+  }
+});
+
+app.get("/api/runnable-issues", async (req, res) => {
+  try {
+    res.json(await listRunnableIssues(req.query));
+  } catch (error) {
+    sendExecutionFailure(res, error);
+  }
+});
+
+app.get("/api/issues/:id/execution-paths", async (req, res) => {
+  try {
+    res.json(await getExecutionPathDeclaration({ ...req.query, issue_id: req.params.id }));
+  } catch (error) {
+    sendExecutionFailure(res, error);
+  }
+});
+
+app.post("/api/issues/:id/execution-paths", async (req, res) => {
+  try {
+    res.status(201).json(await declareExecutionPaths({ ...(req.body ?? {}), issue_id: req.params.id }));
+  } catch (error) {
+    sendExecutionFailure(res, error);
+  }
+});
+
+app.get("/api/conflict-policies", async (req, res) => {
+  try {
+    res.json(await getConflictPolicy(req.query));
+  } catch (error) {
+    sendExecutionFailure(res, error);
+  }
+});
+
+app.post("/api/conflict-policies", async (req, res) => {
+  try {
+    res.status(201).json(await saveConflictPolicy(req.body ?? {}));
+  } catch (error) {
+    sendExecutionFailure(res, error);
+  }
+});
+
+app.post("/api/execution-conflicts/detect", async (req, res) => {
+  try {
+    res.json(await detectExecutionConflicts(req.body ?? {}));
+  } catch (error) {
+    sendExecutionFailure(res, error);
+  }
+});
+
+app.get("/api/execution-conflicts", async (req, res) => {
+  try {
+    res.json({ conflicts: await listExecutionConflicts(req.query) });
+  } catch (error) {
+    sendExecutionFailure(res, error);
+  }
+});
+
+app.get("/api/execution-conflicts/:id", async (req, res) => {
+  try {
+    const conflict = await getExecutionConflict(req.params.id);
+    if (!conflict) {
+      res.status(404).json({ error: `conflict_not_found: Execution conflict not found: ${req.params.id}`, code: "conflict_not_found", details: { conflict_id: req.params.id } });
+      return;
+    }
+    res.json({ conflict });
+  } catch (error) {
+    sendExecutionFailure(res, error);
+  }
+});
+
+app.post("/api/execution-conflicts/:id/decisions", async (req, res) => {
+  try {
+    res.status(201).json(await decideExecutionConflict({ ...(req.body ?? {}), conflict_id: req.params.id }));
+  } catch (error) {
+    sendExecutionFailure(res, error);
+  }
+});
+
+app.get("/api/execution-adapters", (_req, res) => {
+  res.json({ adapters: listExecutionAdapters() });
+});
+
+app.post("/api/execution-attempts/:id/launch", async (req, res) => {
+  try {
+    res.json(await launchAndReport({ ...(req.body ?? {}), attempt_id: req.params.id }));
+  } catch (error) {
+    sendExecutionFailure(res, error);
+  }
+});
+
+app.get("/api/execution-attempts", async (req, res) => {
+  try {
+    res.json({ attempts: await listExecutionAttempts(req.query) });
+  } catch (error) {
+    sendExecutionFailure(res, error);
+  }
+});
+
+app.get("/api/execution-attempts/:id", async (req, res) => {
+  try {
+    const attempt = await getExecutionAttempt(req.params.id);
+    if (!attempt) {
+      res.status(404).json({ error: `attempt_not_found: Execution attempt not found: ${req.params.id}`, code: "attempt_not_found", details: { attempt_id: req.params.id } });
+      return;
+    }
+    res.json({ attempt });
+  } catch (error) {
+    sendExecutionFailure(res, error);
+  }
+});
+
+app.post("/api/execution-attempts/:id/transitions", async (req, res) => {
+  try {
+    res.json(await transitionExecutionAttempt({ ...(req.body ?? {}), attempt_id: req.params.id }));
+  } catch (error) {
+    sendExecutionFailure(res, error);
+  }
+});
+
+app.get("/api/issues/:id/execution-attempts", async (req, res) => {
+  try {
+    res.json({ attempts: await listExecutionAttempts({ ...req.query, issue_id: req.params.id }) });
+  } catch (error) {
+    sendExecutionFailure(res, error);
+  }
+});
+
+app.post("/api/issues/:id/execution-attempts", async (req, res) => {
+  try {
+    const result = await startExecutionAttempt({ ...(req.body ?? {}), issue_id: req.params.id });
+    res.status(result.created ? 201 : 200).json(result);
+  } catch (error) {
+    sendExecutionFailure(res, error);
+  }
+});
+
+app.post("/api/execution-attempts/:id/workspace/plan", async (req, res) => {
+  try {
+    res.json({ plan: await planExecutionWorkspace({ ...(req.body ?? {}), attempt_id: req.params.id }) });
+  } catch (error) {
+    sendExecutionFailure(res, error);
+  }
+});
+
+app.post("/api/execution-attempts/:id/workspace", async (req, res) => {
+  try {
+    const result = await provisionExecutionWorkspace({ ...(req.body ?? {}), attempt_id: req.params.id });
+    res.status(result.created ? 201 : 200).json(result);
+  } catch (error) {
+    sendExecutionFailure(res, error);
+  }
+});
+
+app.get("/api/execution-workspaces", async (req, res) => {
+  try {
+    res.json({ workspaces: await listExecutionWorkspaces(req.query) });
+  } catch (error) {
+    sendExecutionFailure(res, error);
+  }
+});
+
+app.get("/api/execution-workspaces/:id", async (req, res) => {
+  try {
+    const workspace = await getExecutionWorkspace(req.params.id);
+    if (!workspace) {
+      res.status(404).json({ error: `lease_not_found: Workspace lease not found: ${req.params.id}`, code: "lease_not_found", details: { lease_id: req.params.id } });
+      return;
+    }
+    res.json({ workspace });
+  } catch (error) {
+    sendExecutionFailure(res, error);
+  }
+});
+
+app.post("/api/execution-workspaces/:id/renew", async (req, res) => {
+  try {
+    res.json({ workspace: await renewExecutionWorkspace({ ...(req.body ?? {}), id: req.params.id }) });
+  } catch (error) {
+    sendExecutionFailure(res, error);
+  }
+});
+
+app.post("/api/execution-workspaces/:id/release", async (req, res) => {
+  try {
+    res.json(await releaseExecutionWorkspace({ ...(req.body ?? {}), id: req.params.id }));
+  } catch (error) {
+    sendExecutionFailure(res, error);
+  }
+});
+
+app.get("/api/verification-policies", async (req, res) => {
+  try {
+    res.json(await getVerificationPolicy(req.query));
+  } catch (error) {
+    sendExecutionFailure(res, error);
+  }
+});
+
+app.post("/api/verification-policies", async (req, res) => {
+  try {
+    res.status(201).json(await saveVerificationPolicy(req.body ?? {}));
+  } catch (error) {
+    sendExecutionFailure(res, error);
+  }
+});
+
+app.post("/api/execution-attempts/:id/diff", async (req, res) => {
+  try {
+    res.status(201).json(await captureExecutionDiff({ ...(req.body ?? {}), attempt_id: req.params.id }));
+  } catch (error) {
+    sendExecutionFailure(res, error);
+  }
+});
+
+app.get("/api/execution-attempts/:id/evidence", async (req, res) => {
+  try {
+    res.json({ evidence: await listExecutionEvidence({ ...req.query, attempt_id: req.params.id }) });
+  } catch (error) {
+    sendExecutionFailure(res, error);
+  }
+});
+
+app.post("/api/execution-attempts/:id/evidence", async (req, res) => {
+  try {
+    res.status(201).json(await recordExecutionEvidence({ ...(req.body ?? {}), attempt_id: req.params.id }));
+  } catch (error) {
+    sendExecutionFailure(res, error);
+  }
+});
+
+app.post("/api/execution-attempts/:id/verify", async (req, res) => {
+  try {
+    res.json(await verifyExecutionAttempt({ ...(req.body ?? {}), attempt_id: req.params.id }));
+  } catch (error) {
+    sendExecutionFailure(res, error);
+  }
+});
+
+app.get("/api/execution-evidence/:id", async (req, res) => {
+  try {
+    const evidence = await getExecutionEvidence(req.params.id);
+    if (!evidence) {
+      res.status(404).json({ error: `evidence_not_found: Execution evidence not found: ${req.params.id}`, code: "evidence_not_found", details: { evidence_id: req.params.id } });
+      return;
+    }
+    res.json({ evidence });
+  } catch (error) {
+    sendExecutionFailure(res, error);
+  }
+});
+
 if (process.env.CLAW_TASK_HUB_SERVE_UI === "1") {
   const distDirectory = fileURLToPath(new URL("../dist/", import.meta.url));
   const indexFile = fileURLToPath(new URL("../dist/index.html", import.meta.url));
@@ -551,6 +1021,9 @@ if (process.env.CLAW_TASK_HUB_SERVE_UI === "1") {
 const server = app.listen(port, host, () => {
   if (!server.listening) return;
   console.log(`Claw Task Hub API listening on http://${host}:${port}`);
+  // Startup and periodic reconciliation only once the server really listens, so
+  // a hub that lost its port does not repair anything.
+  startReconciliationLoop((message) => console.log(`claw-task-hub: ${message}`));
 });
 
 

@@ -1824,6 +1824,8 @@ function ProjectOverview({ detail, onTab }: { detail: ProjectDetail; onTab: (tab
         <span className="prop-item"><Box size={14} /> {projectSourceLabel(project.source)}</span>
       </div>
 
+      <RunnableQueuePanel projectId={project.id} />
+
       <div className="resources-row">
         <span className="prop-label">Resources</span>
         <div className="resource-list">
@@ -2288,7 +2290,7 @@ function IssueDetail({
       <h2>{issue.title}</h2>
       <div className="detail-pills"><PriorityPill priority={issue.priority} /><span>{issue.project_name}</span><span>{issue.team_name}</span></div>
       <p>{issue.description || "No description yet."}</p>
-      <AgentStatePanel issue={issue} />
+      <AgentStatePanel issue={issue} /><ExecutionPanel issue={issue} />
       <IssueWorkflowControls issue={issue} onAddDependency={onAddDependency} onResolveDependency={onResolveDependency} onStatusChange={onStatusChange} />
       <div className="comments-box">
         <strong>Activity</strong>
@@ -2315,7 +2317,7 @@ function IssueDialog({
         <h2 id="issue-dialog-title">{issue.title}</h2>
         <div className="detail-pills"><PriorityPill priority={issue.priority} /><span>{issue.project_name}</span><span>{issue.team_name}</span></div>
         <p>{issue.description || "No description yet."}</p>
-        <AgentStatePanel issue={issue} />
+        <AgentStatePanel issue={issue} /><ExecutionPanel issue={issue} />
         <IssueWorkflowControls issue={issue} onAddDependency={onAddDependency} onResolveDependency={onResolveDependency} onStatusChange={onStatusChange} />
         <div className="comments-box">
           <strong>Activity</strong>
@@ -2501,6 +2503,318 @@ function decodeUrlSegment(value: string) {
   } catch {
     return value;
   }
+}
+
+type ExecutionAttemptView = {
+  id: string;
+  state: string;
+  revision: number;
+  state_reason: string | null;
+  harness: string;
+  repository: string;
+  base_sha: string;
+  workspace: { branch: string | null; worktree_path: string | null; lease_id: string | null };
+};
+type ExecutionLeaseView = { id: string; status: string; branch: string; repository_path: string; expired: boolean };
+type ExecutionVerdictView = { id: string; status: string; payload: { reason?: string | null } };
+type ExecutionConflictView = { id: string; path: string; method: string; severity: string; blocking: boolean };
+type ExecutionAcceptanceView = { id: string; status: string; step: string; outcome: { code: string; message: string | null } | null };
+type ExecutionAdapterView = { id: string; available: boolean };
+type RunnableIssueSummary = { id: string; identifier: string | null; title: string };
+type RunnableListingView = {
+  runnable_total: number;
+  excluded_total: number;
+  runnable: { issue: RunnableIssueSummary }[];
+  excluded: { issue: RunnableIssueSummary; reasons: { code: string }[] }[];
+};
+type ExecutionSnapshot = {
+  attempts: ExecutionAttemptView[];
+  lease: ExecutionLeaseView | null;
+  verdict: ExecutionVerdictView | null;
+  conflicts: ExecutionConflictView[];
+  acceptance: ExecutionAcceptanceView | null;
+  adapters: ExecutionAdapterView[];
+  runnability: RunnableListingView | null;
+};
+
+const executionStateLabels: Record<string, string> = {
+  provisioning: "Provisioning",
+  running: "Running",
+  verifying: "Verifying",
+  reviewable: "Reviewable",
+  accepted: "Accepted",
+  failed: "Failed",
+  canceled: "Canceled",
+  stale: "Stale",
+  reconciling: "Reconciling",
+};
+const uiOperator = { actor_kind: "operator", actor_id: "ui-operator" };
+
+// The API answers failures with JSON whose error leads with a typed code; show
+// that sentence rather than the raw body.
+function executionErrorText(reason: unknown) {
+  const text = reason instanceof Error ? reason.message : String(reason);
+  try {
+    const parsed = JSON.parse(text) as { error?: unknown };
+    return typeof parsed.error === "string" ? parsed.error : text;
+  } catch {
+    return text;
+  }
+}
+
+async function loadExecutionSnapshot(issueId: string): Promise<ExecutionSnapshot> {
+  const issuePath = encodeURIComponent(issueId);
+  const [attemptList, adapterList, runnability] = await Promise.all([
+    api<{ attempts: ExecutionAttemptView[] }>(`/issues/${issuePath}/execution-attempts`),
+    api<{ adapters: ExecutionAdapterView[] }>("/execution-adapters").catch(() => ({ adapters: [] as ExecutionAdapterView[] })),
+    api<RunnableListingView>(`/runnable-issues?issue_id=${issuePath}&limit=1&excluded_limit=1`).catch(() => null),
+  ]);
+  const latest = attemptList.attempts[0];
+  if (!latest) return { attempts: [], lease: null, verdict: null, conflicts: [], acceptance: null, adapters: adapterList.adapters, runnability };
+  const attemptPath = encodeURIComponent(latest.id);
+  const [verdicts, conflicts, workspaces, acceptances] = await Promise.all([
+    api<{ evidence: ExecutionVerdictView[] }>(`/execution-attempts/${attemptPath}/evidence?kind=verdict`),
+    api<{ conflicts: ExecutionConflictView[] }>(`/execution-conflicts?attempt_id=${attemptPath}`),
+    api<{ workspaces: ExecutionLeaseView[] }>(`/execution-workspaces?attempt_id=${attemptPath}&include_released=true`),
+    api<{ acceptances: ExecutionAcceptanceView[] }>(`/execution-attempts/${attemptPath}/acceptances`),
+  ]);
+  return {
+    attempts: attemptList.attempts,
+    lease: workspaces.workspaces[0] ?? null,
+    verdict: verdicts.evidence.at(-1) ?? null,
+    conflicts: conflicts.conflicts,
+    acceptance: acceptances.acceptances.at(-1) ?? null,
+    adapters: adapterList.adapters,
+    runnability,
+  };
+}
+
+// Execution control for one issue. Every control calls the same HTTP handlers
+// the CLI and MCP tools use, so the panel can do nothing the domain rules would
+// refuse elsewhere; a refusal is shown with its typed code.
+function ExecutionPanel({ issue }: { issue: Issue }) {
+  const [snapshot, setSnapshot] = useState<ExecutionSnapshot | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
+  // Kept apart: a refresh after an action must not erase that action's refusal.
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    loadExecutionSnapshot(issue.id)
+      .then((next) => {
+        if (cancelled) return;
+        setSnapshot(next);
+        setLoadError(null);
+      })
+      .catch((reason: unknown) => {
+        if (!cancelled) setLoadError(executionErrorText(reason));
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [issue, reloadKey]);
+
+  const latest = snapshot?.attempts[0] ?? null;
+  const post = <T,>(path: string, body: Record<string, unknown>) => api<T>(path, { method: "POST", body: JSON.stringify(body) });
+  const act = async (label: string, run: () => Promise<string>) => {
+    setBusy(label);
+    setError(null);
+    setMessage(null);
+    try {
+      setMessage(await run());
+    } catch (reason) {
+      setError(executionErrorText(reason));
+    } finally {
+      setBusy(null);
+      setReloadKey((key) => key + 1);
+    }
+  };
+
+  if (!snapshot) {
+    return (
+      <section className="execution-panel" aria-label="Execution control" aria-busy={loading}>
+        <div className="execution-head"><strong>Execution</strong></div>
+        {loadError ? <p role="alert" className="execution-error">{loadError}</p> : <p role="status">Loading execution state…</p>}
+      </section>
+    );
+  }
+
+  const excluded = snapshot.runnability?.excluded[0];
+  const runnable = Boolean(snapshot.runnability?.runnable.length);
+  const claimId = issue.active_claims?.[0]?.id ?? null;
+  const adapters = snapshot.adapters.filter((adapter) => adapter.available);
+  const blocking = snapshot.conflicts.filter((conflict) => conflict.blocking).length;
+  const attemptPath = latest ? encodeURIComponent(latest.id) : "";
+  const transition = (event: string, reason: string | null) => {
+    if (!latest) return Promise.resolve();
+    return post(`/execution-attempts/${attemptPath}/transitions`, { event, reason, expected_revision: latest.revision, idempotency_key: `ui-${event}-${latest.id}-${latest.revision}`, ...uiOperator });
+  };
+  const launch = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!latest) return;
+    const form = new FormData(event.currentTarget);
+    void act("launch", async () => {
+      await post(`/execution-attempts/${attemptPath}/launch`, { adapter: String(form.get("adapter") ?? ""), prompt: String(form.get("prompt") ?? ""), idempotency_key: `ui-launch-${latest.id}` });
+      return "Harness launched.";
+    });
+  };
+
+  return (
+    <section className="execution-panel" aria-label="Execution control" aria-busy={loading || Boolean(busy)}>
+      <div className="execution-head">
+        <strong>Execution</strong>
+        <button type="button" aria-label="Refresh execution state" onClick={() => setReloadKey((key) => key + 1)} disabled={Boolean(busy)}><RefreshCw size={14} /></button>
+      </div>
+      {snapshot.runnability ? <p>{runnable ? "Runnable now." : `Not runnable: ${excluded?.reasons.map((reason) => reason.code).join(", ") || "closed"}.`}</p> : null}
+      {latest ? (
+        <div className="execution-attempt" data-state={latest.state}>
+          <span className="execution-state">{executionStateLabels[latest.state] ?? latest.state}</span>
+          <dl className="execution-facts">
+            <dt>Attempt</dt>
+            <dd>{latest.id} · revision {latest.revision}{latest.state_reason ? ` · ${latest.state_reason}` : ""}</dd>
+            <dt>Harness</dt>
+            <dd>{latest.harness} at {latest.base_sha.slice(0, 12)}</dd>
+            <dt>Workspace</dt>
+            <dd>{snapshot.lease ? `${snapshot.lease.branch} (${snapshot.lease.expired ? "expired" : snapshot.lease.status})` : "Not provisioned"}</dd>
+            <dt>Verification</dt>
+            <dd>{snapshot.verdict ? `${snapshot.verdict.status}${snapshot.verdict.payload.reason ? ` (${snapshot.verdict.payload.reason})` : ""}` : "No verdict"}</dd>
+            <dt>Conflicts</dt>
+            <dd>{snapshot.conflicts.length ? `${snapshot.conflicts.length} open${blocking ? `, ${blocking} blocking` : ""}: ${snapshot.conflicts.slice(0, 3).map((conflict) => `${conflict.path || "bases"} (${conflict.method}, ${conflict.severity})`).join("; ")}` : "None"}</dd>
+            <dt>Acceptance</dt>
+            <dd>{snapshot.acceptance ? `${snapshot.acceptance.status} at ${snapshot.acceptance.step}${snapshot.acceptance.outcome ? ` (${snapshot.acceptance.outcome.code})` : ""}` : "Not started"}</dd>
+          </dl>
+          <div className="execution-actions">
+            {latest.state === "verifying" ? (
+              <button type="button" aria-label="Verify attempt" disabled={Boolean(busy)} onClick={() => void act("verify", async () => {
+                const result = await post<{ verdict: { status: string } | null }>(`/execution-attempts/${attemptPath}/verify`, {});
+                return result.verdict ? `Verification ${result.verdict.status}.` : "Verification stopped.";
+              })}>Verify</button>
+            ) : null}
+            {latest.state === "reviewable" ? (
+              <>
+                <button type="button" aria-label="Accept attempt" disabled={Boolean(busy)} onClick={() => void act("accept", async () => {
+                  const result = await post<{ acceptance: ExecutionAcceptanceView }>(`/execution-attempts/${attemptPath}/accept`, { idempotency_key: `ui-accept-${latest.id}-${Date.now()}`, ...uiOperator });
+                  if (result.acceptance.status !== "accepted") throw new Error(`${result.acceptance.outcome?.code ?? result.acceptance.status}: acceptance did not complete`);
+                  return "Attempt accepted.";
+                })}>Accept</button>
+                <button type="button" aria-label="Reject attempt" disabled={Boolean(busy)} onClick={() => void act("reject", async () => {
+                  await post(`/execution-attempts/${attemptPath}/reject`, { idempotency_key: `ui-reject-${latest.id}-${latest.revision}`, ...uiOperator });
+                  return "Attempt rejected.";
+                })}>Reject</button>
+              </>
+            ) : null}
+            {executionStateLabels[latest.state] && !["accepted", "failed", "canceled"].includes(latest.state) ? (
+              <button type="button" aria-label="Cancel attempt" disabled={Boolean(busy)} onClick={() => void act("cancel", async () => {
+                await transition("cancel", "operator_requested");
+                return "Attempt canceled.";
+              })}>Cancel</button>
+            ) : null}
+            {["provisioning", "running", "verifying", "reviewable", "stale"].includes(latest.state) ? (
+              <button type="button" aria-label="Quarantine attempt" disabled={Boolean(busy)} onClick={() => void act("quarantine", async () => {
+                await post(`/execution-attempts/${attemptPath}/quarantine`, { idempotency_key: `ui-quarantine-${latest.id}-${latest.revision}`, ...uiOperator });
+                return "Attempt quarantined for reconciliation.";
+              })}>Quarantine</button>
+            ) : null}
+            {latest.state === "reconciling" ? (
+              <button type="button" aria-label="Resume attempt" disabled={Boolean(busy)} onClick={() => void act("resume", async () => {
+                await transition("resume", null);
+                return "Attempt resumed.";
+              })}>Resume</button>
+            ) : null}
+            {!["accepted", "failed", "canceled"].includes(latest.state) ? (
+              <button type="button" aria-label="Reconcile attempt" disabled={Boolean(busy)} onClick={() => void act("reconcile", async () => {
+                const result = await post<{ run: { decisions: unknown[] } }>("/execution-reconciliation", { attempt_id: latest.id, ...uiOperator });
+                return `Reconciliation recorded ${result.run.decisions.length} decision(s).`;
+              })}>Reconcile</button>
+            ) : null}
+            {latest.state === "failed" || latest.state === "canceled" ? (
+              <button type="button" aria-label="Retry attempt" disabled={Boolean(busy) || !claimId} title={claimId ? undefined : "Claim the issue to retry"} onClick={() => void act("retry", async () => {
+                await post(`/issues/${encodeURIComponent(issue.id)}/execution-attempts`, {
+                  claim_id: claimId,
+                  harness: latest.harness,
+                  repository: latest.repository,
+                  base_sha: latest.base_sha,
+                  retry_of: latest.id,
+                  idempotency_key: `ui-retry-${latest.id}`,
+                  repository_path: snapshot.lease?.repository_path,
+                });
+                return "Retry attempt created.";
+              })}>Retry</button>
+            ) : null}
+          </div>
+          {latest.state === "provisioning" && snapshot.lease?.status === "active" ? (
+            <form className="execution-launch" onSubmit={launch}>
+              <select name="adapter" aria-label="Harness adapter" required defaultValue={adapters[0]?.id ?? ""}>
+                {adapters.map((adapter) => <option key={adapter.id} value={adapter.id}>{adapter.id}</option>)}
+              </select>
+              <textarea name="prompt" aria-label="Harness prompt" required maxLength={200000} placeholder="Instructions for the harness" />
+              <button type="submit" aria-label="Launch attempt" disabled={Boolean(busy) || !adapters.length}>Launch</button>
+            </form>
+          ) : null}
+          {snapshot.attempts.length > 1 ? (
+            <ol className="execution-history" aria-label="Attempt history">
+              {snapshot.attempts.slice(1, 6).map((attempt) => (
+                <li key={attempt.id}>{attempt.id}: {executionStateLabels[attempt.state] ?? attempt.state}{attempt.state_reason ? ` (${attempt.state_reason})` : ""}</li>
+              ))}
+            </ol>
+          ) : null}
+        </div>
+      ) : <p>No execution attempts yet.</p>}
+      {loadError ? <p role="alert" className="execution-error">{loadError}</p> : null}
+      {error ? <p role="alert" className="execution-error">{error}</p> : null}
+      {message ? <p role="status">{message}</p> : null}
+    </section>
+  );
+}
+
+function RunnableQueuePanel({ projectId }: { projectId: string }) {
+  const [listing, setListing] = useState<RunnableListingView | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    api<RunnableListingView>(`/runnable-issues?project_id=${encodeURIComponent(projectId)}&limit=10&excluded_limit=10`)
+      .then((next) => {
+        if (cancelled) return;
+        setListing(next);
+        setError(null);
+      })
+      .catch((reason: unknown) => {
+        if (!cancelled) setError(executionErrorText(reason));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId]);
+
+  return (
+    <section className="runnable-queue" aria-label="Runnable queue">
+      <strong>Runnable queue</strong>
+      {error ? <p role="alert" className="execution-error">{error}</p> : null}
+      {listing ? (
+        <>
+          <p>{listing.runnable_total} runnable, {listing.excluded_total} waiting.</p>
+          {listing.runnable.length ? (
+            <ul aria-label="Runnable issues">
+              {listing.runnable.map((entry) => <li key={entry.issue.id}>{entry.issue.identifier ?? entry.issue.id} {entry.issue.title}</li>)}
+            </ul>
+          ) : null}
+          {listing.excluded.length ? (
+            <ul aria-label="Waiting issues">
+              {listing.excluded.map((entry) => <li key={entry.issue.id}>{entry.issue.identifier ?? entry.issue.id} {entry.issue.title}: {entry.reasons.map((reason) => reason.code).join(", ")}</li>)}
+            </ul>
+          ) : null}
+        </>
+      ) : error ? null : <p role="status">Loading runnable queue…</p>}
+    </section>
+  );
 }
 
 function AgentStatePanel({ issue }: { issue: Issue }) {

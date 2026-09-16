@@ -287,6 +287,60 @@ try {
 
   assert((await store.deleteIssue({ id: externalIssue.id, confirm: true })).deleted === true, "issue delete did not report deletion");
 
+  // --- claims and runnability: a race only a pool can produce ----------------
+  //
+  // Each claim below runs on its own pooled connection; the issue row lock is
+  // what lets exactly one of them win.
+
+  const runnability = await import("../server/issue-runnability.ts");
+  const raceTarget = await store.upsertIssue({ title: "Postgres claim race target", status: "Todo", project_id: project.id });
+  const racers = ["pg-race-0", "pg-race-1", "pg-race-2", "pg-race-3"];
+  for (const id of racers) await store.startAgentSession({ id, agent_name: `Postgres Racer ${id}`, harness: "codex", ttl_minutes: 30 });
+  const claimRace = await Promise.allSettled(racers.map((id) => store.claimIssue({ issue_id: raceTarget.id, session_id: id, ttl_minutes: 30 })));
+  assert(claimRace.filter((outcome) => outcome.status === "fulfilled").length === 1, `exactly one concurrent Postgres claim may win: ${JSON.stringify(claimRace.map((outcome) => outcome.status))}`);
+  assert((await store.listIssueClaims({ issue_id: raceTarget.id })).length === 1, "one active Postgres claim must remain");
+  const runnableListing = await runnability.listRunnableIssues({ project_id: project.id, limit: 250, excluded_limit: 250 });
+  assert(runnableListing.excluded.some((entry) => entry.issue.id === raceTarget.id && entry.reasons.some((reason) => reason.code === "claimed")), "the claimed Postgres issue must be excluded as claimed");
+  assert(runnableListing.runnable.every((entry) => typeof entry.issue.priority === "number" && typeof entry.issue.unblocks_count === "number"), "Postgres runnability summaries must carry numbers");
+
+  // --- execution attempts: races that only a pool can produce ----------------
+  //
+  // SQLite serializes writers, so tests/execution-attempts.mjs cannot show that
+  // the Postgres path holds when two transactions really overlap. Here each
+  // create and launch runs on its own pooled connection.
+
+  const attempts = await import("../server/execution-attempts.ts");
+  await store.startAgentSession({ id: "pg-attempt-session", agent_name: "Postgres Agent", harness: "codex", ttl_minutes: 30 });
+  const attemptTarget = await store.upsertIssue({ title: "Postgres attempt target", status: "Todo", project_id: project.id });
+  const attemptClaim = (await store.claimIssue({ issue_id: attemptTarget.id, session_id: "pg-attempt-session", ttl_minutes: 30 })).claim;
+  const attemptInput = { issue_id: attemptTarget.id, claim_id: attemptClaim.id, harness: "codex", repository: "https://example.com/claw/pg.git", base_sha: "c".repeat(40) };
+  const createRace = await Promise.allSettled([0, 1, 2].map((index) => attempts.createExecutionAttempt({ ...attemptInput, idempotency_key: `pg-create-${index}` })));
+  const createdAttempts = createRace.filter((result) => result.status === "fulfilled");
+  assert(createdAttempts.length === 1, `exactly one overlapping create may land on Postgres, ${createdAttempts.length} did`);
+  assert(
+    createRace.filter((result) => result.status === "rejected").every((result) => result.reason?.code === "live_attempt_exists"),
+    `losing creates must fail with live_attempt_exists: ${JSON.stringify(createRace.map((result) => result.reason?.message))}`,
+  );
+  const pgAttempt = createdAttempts[0].value.attempt;
+  const launchRace = await Promise.allSettled([0, 1, 2].map((index) => attempts.transitionExecutionAttempt({
+    attempt_id: pgAttempt.id,
+    event: "launch",
+    expected_revision: 0,
+    idempotency_key: `pg-launch-${index}`,
+    actor_kind: "control_plane",
+    actor_id: `hub-${index}`,
+    process: { pid: 100 + index },
+  })));
+  assert(launchRace.filter((result) => result.status === "fulfilled").length === 1, "exactly one overlapping launch may land on Postgres");
+  assert(
+    launchRace.filter((result) => result.status === "rejected").every((result) => result.reason?.code === "revision_conflict"),
+    `losing launches must fail with revision_conflict: ${JSON.stringify(launchRace.map((result) => result.reason?.message))}`,
+  );
+  const pgHistory = await attempts.getExecutionAttempt(pgAttempt.id);
+  assert(pgHistory.revision === 1 && pgHistory.transitions.length === 1, `the Postgres ledger must hold exactly one launch: ${JSON.stringify(pgHistory)}`);
+  assert(typeof pgHistory.process.pid === "number" && typeof pgHistory.revision === "number", "Postgres attempt values must come back as numbers");
+  assert((await attempts.listExecutionAttempts({ issue_id: attemptTarget.id })).length === 1, "Postgres issue history must list the attempt");
+
   // --- back to local, and an unreachable connection is refused --------------
 
   const local = await dbModule.activateDatabase(localId);

@@ -1,32 +1,14 @@
 import { customAlphabet } from "nanoid";
 import { adapter, json, nowIso, parseJson } from "./db.js";
 import { searchIssuesClausePostgres, searchIssuesClauseSqlite } from "./db-schema-postgres.js";
+import { liveExecutionStatesSql } from "./execution-attempts-schema.js";
+import { blockingReasonCodes, evaluateIssueRunnability, issueStatusTypeSql } from "./issue-runnability.js";
 
 const nanoid = customAlphabet("0123456789abcdefghijklmnopqrstuvwxyz", 12);
 const localIssuePrefix = "CTH";
 let issueIdentifiersChecked = false;
-const normalizedStatusTypeSql = `
-  CASE
-    WHEN lower(COALESCE(status, '')) IN ('done', 'completed') THEN 'completed'
-    WHEN lower(COALESCE(status, '')) IN ('in progress', 'started') THEN 'started'
-    WHEN lower(COALESCE(status, '')) IN ('todo', 'to do') THEN 'unstarted'
-    WHEN lower(COALESCE(status, '')) IN ('blocked', 'blocker') THEN 'blocked'
-    WHEN lower(COALESCE(status, '')) IN ('paused', 'pause') THEN 'paused'
-    WHEN lower(COALESCE(status, '')) IN ('canceled', 'cancelled') THEN 'canceled'
-    ELSE status_type
-  END
-`;
-const normalizedIssueStatusTypeSql = `
-  CASE
-    WHEN lower(COALESCE(i.status, '')) IN ('done', 'completed') THEN 'completed'
-    WHEN lower(COALESCE(i.status, '')) IN ('in progress', 'started') THEN 'started'
-    WHEN lower(COALESCE(i.status, '')) IN ('todo', 'to do') THEN 'unstarted'
-    WHEN lower(COALESCE(i.status, '')) IN ('blocked', 'blocker') THEN 'blocked'
-    WHEN lower(COALESCE(i.status, '')) IN ('paused', 'pause') THEN 'paused'
-    WHEN lower(COALESCE(i.status, '')) IN ('canceled', 'cancelled') THEN 'canceled'
-    ELSE i.status_type
-  END
-`;
+const normalizedStatusTypeSql = issueStatusTypeSql();
+const normalizedIssueStatusTypeSql = issueStatusTypeSql("i.");
 const effectiveIssueStatusTypeSql = `
   CASE
     WHEN (${normalizedIssueStatusTypeSql}) IN ('completed', 'canceled') THEN (${normalizedIssueStatusTypeSql})
@@ -1183,6 +1165,15 @@ export async function deleteIssue(input: DeleteIssueInput) {
   if (activeClaimCount > 0 && input.force !== true) {
     throw new Error(`Issue ${issue.identifier ?? issue.id} has ${activeClaimCount} active claim(s). Pass force=true to delete it; nothing was deleted.`);
   }
+  // Deleting an issue cascades to its execution attempts and their transition
+  // ledger, so live work is protected the same way an active claim is.
+  const liveAttemptCount = Number((await adapter.get(
+    `SELECT COUNT(*) AS count FROM execution_attempts WHERE issue_id=@issue_id AND state IN (${liveExecutionStatesSql})`,
+    { issue_id: issueId },
+  ) as { count: number }).count);
+  if (liveAttemptCount > 0 && input.force !== true) {
+    throw new Error(`Issue ${issue.identifier ?? issue.id} has ${liveAttemptCount} live execution attempt(s). Pass force=true to delete it and its attempt history; nothing was deleted.`);
+  }
   await adapter.run("DELETE FROM issues WHERE id=@id", { id: issueId });
   return { deleted: true, issue };
 }
@@ -1441,59 +1432,70 @@ export async function listAgentSessions(input: { include_ended?: boolean | strin
 }
 
 export async function claimIssue(input: ClaimIssueInput) {
-  const at = nowIso();
   const issueId = await resolveParentId(input.issue_id);
   if (!issueId) throw new Error(`Issue not found: ${input.issue_id}`);
-  const issue = await getClaimableIssue(issueId);
-  assertIssueOpenForAgentWrite(issue, input.allow_closed, "claim");
-  if (!booleanValue(input.force, false) && await issueIsBlocked(issueId, issue)) {
-    throw new Error(`Issue ${issueLabel(issue)} is blocked; resolve its dependencies or explicit Blocked status before claiming it`);
-  }
-  const session = await getActiveAgentSession(input.session_id, at);
-  if (!session) throw new Error(`Active agent session not found: ${input.session_id}`);
-  await heartbeatAgentSession({ session_id: input.session_id, ttl_minutes: input.ttl_minutes });
-  const expiredReleased = await expireIssueClaims(issueId, at);
-  const activeClaims = await activeIssueClaims(issueId, at);
-  const active = activeClaims[0];
-  const expiresAt = addMinutes(at, ttlMinutes(input.ttl_minutes));
-  const sameSessionActive = activeClaims.find((claim) => claim.session_id === input.session_id);
-  if (sameSessionActive) {
-    await supersedeOtherActiveIssueClaims(issueId, sameSessionActive.id, at);
-    await adapter.run(`
-      UPDATE issue_claims
-      SET status='active', note=@note, heartbeat_at=@heartbeat_at, expires_at=@expires_at
-      WHERE id=@id
-    `, { id: sameSessionActive.id, note: input.note ?? sameSessionActive.note ?? null, heartbeat_at: at, expires_at: expiresAt });
-    await markIssueInProgress(issueId, at);
-    return { claim: await getIssueClaim(sameSessionActive.id), idempotent: true, forced: false, expired_released: expiredReleased };
-  }
-  let forced = false;
-  if (active) {
-    if (!booleanValue(input.force, false)) {
-      throw new Error(`Issue already claimed by ${active.agent_name} (${active.session_id}) until ${active.expires_at}`);
+  // One transaction per claim, so sessions racing for the same issue cannot both
+  // find it unclaimed. SQLite's writer lock already serializes them; on Postgres
+  // the issue row lock makes the later claim wait and then see the earlier one.
+  return await adapter.transaction(async () => {
+    if (adapter.kind === "postgres") await adapter.get("SELECT id FROM issues WHERE id = @id FOR UPDATE", { id: issueId });
+    const at = nowIso();
+    const issue = await getClaimableIssue(issueId);
+    assertIssueOpenForAgentWrite(issue, input.allow_closed, "claim");
+    const runnability = await evaluateIssueRunnability(issueId, { session_id: input.session_id, at });
+    const blocking = runnability?.reasons.filter((reason) => blockingReasonCodes.includes(reason.code)) ?? [];
+    if (blocking.length && !booleanValue(input.force, false)) {
+      throw new Error(`Issue ${issueLabel(issue)} is blocked; resolve its dependencies, explicit Blocked status, or blocking path conflicts before claiming it (${blocking.map((reason) => reason.code).join(", ")})`);
     }
-    forced = true;
-    await supersedeActiveIssueClaims(issueId, at);
-  }
-  const row = {
-    id: makeId("claim"),
-    issue_id: issueId,
-    session_id: input.session_id,
-    agent_name: session.agent_name,
-    status: "active",
-    note: input.note ?? null,
-    claimed_at: at,
-    heartbeat_at: at,
-    expires_at: expiresAt,
-    released_at: null,
-    force: forced ? 1 : 0,
-  };
-  await adapter.run(`
-    INSERT INTO issue_claims (id, issue_id, session_id, agent_name, status, note, claimed_at, heartbeat_at, expires_at, released_at, force)
-    VALUES (@id, @issue_id, @session_id, @agent_name, @status, @note, @claimed_at, @heartbeat_at, @expires_at, @released_at, @force)
-  `, row);
-  await markIssueInProgress(issueId, at);
-  return { claim: await getIssueClaim(row.id), idempotent: false, forced, expired_released: expiredReleased };
+    // Overlaps that do not block still travel with the claim, so the claiming
+    // agent knows which live work its declared paths touch.
+    const pathWarnings = runnability?.path_warnings ?? [];
+    const session = await getActiveAgentSession(input.session_id, at);
+    if (!session) throw new Error(`Active agent session not found: ${input.session_id}`);
+    await heartbeatAgentSession({ session_id: input.session_id, ttl_minutes: input.ttl_minutes });
+    const expiredReleased = await expireIssueClaims(issueId, at);
+    const activeClaims = await activeIssueClaims(issueId, at);
+    const active = activeClaims[0];
+    const expiresAt = addMinutes(at, ttlMinutes(input.ttl_minutes));
+    const sameSessionActive = activeClaims.find((claim) => claim.session_id === input.session_id);
+    if (sameSessionActive) {
+      await supersedeOtherActiveIssueClaims(issueId, sameSessionActive.id, at);
+      await adapter.run(`
+        UPDATE issue_claims
+        SET status='active', note=@note, heartbeat_at=@heartbeat_at, expires_at=@expires_at
+        WHERE id=@id
+      `, { id: sameSessionActive.id, note: input.note ?? sameSessionActive.note ?? null, heartbeat_at: at, expires_at: expiresAt });
+      await markIssueInProgress(issueId, at);
+      return { claim: await getIssueClaim(sameSessionActive.id), idempotent: true, forced: false, expired_released: expiredReleased, path_warnings: pathWarnings };
+    }
+    let forced = false;
+    if (active) {
+      if (!booleanValue(input.force, false)) {
+        throw new Error(`Issue already claimed by ${active.agent_name} (${active.session_id}) until ${active.expires_at}`);
+      }
+      forced = true;
+      await supersedeActiveIssueClaims(issueId, at);
+    }
+    const row = {
+      id: makeId("claim"),
+      issue_id: issueId,
+      session_id: input.session_id,
+      agent_name: session.agent_name,
+      status: "active",
+      note: input.note ?? null,
+      claimed_at: at,
+      heartbeat_at: at,
+      expires_at: expiresAt,
+      released_at: null,
+      force: forced ? 1 : 0,
+    };
+    await adapter.run(`
+      INSERT INTO issue_claims (id, issue_id, session_id, agent_name, status, note, claimed_at, heartbeat_at, expires_at, released_at, force)
+      VALUES (@id, @issue_id, @session_id, @agent_name, @status, @note, @claimed_at, @heartbeat_at, @expires_at, @released_at, @force)
+    `, row);
+    await markIssueInProgress(issueId, at);
+    return { claim: await getIssueClaim(row.id), idempotent: false, forced, expired_released: expiredReleased, path_warnings: pathWarnings };
+  });
 }
 
 export async function releaseIssueClaim(input: ReleaseIssueClaimInput) {
@@ -1738,14 +1740,6 @@ async function activeIssueClaims(issueId: string, at = nowIso()) {
       AND s.expires_at > @at
     ORDER BY c.heartbeat_at DESC, c.claimed_at DESC
   `, { issue_id: issueId, at }) as { id: string; session_id: string; agent_name: string; harness?: string | null; note: string | null; expires_at: string }[];
-}
-
-async function issueIsBlocked(issueId: string, issue?: Record<string, unknown>) {
-  const stored = issue ?? await getClaimableIssue(issueId);
-  const statusType = inferStatusType(stringValue(stored.status) ?? undefined) ?? knownStatusType(stringValue(stored.status_type) ?? undefined);
-  if (statusType === "blocked") return true;
-  const dependency = await adapter.get("SELECT 1 FROM issue_dependencies WHERE issue_id=@issue_id AND status='open' LIMIT 1", { issue_id: issueId });
-  return Boolean(dependency);
 }
 
 async function markIssueInProgress(issueId: string, at = nowIso()) {
