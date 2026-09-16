@@ -304,6 +304,7 @@ Default database path:
 Environment variables:
 
 - `CLAW_TASK_HUB_DB`: preferred SQLite database override
+- `CLAW_TASK_HUB_EXTERNAL_DB`: pin the process to a registered Postgres/Supabase connection id, with no SQLite fallback (see [docs/EXTERNAL_DATABASES.md](docs/EXTERNAL_DATABASES.md))
 - `PORT`: API port, default `4781`
 - `CLAW_TASK_HUB_HOST`: API host, default `127.0.0.1`
 - `CLAW_TASK_HUB_CORS_ORIGINS`: optional comma-separated list of extra allowed browser origins

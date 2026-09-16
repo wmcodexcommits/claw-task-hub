@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { db } from "../server/db.js";
+import { activeExternalConnectionId, db } from "../server/db.js";
 import {
   ensureIssueIdentifiers,
   saveComment,
@@ -10,6 +10,12 @@ import {
   upsertIssue,
   upsertProject,
 } from "../server/store.js";
+
+// This tool reads the local SQLite handle directly while store.ts writes through
+// the active adapter; against an external connection the two would disagree.
+if (activeExternalConnectionId()) {
+  throw new Error("sync:requisitions reads the local SQLite database directly and cannot run while an external connection is active");
+}
 
 type RequisitionKind = "alias" | "clause" | "policy" | "source";
 

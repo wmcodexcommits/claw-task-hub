@@ -50,6 +50,7 @@
     "adapter-postgres": "bun tests/db-adapter-postgres.mjs",
     "data-change-relay": "bun tests/data-change-relay.mjs",
     "store-postgres": "bun tests/store-postgres.mjs",
+    "pinned-external-db": "bun tests/pinned-external-db.mjs",
     "multiprocess-contention": "bun tests/multiprocess-contention.mjs",
     "harness-smoke": "bun tests/harness-smoke.mjs",
     "open-context-smoke": "bun tests/open-context-smoke.mjs",
