@@ -107,8 +107,15 @@ function isTruthyEnv(value: string | undefined) {
   return normalized !== "" && normalized !== "0" && normalized !== "false";
 }
 
-const configuredDbPath = resolveDbPath();
-const databaseDir = dirname(configuredDbPath);
+// A hub pinned to an external connection has no local database file at all. It
+// opens the named connection at startup or exits, so an unreachable server can
+// never turn into writes landing in a SQLite file nobody is looking at. The
+// in-memory handle only satisfies code that expects `db` to exist.
+const pinnedExternalConnectionId = process.env.CLAW_TASK_HUB_EXTERNAL_DB?.trim() || null;
+const inMemoryDbPath = ":memory:";
+
+const configuredDbPath = pinnedExternalConnectionId ? inMemoryDbPath : resolveDbPath();
+const databaseDir = pinnedExternalConnectionId ? dataDir : dirname(configuredDbPath);
 const activeDatabasePointer = join(databaseDir, ".claw-task-hub-active-db");
 const databaseRegistryPath = join(databaseDir, ".claw-task-hub-databases.json");
 // An external (Postgres) connection is selected in the same pointer file as a
@@ -162,6 +169,10 @@ function announceActiveDatabaseChange() {
 }
 
 export function listManagedDatabases(): { active: ManagedDatabase; databases: ManagedDatabase[] } {
+  if (pinnedExternalConnectionId) {
+    if (!activeExternal) throw new Error(`The pinned external connection ${pinnedExternalConnectionId} is not open`);
+    return { active: externalCatalogueEntry(activeExternal.summary), databases: [] };
+  }
   const databasePaths = new Set(
     readdirSync(databaseDir, { withFileTypes: true })
       .filter((entry) => entry.isFile() && extname(entry.name).toLowerCase() === ".sqlite")
@@ -195,6 +206,7 @@ export function getManagedDatabase(id: string) {
 }
 
 export function createManagedDatabase(name: string, requestedPath?: string) {
+  assertNotPinned();
   const nextPath = resolveNewDatabasePath(name, requestedPath);
   if (existsSync(nextPath)) throw new Error(`Database already exists: ${nextPath}`);
   const nextDatabase = openDatabase(nextPath);
@@ -212,6 +224,7 @@ export function createManagedDatabase(name: string, requestedPath?: string) {
 }
 
 export function activateManagedDatabase(id: string) {
+  assertNotPinned();
   const registered = listManagedDatabases().databases.find((database) => database.id === id);
   if (!registered) throw new Error(`Database not found: ${id}`);
   const nextPath = registered.path;
@@ -256,7 +269,18 @@ export function deleteManagedDatabase(id: string, confirm = false) {
   return listManagedDatabases();
 }
 
+function assertNotPinned() {
+  if (!pinnedExternalConnectionId) return;
+  throw new Error(
+    `This hub is pinned to external connection ${pinnedExternalConnectionId} by CLAW_TASK_HUB_EXTERNAL_DB; ` +
+    "local databases are disabled. Nothing was changed.");
+}
+
 function resolveInitialDbPath() {
+  if (pinnedExternalConnectionId) {
+    startupExternalConnectionId = pinnedExternalConnectionId;
+    return inMemoryDbPath;
+  }
   mkdirSync(databaseDir, { recursive: true });
   if (!existsSync(activeDatabasePointer)) return configuredDbPath;
   try {
@@ -389,6 +413,10 @@ function externalCatalogueEntry(summary: ExternalConnectionSummary): ManagedData
  * connection is "external:<connection id>".
  */
 export async function activateDatabase(id: string) {
+  if (pinnedExternalConnectionId) {
+    if (id === `${externalDatabasePrefix}${pinnedExternalConnectionId}`) return listManagedDatabases();
+    assertNotPinned();
+  }
   if (!id.startsWith(externalDatabasePrefix)) return activateManagedDatabase(id);
   await activateExternalConnection(id.slice(externalDatabasePrefix.length), { persist: true });
   return listManagedDatabases();
@@ -992,10 +1020,17 @@ if (startupExternalConnectionId) {
   try {
     await activateExternalConnection(startupExternalConnectionId, { persist: false });
     if (!isTruthyEnv(process.env.CLAW_TASK_HUB_QUIET_DB)) {
-      process.stderr.write(`claw-task-hub: database ${activeDatabaseLabel()} [selected external connection]\n`);
+      const source = pinnedExternalConnectionId ? "CLAW_TASK_HUB_EXTERNAL_DB" : "selected external connection";
+      process.stderr.write(`claw-task-hub: database ${activeDatabaseLabel()} [${source}]\n`);
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    if (pinnedExternalConnectionId) {
+      throw new Error(
+        `claw-task-hub: could not open external connection ${pinnedExternalConnectionId} pinned by ` +
+        `CLAW_TASK_HUB_EXTERNAL_DB: ${message}. There is no local fallback; refusing to start.`,
+        { cause: error });
+    }
     process.stderr.write(
       `claw-task-hub: could not open the selected external connection ${startupExternalConnectionId}: ${message}\n` +
       `claw-task-hub: this process is using the local database ${dbPath} instead\n`,

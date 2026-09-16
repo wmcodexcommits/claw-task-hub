@@ -41,6 +41,20 @@ are then read and written in that Postgres database.
   from the local database. Seed or import into it the same way as any other
   Claw Task Hub database.
 
+## Pinning a hub to a connection
+
+Set `CLAW_TASK_HUB_EXTERNAL_DB=<connection id>` to make a connection the
+permanent database for a process, independent of the active-database pointer:
+
+- The process opens that connection at startup, or exits with an error. It
+  never falls back to a local database, and opens no SQLite file (a
+  `CLAW_TASK_HUB_DB` value is ignored).
+- Creating or activating a local database is refused. `list_databases` returns
+  only the pinned connection.
+- Set it in the environment of each long-running process (service unit, MCP
+  server entry), not in `.env`: Bun loads `.env` for the test suite too, and the
+  tests would then run against the pinned database.
+
 ## Live refresh across processes and machines
 
 Several hubs, on one machine or several, can share one Postgres database, and
