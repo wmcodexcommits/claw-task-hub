@@ -68,7 +68,9 @@ function render() {
 
 const generated = render();
 if (process.argv.includes("--check")) {
-  const current = readFileSync(outputPath, "utf8");
+  // Line endings are compared loosely: Git's core.autocrlf rewrites them on
+  // Windows checkouts, which changes the bytes and not the stylesheet.
+  const current = readFileSync(outputPath, "utf8").replace(/\r\n/g, "\n");
   if (current !== generated) throw new Error("src/App.css has drifted; run bun run css:generate");
   console.log("generated CSS is current");
 } else {

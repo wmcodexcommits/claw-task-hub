@@ -14,6 +14,8 @@
 // the column is derived. searchIssuesClausePostgres below is the matching
 // predicate for that column.
 
+import { executionAttemptsSchemaSql } from "./execution-attempts-schema.js";
+
 export const postgresSchemaSql = `
 CREATE TABLE IF NOT EXISTS teams (
   id TEXT PRIMARY KEY,
@@ -198,6 +200,7 @@ CREATE INDEX IF NOT EXISTS idx_context_bindings_lookup ON context_bindings(harne
 CREATE INDEX IF NOT EXISTS idx_project_updates_project_created ON project_updates(project_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_issue_dependencies_issue_status ON issue_dependencies(issue_id, status);
 CREATE INDEX IF NOT EXISTS idx_issue_dependencies_blocker_status ON issue_dependencies(blocker_issue_id, status);
+${executionAttemptsSchemaSql}
 `;
 
 /**
@@ -229,6 +232,20 @@ export const dataChangeTables = [
   "context_bindings",
   "project_updates",
   "issue_dependencies",
+  "execution_attempts",
+  "execution_attempt_transitions",
+  "execution_workspace_leases",
+  "verification_policies",
+  "execution_evidence",
+  "execution_path_declarations",
+  "execution_conflict_policies",
+  "execution_conflicts",
+  "execution_conflict_decisions",
+  "execution_acceptance_policies",
+  "execution_acceptances",
+  "execution_runners",
+  "execution_reconciliation_runs",
+  "execution_reconciliation_decisions",
 ] as const;
 
 // Change announcements for UIs served by OTHER processes and machines.

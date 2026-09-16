@@ -29,19 +29,34 @@ import { listExternalConnections, resolveExternalConnection } from "../server/db
 import { postgresSchemaSql } from "../server/db-schema-postgres.js";
 
 type Row = Record<string, unknown>;
-type TablePlan = { table: string; key: string; rename?: Record<string, string> };
+// selfReference names a column that points at the same table (issues.parent_id,
+// execution_attempts.retry_of). It is inserted as NULL and linked in a second
+// pass once every row of that table exists.
+type TablePlan = { table: string; key: string; rename?: Record<string, string>; selfReference?: string };
 
 // Foreign-key order: every table comes after the tables it references.
-// issues.parent_id references issues itself, so parents are linked in a second
-// pass once every issue exists.
 const plan: TablePlan[] = [
   { table: "teams", key: "id" },
   { table: "projects", key: "id" },
   { table: "agent_sessions", key: "id" },
-  { table: "issues", key: "id" },
+  { table: "issues", key: "id", selfReference: "parent_id" },
   { table: "comments", key: "id" },
   { table: "documents", key: "id" },
   { table: "issue_claims", key: "id" },
+  { table: "execution_attempts", key: "id", selfReference: "retry_of" },
+  { table: "execution_attempt_transitions", key: "id" },
+  { table: "execution_workspace_leases", key: "id" },
+  { table: "verification_policies", key: "id" },
+  { table: "execution_evidence", key: "id", selfReference: "supersedes" },
+  { table: "execution_path_declarations", key: "id" },
+  { table: "execution_conflict_policies", key: "id" },
+  { table: "execution_conflicts", key: "id" },
+  { table: "execution_conflict_decisions", key: "id" },
+  { table: "execution_acceptance_policies", key: "id" },
+  { table: "execution_acceptances", key: "id" },
+  { table: "execution_runners", key: "run_id" },
+  { table: "execution_reconciliation_runs", key: "id" },
+  { table: "execution_reconciliation_decisions", key: "id" },
   { table: "context_bindings", key: "id" },
   { table: "project_updates", key: "id" },
   { table: "issue_dependencies", key: "id" },
@@ -213,14 +228,15 @@ async function main() {
           continue;
         }
         const columns = Object.keys(rows[0]);
-        const insertRows = entry.table === "issues" ? rows.map((row) => ({ ...row, parent_id: null })) : rows;
+        const selfReference = entry.selfReference;
+        const insertRows = selfReference ? rows.map((row) => ({ ...row, [selfReference]: null })) : rows;
         for (let start = 0; start < insertRows.length; start += batchSize) {
           const batch = insertRows.slice(start, start + batchSize);
           await tx`INSERT INTO ${tx(entry.table)} ${tx(batch, ...columns)}`;
         }
-        if (entry.table === "issues") {
-          for (const row of rows.filter((candidate) => candidate.parent_id != null)) {
-            await tx`UPDATE issues SET parent_id = ${row.parent_id as string} WHERE id = ${row.id as string}`;
+        if (selfReference) {
+          for (const row of rows.filter((candidate) => candidate[selfReference] != null)) {
+            await tx`UPDATE ${tx(entry.table)} SET ${tx(selfReference)} = ${row[selfReference] as string} WHERE ${tx(entry.key)} = ${row[entry.key] as string}`;
           }
         }
 
