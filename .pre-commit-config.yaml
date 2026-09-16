@@ -1,6 +1,13 @@
 repos:
   - repo: local
     hooks:
+      - id: branch-current-with-main
+        name: Branch Current With Main
+        entry: scripts/check-branch-current.sh
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
       - id: verification-gate
         name: Verification Gate
         entry: bun run verify

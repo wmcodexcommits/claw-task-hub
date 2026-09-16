@@ -392,8 +392,8 @@ try {
   } finally {
     dependencySourceMigrationDb.close();
   }
-  ensureDefaultTeam();
-  const firstNullExternalTeam = upsertTeam({
+  await ensureDefaultTeam();
+  const firstNullExternalTeam = await upsertTeam({
     id: "team_null_external_first",
     name: "First Null External Team",
   });
