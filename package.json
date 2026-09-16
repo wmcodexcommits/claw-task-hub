@@ -59,6 +59,7 @@
     "control-plane-e2e": "bunx playwright install chromium && bun tests/control-plane-e2e.mjs",
     "public-hygiene": "bun tests/public-hygiene.mjs",
     "release:version": "bun scripts/check-release-version.mjs",
+    "release:next": "bun scripts/release-version.mjs",
     "release:package": "bun scripts/package-release.mjs",
     "release-package-smoke": "bun tests/release-package-smoke.mjs",
     "verify:deps": "bun install --frozen-lockfile",

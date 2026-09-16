@@ -1,6 +1,17 @@
 repos:
   - repo: local
     hooks:
+      # Fast enough to run on every commit: a type error or a lint failure is
+      # caught before it reaches a branch, without paying for two Playwright
+      # installs and a 22-step suite on each save.
+      - id: commit-gate
+        name: Commit Gate
+        entry: sh -c 'bun run check:server && bun run lint'
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]
+
       - id: branch-current-with-main
         name: Branch Current With Main
         entry: scripts/check-branch-current.sh
@@ -8,10 +19,14 @@ repos:
         pass_filenames: false
         always_run: true
         stages: [pre-push]
+
+      # The full suite belongs on push, not on commit. Running it per commit
+      # cost minutes each time and made GitKraken's buttons look dead, because
+      # the GUI shows no hook output while it waits.
       - id: verification-gate
         name: Verification Gate
         entry: bun run verify
         language: system
         pass_filenames: false
         always_run: true
-        stages: [pre-commit, pre-push]
+        stages: [pre-push]

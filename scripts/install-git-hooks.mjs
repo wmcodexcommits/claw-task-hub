@@ -18,6 +18,6 @@ if (result.status !== 0) {
 }
 
 if (process.platform !== "win32") {
-  for (const name of ["pre-commit", "pre-push", "verification"]) chmodSync(join(root, ".githooks", name), 0o755);
+  for (const name of ["pre-commit", "commit-msg", "pre-push", "verification"]) chmodSync(join(root, ".githooks", name), 0o755);
 }
 console.log("Repository hooks installed from .githooks/.");
