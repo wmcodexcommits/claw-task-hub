@@ -1,12 +1,13 @@
 repos:
   - repo: local
     hooks:
-      # Fast enough to run on every commit: a type error or a lint failure is
-      # caught before it reaches a branch, without paying for two Playwright
-      # installs and a 22-step suite on each save.
+      # Commit-time gate: a type error is caught before it can reach a branch,
+      # and nothing else. Lint moved to pre-push because it was 5.4s of the
+      # 14.8s this used to cost, which put every commit in the band where
+      # people start context-switching while they wait.
       - id: commit-gate
         name: Commit Gate
-        entry: sh -c 'bun run check:server && bun run lint'
+        entry: bun run check:server
         language: system
         pass_filenames: false
         always_run: true
@@ -20,12 +21,15 @@ repos:
         always_run: true
         stages: [pre-push]
 
-      # The full suite belongs on push, not on commit. Running it per commit
-      # cost minutes each time and made GitKraken's buttons look dead, because
-      # the GUI shows no hook output while it waits.
-      - id: verification-gate
-        name: Verification Gate
-        entry: bun run verify
+      # Everything except the two browser suites. `bun run verify` (the full
+      # 147s run including ui-smoke and control-plane-e2e) stays the canonical
+      # gate and is what CI enforces through the required Verification Gate
+      # check, so nothing merges without it. Paying for two Playwright browser
+      # runs on every push -- including a push that only deletes a branch --
+      # bought no safety that the required check did not already provide.
+      - id: verification-gate-local
+        name: Verification Gate (local)
+        entry: bun run verify:local
         language: system
         pass_filenames: false
         always_run: true
