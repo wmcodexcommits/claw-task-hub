@@ -3,16 +3,17 @@ set -eu
 
 # Refuse to push a branch that does not already contain origin/main.
 #
-# A pull request whose head is behind main and is merged with "Squash and
-# merge" replays the head's OLD copy of every file it touches over main. The
-# result is a commit made entirely of deletions that reverts work already
-# merged, with no conflict and nothing in the PR diff to look at. a001271
-# (#7) did exactly that: -176 lines of server/db.ts, and main could no longer
-# boot because index.ts still imported what the squash had removed.
+# This is hygiene, not the gate. The incident that prompted it (a001271, the
+# squash of #7) was NOT caused by a stale branch: that branch sat directly on
+# main's tip. The 176 deleted lines of server/db.ts were authored by the local
+# merge 4fcfc45, which resolved its conflicts by keeping the older side, and
+# the squash then carried that deletion onto main faithfully. CI was red on the
+# pull request and it was merged anyway, because no status check was required.
 #
-# GitHub's "Require branches to be up to date before merging" is the gate that
-# actually blocks the merge; this hook is the early warning, so the staleness
-# is visible at push time rather than after the squash lands on main.
+# The real gate is the MAINPROTECT ruleset, which now requires the Verification
+# Gate and Windows Portability checks to pass before a merge. This hook only
+# keeps a branch from drifting far enough that a merge resolution has to make
+# that kind of choice in the first place.
 #
 # Set CLAW_ALLOW_STALE_PUSH=1 to push anyway.
 
