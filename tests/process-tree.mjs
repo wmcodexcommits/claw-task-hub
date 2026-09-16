@@ -1,7 +1,15 @@
 import { spawnSync } from "node:child_process";
 
+// A child killed by a signal keeps exitCode === null for good; signalCode is
+// what it sets instead. Testing only exitCode makes a second stop attempt wait
+// on an "exit" event that already fired, time out, and report a live process
+// tree that is in fact long dead.
+function hasExited(child) {
+  return child.exitCode !== null || child.signalCode !== null;
+}
+
 function waitForExit(child, timeoutMs) {
-  if (child.exitCode !== null) return Promise.resolve(true);
+  if (hasExited(child)) return Promise.resolve(true);
   return new Promise((resolve) => {
     let settled = false;
     const finish = (exited) => {
@@ -17,7 +25,7 @@ function waitForExit(child, timeoutMs) {
 }
 
 export async function stopProcessTree(child) {
-  if (!child?.pid || child.exitCode !== null) return;
+  if (!child?.pid || hasExited(child)) return;
   if (process.platform === "win32") {
     spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore" });
   } else {
