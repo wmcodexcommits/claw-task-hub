@@ -4,6 +4,11 @@ import { createHash } from "node:crypto";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { removePathWithRetries, waitSync } from "./filesystem.js";
+import { clearStatementCache, prepareCached } from "./statement-cache.js";
+import { createPostgresAdapter, createSqliteAdapter, postgresNumericTypes, type DbAdapter, type PostgresClient } from "./db-adapter.js";
+import { resolveExternalConnection, type ExternalConnectionSummary } from "./db-connections.js";
+import { postgresChangeNotificationSql, postgresSchemaSql } from "./db-schema-postgres.js";
+import type { ListenerClient } from "./data-change-relay.js";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const dataDir = join(root, "data");
@@ -25,6 +30,31 @@ type SqliteDatabase = Omit<Database, "prepare" | "query"> & {
 function openDatabase(path: string): SqliteDatabase {
   const database = new Database(path, { strict: true }) as unknown as SqliteDatabase;
   return withStatementCache(database);
+}
+
+// Route prepare() through the statement cache for every handle this module hands
+// out, so the callers in store.ts get compiled statements without 91 call sites
+// having to ask for them. The cache keys on the instance, so this stays correct
+// across an activation swap.
+//
+// An own property shadows the prototype method; the bound original is kept for
+// the cache to compile through, so a cache miss still reaches real bun:sqlite.
+function withStatementCache(database: SqliteDatabase): SqliteDatabase {
+  // Kill switch. The cache changes statement lifetime rather than SQL, so if it
+  // is ever implicated in a bug this reverts to compiling per call without a
+  // redeploy -- and it makes an A/B measurement run the identical code path.
+  if (isFalsyEnv(process.env.CLAW_TASK_HUB_STATEMENT_CACHE)) return database;
+  // Bind the real prepare before shadowing it, so a cache miss compiles through
+  // bun:sqlite instead of recursing into this wrapper. The cache is keyed on the
+  // handle itself, which is what closeDatabase() clears.
+  const compile = database.prepare.bind(database);
+  Object.defineProperty(database, "prepare", {
+    configurable: true,
+    writable: true,
+    enumerable: false,
+    value: (sql: string) => prepareCached(database, sql, compile),
+  });
+  return database;
 }
 
 export type WalModeOptions = {
@@ -342,21 +372,161 @@ function activateOpenDatabase(nextDatabase: SqliteDatabase, nextPath: string) {
   const previousDatabase = db;
   const previousPath = dbPath;
   closeDatabase(previousDatabase);
-  const temporaryPointer = `${activeDatabasePointer}.${process.pid}.tmp`;
   try {
     registerDatabasePath(nextPath);
-    writeFileSync(temporaryPointer, `${resolve(nextPath)}\n`, { encoding: "utf8", mode: 0o600 });
-    renameSync(temporaryPointer, activeDatabasePointer);
+    writeActivePointer(`${resolve(nextPath)}\n`);
     db = nextDatabase;
     dbPath = nextPath;
+    localAdapter = createSqliteAdapter(nextDatabase);
+    adapter = localAdapter;
+    releaseExternalConnection();
   } catch (error) {
     db = openDatabase(previousPath);
     dbPath = previousPath;
+    localAdapter = createSqliteAdapter(db);
+    adapter = activeExternal?.adapter ?? localAdapter;
     throw error;
   }
 }
 
+function writeActivePointer(content: string) {
+  const temporaryPointer = `${activeDatabasePointer}.${process.pid}.tmp`;
+  writeFileSync(temporaryPointer, content, { encoding: "utf8", mode: 0o600 });
+  renameSync(temporaryPointer, activeDatabasePointer);
+}
+
+function externalCatalogueEntry(summary: ExternalConnectionSummary): ManagedDatabase {
+  return {
+    id: `${externalDatabasePrefix}${summary.id}`,
+    name: summary.name,
+    fileName: summary.name,
+    // Never the credential: host[:port][/database], or env:VAR_NAME.
+    path: summary.target,
+    active: true,
+    engine: "postgres",
+  };
+}
+
+/**
+ * Make a database the live data layer for this process and every process that
+ * starts after it. Local databases are managed-database ids; an external
+ * connection is "external:<connection id>".
+ */
+export async function activateDatabase(id: string) {
+  if (pinnedExternalConnectionId) {
+    if (id === `${externalDatabasePrefix}${pinnedExternalConnectionId}`) return listManagedDatabases();
+    assertNotPinned();
+  }
+  if (!id.startsWith(externalDatabasePrefix)) return activateManagedDatabase(id);
+  await activateExternalConnection(id.slice(externalDatabasePrefix.length), { persist: true });
+  return listManagedDatabases();
+}
+
+export function activeExternalConnectionId() {
+  return activeExternal?.summary.id ?? null;
+}
+
+/** What /api/health and startup diagnostics name as the database in use. */
+export function activeDatabaseLabel() {
+  if (!activeExternal) return dbPath;
+  const { kind, name, target } = activeExternal.summary;
+  return `${kind} "${name}" (${target})`;
+}
+
+/**
+ * Close a live external connection's pool. A one-shot process calls this when
+ * it is done: open sockets would otherwise keep it running after its output.
+ */
+export async function closeActiveDatabase() {
+  const external = activeExternal;
+  if (!external) return;
+  activeExternal = null;
+  adapter = localAdapter;
+  announceActiveDatabaseChange();
+  await external.adapter.close();
+}
+
+async function activateExternalConnection(connectionId: string, options: { persist: boolean }) {
+  const target = resolveExternalConnection(connectionId);
+  // Imported on demand, like the connection test, so a checkout that never uses
+  // an external database does not load the driver to boot.
+  const { default: postgres } = await import("postgres");
+  const client = postgres(target.connectionString, {
+    ssl: target.ssl ? "require" : false,
+    max: 4,
+    connect_timeout: 10,
+    idle_timeout: 30,
+    onnotice: () => undefined,
+    types: postgresNumericTypes,
+  });
+  const nextAdapter = createPostgresAdapter(client as unknown as PostgresClient);
+  try {
+    // Reach the server and apply the schema BEFORE switching anything. A
+    // connection that cannot be opened leaves the current database live rather
+    // than half-activating one that fails on the first read.
+    await nextAdapter.exec(postgresSchemaSql);
+    await installChangeNotifications(nextAdapter, target.summary.name);
+    if (options.persist) {
+      writeActivePointer(`${externalDatabasePrefix}${target.summary.id}\n${resolve(dbPath)}\n`);
+    }
+  } catch (error) {
+    await nextAdapter.close().catch(() => undefined);
+    throw error;
+  }
+  releaseExternalConnection();
+  activeExternal = { summary: target.summary, adapter: nextAdapter };
+  adapter = nextAdapter;
+  announceActiveDatabaseChange();
+}
+
+// Live refresh is an addition, not a requirement: a Postgres-wire server without
+// triggers or NOTIFY still works as a hub, so a failure here is reported and the
+// activation goes ahead. See postgresChangeNotificationSql.
+async function installChangeNotifications(target: DbAdapter, name: string) {
+  try {
+    await target.exec(postgresChangeNotificationSql);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(
+      `claw-task-hub: could not install change notifications on ${name}: ${message}\n` +
+      "claw-task-hub: UIs in other processes and on other machines will need a manual refresh to see changes\n",
+    );
+  }
+}
+
+/**
+ * Open a dedicated client for LISTEN on an external connection. It stays out of
+ * the query pool so a long-lived listening connection never holds a slot that a
+ * request needs. The caller owns the client and must end() it.
+ */
+export async function openExternalListenerClient(connectionId: string): Promise<ListenerClient> {
+  const target = resolveExternalConnection(connectionId);
+  const { default: postgres } = await import("postgres");
+  const client = postgres(target.connectionString, {
+    ssl: target.ssl ? "require" : false,
+    max: 1,
+    connect_timeout: 10,
+    onnotice: () => undefined,
+  });
+  return client as unknown as ListenerClient;
+}
+
+function releaseExternalConnection() {
+  const previous = activeExternal;
+  activeExternal = null;
+  if (!previous) return;
+  announceActiveDatabaseChange();
+  // end() lets queries already running on the pool finish before it closes.
+  void previous.adapter.close().catch((error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`claw-task-hub: closing external connection ${previous.summary.name} failed: ${message}\n`);
+  });
+}
+
 function closeDatabase(database: SqliteDatabase) {
+  // close(true) throws rather than closing over live statements, so the cached
+  // statements have to be finalized first or an activation would fail.
+  clearStatementCache(database);
   Bun.gc(true);
   database.close(true);
 }
