@@ -23,7 +23,8 @@ type SqliteDatabase = Omit<Database, "prepare" | "query"> & {
 };
 
 function openDatabase(path: string): SqliteDatabase {
-  return new Database(path, { strict: true }) as unknown as SqliteDatabase;
+  const database = new Database(path, { strict: true }) as unknown as SqliteDatabase;
+  return withStatementCache(database);
 }
 
 export type WalModeOptions = {
@@ -38,6 +39,7 @@ export type ManagedDatabase = {
   fileName: string;
   path: string;
   active: boolean;
+  engine: "sqlite" | "postgres";
 };
 
 export function resolveDbPath(env: NodeJS.ProcessEnv = process.env, legacyExists = existsSync(legacyDbPath)) {
@@ -64,22 +66,83 @@ export function resolveDbPath(env: NodeJS.ProcessEnv = process.env, legacyExists
   return legacyExists ? legacyDbPath : clawDbPath;
 }
 
+function isFalsyEnv(value: string | undefined) {
+  if (value === undefined) return false;
+  return ["0", "false", "no", "off"].includes(value.trim().toLowerCase());
+}
+
 function isTruthyEnv(value: string | undefined) {
   if (!value) return false;
   const normalized = value.trim().toLowerCase();
   return normalized !== "" && normalized !== "0" && normalized !== "false";
 }
 
-const configuredDbPath = resolveDbPath();
-const databaseDir = dirname(configuredDbPath);
+// A hub pinned to an external connection has no local database file at all. It
+// opens the named connection at startup or exits, so an unreachable server can
+// never turn into writes landing in a SQLite file nobody is looking at. The
+// in-memory handle only satisfies code that expects `db` to exist.
+const pinnedExternalConnectionId = process.env.CLAW_TASK_HUB_EXTERNAL_DB?.trim() || null;
+const inMemoryDbPath = ":memory:";
+
+const configuredDbPath = pinnedExternalConnectionId ? inMemoryDbPath : resolveDbPath();
+const databaseDir = pinnedExternalConnectionId ? dataDir : dirname(configuredDbPath);
 const activeDatabasePointer = join(databaseDir, ".claw-task-hub-active-db");
 const databaseRegistryPath = join(databaseDir, ".claw-task-hub-databases.json");
+// An external (Postgres) connection is selected in the same pointer file as a
+// SQLite database: "external:<connection id>", then the local database it was
+// selected from. Every process reads the one pointer, so the UI server, the CLI
+// and the MCP server agree on which database is live.
+const externalDatabasePrefix = "external:";
+let startupExternalConnectionId: string | null = null;
 
 export let dbPath = resolveInitialDbPath();
 mkdirSync(dirname(dbPath), { recursive: true });
 export let db = openDatabase(dbPath);
 
+// The async data interface store.ts reads and writes through.
+//
+// store.ts talks to this rather than to `db` directly so the engine underneath
+// can change without the data layer changing shape: a Postgres-backed hub swaps
+// this for createPostgresAdapter and every query in store.ts keeps working. It
+// is a mutable binding for the same reason `db` is -- activating another
+// database replaces the handle, and the adapter has to follow it or it would
+// keep writing to the database that was just closed.
+let localAdapter: DbAdapter = createSqliteAdapter(db);
+export let adapter: DbAdapter = localAdapter;
+
+// While an external connection is live, `adapter` is its Postgres adapter and
+// `db` stays open as this process's local fallback.
+type ActiveExternalConnection = { summary: ExternalConnectionSummary; adapter: DbAdapter };
+let activeExternal: ActiveExternalConnection | null = null;
+
+// Code that has to follow the active database, such as the API server's live
+// refresh relay, subscribes here rather than polling activeExternalConnectionId().
+const activeDatabaseListeners = new Set<() => void>();
+
+/** Call `listener` whenever this process's active external connection changes. */
+export function onActiveDatabaseChange(listener: () => void) {
+  activeDatabaseListeners.add(listener);
+  return () => {
+    activeDatabaseListeners.delete(listener);
+  };
+}
+
+function announceActiveDatabaseChange() {
+  for (const listener of activeDatabaseListeners) {
+    try {
+      listener();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      process.stderr.write(`claw-task-hub: an active-database listener failed: ${message}\n`);
+    }
+  }
+}
+
 export function listManagedDatabases(): { active: ManagedDatabase; databases: ManagedDatabase[] } {
+  if (pinnedExternalConnectionId) {
+    if (!activeExternal) throw new Error(`The pinned external connection ${pinnedExternalConnectionId} is not open`);
+    return { active: externalCatalogueEntry(activeExternal.summary), databases: [] };
+  }
   const databasePaths = new Set(
     readdirSync(databaseDir, { withFileTypes: true })
       .filter((entry) => entry.isFile() && extname(entry.name).toLowerCase() === ".sqlite")
@@ -96,19 +159,24 @@ export function listManagedDatabases(): { active: ManagedDatabase; databases: Ma
       name: databaseDisplayName(basename(path)),
       fileName: basename(path),
       path,
-      active: path === activePath,
+      // While an external connection is live, no local file is the active database.
+      active: activeExternal === null && path === activePath,
+      engine: "sqlite" as const,
     }))
     .sort((left, right) => Number(right.active) - Number(left.active) || left.name.localeCompare(right.name));
+  if (activeExternal) return { active: externalCatalogueEntry(activeExternal.summary), databases };
   const active = databases.find((entry) => entry.active);
   if (!active) throw new Error("Active database is missing from the database catalogue");
   return { active, databases };
 }
 
 export function getManagedDatabase(id: string) {
-  return listManagedDatabases().databases.find((database) => database.id === id) ?? null;
+  const catalogue = listManagedDatabases();
+  return [catalogue.active, ...catalogue.databases].find((database) => database.id === id) ?? null;
 }
 
 export function createManagedDatabase(name: string, requestedPath?: string) {
+  assertNotPinned();
   const nextPath = resolveNewDatabasePath(name, requestedPath);
   if (existsSync(nextPath)) throw new Error(`Database already exists: ${nextPath}`);
   const nextDatabase = openDatabase(nextPath);
@@ -126,10 +194,20 @@ export function createManagedDatabase(name: string, requestedPath?: string) {
 }
 
 export function activateManagedDatabase(id: string) {
+  assertNotPinned();
   const registered = listManagedDatabases().databases.find((database) => database.id === id);
   if (!registered) throw new Error(`Database not found: ${id}`);
   const nextPath = registered.path;
-  if (resolve(nextPath) === resolve(dbPath)) return listManagedDatabases();
+  if (resolve(nextPath) === resolve(dbPath)) {
+    // Already open as the local fallback: selecting it only has to take the
+    // live role back from an external connection.
+    if (activeExternal) {
+      writeActivePointer(`${resolve(dbPath)}\n`);
+      adapter = localAdapter;
+      releaseExternalConnection();
+    }
+    return listManagedDatabases();
+  }
   const nextDatabase = openDatabase(nextPath);
   try {
     initializeDatabase(nextDatabase);
@@ -147,6 +225,11 @@ export function deleteManagedDatabase(id: string, confirm = false) {
   const target = catalogue.databases.find((database) => database.id === id);
   if (!target) throw new Error(`Database not found: ${id}`);
   if (target.active) throw new Error("The active database cannot be deleted. Activate another database first.");
+  // With an external connection live, the local database stays open as this
+  // process's fallback, so its file is still in use.
+  if (resolve(target.path) === resolve(dbPath)) {
+    throw new Error("The active database's local fallback cannot be deleted while it is open. Activate another local database first.");
+  }
 
   removePathWithRetries(target.path);
   removePathWithRetries(`${target.path}-wal`, { force: true });
@@ -156,11 +239,30 @@ export function deleteManagedDatabase(id: string, confirm = false) {
   return listManagedDatabases();
 }
 
+function assertNotPinned() {
+  if (!pinnedExternalConnectionId) return;
+  throw new Error(
+    `This hub is pinned to external connection ${pinnedExternalConnectionId} by CLAW_TASK_HUB_EXTERNAL_DB; ` +
+    "local databases are disabled. Nothing was changed.");
+}
+
 function resolveInitialDbPath() {
+  if (pinnedExternalConnectionId) {
+    startupExternalConnectionId = pinnedExternalConnectionId;
+    return inMemoryDbPath;
+  }
   mkdirSync(databaseDir, { recursive: true });
   if (!existsSync(activeDatabasePointer)) return configuredDbPath;
   try {
-    const selectedId = readFileSync(activeDatabasePointer, "utf8").trim();
+    const [first = "", second = ""] = readFileSync(activeDatabasePointer, "utf8").split("\n").map((line) => line.trim());
+    let selectedId = first;
+    if (first.startsWith(externalDatabasePrefix)) {
+      // The external connection is opened once the local database is ready; the
+      // second line is the local database this process falls back to.
+      startupExternalConnectionId = first.slice(externalDatabasePrefix.length) || null;
+      selectedId = second;
+      if (!selectedId) return configuredDbPath;
+    }
     const selectedPath = isAbsolute(selectedId) ? resolve(selectedId) : managedDatabasePath(selectedId);
     return existsSync(selectedPath) ? selectedPath : configuredDbPath;
   } catch {
@@ -262,7 +364,8 @@ function closeDatabase(database: SqliteDatabase) {
 // Say which database this process is using, always, on stderr so it cannot be
 // confused with tool output. The wrong-database incident cost an hour and would
 // have been one line to spot.
-if (!isTruthyEnv(process.env.CLAW_TASK_HUB_QUIET_DB)) {
+// A selected external connection announces itself once it is open (below).
+if (!isTruthyEnv(process.env.CLAW_TASK_HUB_QUIET_DB) && !startupExternalConnectionId) {
   const source = process.env.CLAW_TASK_HUB_DB
     ? "CLAW_TASK_HUB_DB"
     : process.env.CODEX_TASK_HUB_DB
@@ -736,6 +839,34 @@ function isDuplicateColumnError(error: unknown) {
 }
 
 initializeDatabase(db);
+
+// A process started while an external connection is selected opens it here,
+// before any importer can run a query. If it cannot be reached, this process
+// uses the local database and says so -- loudly, because the silent version
+// (writes landing in a database nobody is looking at) is the incident the
+// banner above exists for. The selection is left in place, so the next start
+// tries the external connection again.
+if (startupExternalConnectionId) {
+  try {
+    await activateExternalConnection(startupExternalConnectionId, { persist: false });
+    if (!isTruthyEnv(process.env.CLAW_TASK_HUB_QUIET_DB)) {
+      const source = pinnedExternalConnectionId ? "CLAW_TASK_HUB_EXTERNAL_DB" : "selected external connection";
+      process.stderr.write(`claw-task-hub: database ${activeDatabaseLabel()} [${source}]\n`);
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (pinnedExternalConnectionId) {
+      throw new Error(
+        `claw-task-hub: could not open external connection ${pinnedExternalConnectionId} pinned by ` +
+        `CLAW_TASK_HUB_EXTERNAL_DB: ${message}. There is no local fallback; refusing to start.`,
+        { cause: error });
+    }
+    process.stderr.write(
+      `claw-task-hub: could not open the selected external connection ${startupExternalConnectionId}: ${message}\n` +
+      `claw-task-hub: this process is using the local database ${dbPath} instead\n`,
+    );
+  }
+}
 
 export function nowIso() {
   return new Date().toISOString();

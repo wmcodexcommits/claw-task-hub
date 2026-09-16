@@ -4,6 +4,11 @@ All notable changes to Claw Task Hub will be documented in this file.
 
 ## Unreleased
 
+- Made open UIs refresh when any hub sharing a Postgres database writes, including hubs in other processes and on other machines: activation installs statement-level `NOTIFY` triggers, and each API server relays the notifications to its UIs with a self-healing listener. It degrades to manual refresh on servers without triggers or `NOTIFY`.
+- Added `bun run migrate:postgres`, a standalone operator tool that copies a SQLite hub into a registered Postgres/Supabase connection in one verified transaction, with a rollback-only `--dry-run`.
+- Made registered Postgres/Supabase connections selectable as the active database from the database menu, `activate_database`, and the HTTP API, with schema applied on activation, a shared selection across UI/CLI/MCP processes, and a loud local fallback when a selected connection is unreachable at startup.
+- Made the store layer run on Postgres: single-key upserts rendered from the SQLite multi-key definitions, Postgres full-text search, explicitly typed nullable parameters, and bigint/numeric results returned as numbers.
+
 ## [0.2.0]
 
 - Made Bun 1.3.14 the single package-manager and runtime contract, including native `bun:sqlite` storage.

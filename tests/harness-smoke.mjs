@@ -188,7 +188,10 @@ async function assertApiLinearImportAbsent() {
 }
 
 async function assertApiRejectsUnsafeBind() {
-  const child = spawnBun(["run", "--silent", "api"], { CLAW_TASK_HUB_HOST: "0.0.0.0" });
+  // The flag is cleared explicitly: Bun loads the repository's .env into this
+  // child, so a developer's local CLAW_TASK_HUB_UNSAFE_BIND=1 would otherwise
+  // switch the guard off and this would test local configuration, not the guard.
+  const child = spawnBun(["run", "--silent", "api"], { CLAW_TASK_HUB_HOST: "0.0.0.0", CLAW_TASK_HUB_UNSAFE_BIND: "0" });
   let stderr = "";
   child.stderr?.on("data", (chunk) => {
     stderr += chunk.toString();

@@ -1,7 +1,7 @@
 import { ensureDefaultTeam, upsertIssue, upsertProject } from "./store.js";
 
-const team = ensureDefaultTeam() as { id: string };
-const project = upsertProject({
+const team = await ensureDefaultTeam() as { id: string };
+const project = await upsertProject({
   id: "project_claw_task_hub_mvp",
   external_id: "local:claw-task-hub-mvp",
   name: "Claw Task Hub MVP",
@@ -11,7 +11,7 @@ const project = upsertProject({
   priority: 2,
 }) as { id: string };
 
-upsertIssue({
+await upsertIssue({
   id: "LOCAL-1",
   external_id: "LOCAL-1",
   identifier: "LOCAL-1",
@@ -25,7 +25,7 @@ upsertIssue({
   labels: ["mvp", "core"],
 });
 
-upsertIssue({
+await upsertIssue({
   id: "LOCAL-2",
   external_id: "LOCAL-2",
   identifier: "LOCAL-2",
